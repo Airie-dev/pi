@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 import { MemoryStorage } from "../../src/harness/session/memory.ts";
 import { InstrumentedStorage } from "../../src/harness/session/testing/index.ts";
 import type { CommitResult, Transaction } from "../../src/harness/session/types.ts";
@@ -49,10 +50,10 @@ describe("InstrumentedStorage", () => {
 			writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "second" }],
 		};
 
-		const firstCommit = storage.commit(firstTransaction);
+		const firstCommit = storage.commit(firstTransaction, BACKGROUND_CONTEXT);
 		expect(firstCommit).toBe(delegate.lastCommit);
 		expect(storage.getCommitAttempts()).toEqual([firstTransaction]);
-		const secondCommit = storage.commit(secondTransaction);
+		const secondCommit = storage.commit(secondTransaction, BACKGROUND_CONTEXT);
 		expect(secondCommit).toBe(delegate.lastCommit);
 		expect(storage.getCommitAttempts()).toEqual([firstTransaction, secondTransaction]);
 
@@ -63,7 +64,7 @@ describe("InstrumentedStorage", () => {
 		const secondResult = { firstSeq: 2, seqs: [2], timestamp: 20 };
 		delegate.resolveNextCommit(secondResult);
 		expect(await secondCommit).toBe(secondResult);
-		await storage.close();
+		await storage.close(BACKGROUND_CONTEXT);
 	});
 	it("records the transaction reference passed to the delegate", async () => {
 		const delegate = new ControlledCommitStorage();
@@ -72,83 +73,104 @@ describe("InstrumentedStorage", () => {
 			writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "value" }],
 		};
 
-		const commit = storage.commit(transaction);
+		const commit = storage.commit(transaction, BACKGROUND_CONTEXT);
 		expect(storage.getCommitAttempts()[0]).toBe(transaction);
 		delegate.resolveNextCommit({ firstSeq: 1, seqs: [1], timestamp: 10 });
 		await commit;
-		await storage.close();
+		await storage.close(BACKGROUND_CONTEXT);
 	});
 
 	it("clears recorded attempts between phases without affecting the delegate", async () => {
 		const delegate = new MemoryStorage({ now: () => 100 });
 		const storage = new InstrumentedStorage(delegate);
-		await storage.commit({
-			writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "first" }],
-		});
+		await storage.commit(
+			{
+				writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "first" }],
+			},
+			BACKGROUND_CONTEXT,
+		);
 
 		storage.clearCommitAttempts();
 		expect(storage.getCommitAttempts()).toEqual([]);
-		expect(await storage.getRegister("fact.name", "")).toMatchObject({ value: "first" });
+		expect(await storage.getRegister("fact.name", "", BACKGROUND_CONTEXT)).toMatchObject({ value: "first" });
 
 		const secondTransaction: Transaction = {
 			writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "second" }],
 		};
-		await storage.commit(secondTransaction);
+		await storage.commit(secondTransaction, BACKGROUND_CONTEXT);
 		expect(storage.getCommitAttempts()).toEqual([secondTransaction]);
-		await storage.close();
+		await storage.close(BACKGROUND_CONTEXT);
 	});
 
 	it("delegates every read and query without recording synthetic writes", async () => {
 		const delegate = new MemoryStorage({ now: () => 100 });
 		const storage = new InstrumentedStorage(delegate);
-		await storage.commit({
-			writes: [
-				{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "note" } },
-				{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "session" },
-				{
-					kind: "usage",
-					row: {
-						id: "usage",
-						adjustment: false,
-						usage: {
-							input: 1,
-							output: 2,
-							cacheRead: 0,
-							cacheWrite: 0,
-							totalTokens: 3,
-							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		await storage.commit(
+			{
+				writes: [
+					{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "note" } },
+					{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "session" },
+					{
+						kind: "usage",
+						row: {
+							id: "usage",
+							adjustment: false,
+							usage: {
+								input: 1,
+								output: 2,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 3,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
 						},
 					},
-				},
-			],
-		});
-
-		expect(await storage.getEntries(["root"])).toEqual(await delegate.getEntries(["root"]));
-		expect(await storage.getRegister("fact.name", "")).toEqual(await delegate.getRegister("fact.name", ""));
-		expect(await storage.listRegisters("fact.name")).toEqual(await delegate.listRegisters("fact.name"));
-		expect(await storage.scanBranch({ start: "root" })).toEqual(await delegate.scanBranch({ start: "root" }));
-		expect(await storage.scanBranchStructure({ start: "root" })).toEqual(
-			await delegate.scanBranchStructure({ start: "root" }),
+				],
+			},
+			BACKGROUND_CONTEXT,
 		);
-		expect(await storage.scanEntries({ order: "asc" })).toEqual(await delegate.scanEntries({ order: "asc" }));
-		expect(await storage.scanUsage({ order: "asc" })).toEqual(await delegate.scanUsage({ order: "asc" }));
-		expect(await storage.getStats()).toEqual(await delegate.getStats());
+
+		expect(await storage.getEntries(["root"], BACKGROUND_CONTEXT)).toEqual(
+			await delegate.getEntries(["root"], BACKGROUND_CONTEXT),
+		);
+		expect(await storage.getRegister("fact.name", "", BACKGROUND_CONTEXT)).toEqual(
+			await delegate.getRegister("fact.name", "", BACKGROUND_CONTEXT),
+		);
+		expect(await storage.listRegisters("fact.name", undefined, BACKGROUND_CONTEXT)).toEqual(
+			await delegate.listRegisters("fact.name", undefined, BACKGROUND_CONTEXT),
+		);
+		expect(await storage.scanBranch({ start: "root" }, BACKGROUND_CONTEXT)).toEqual(
+			await delegate.scanBranch({ start: "root" }, BACKGROUND_CONTEXT),
+		);
+		expect(await storage.scanBranchStructure({ start: "root" }, BACKGROUND_CONTEXT)).toEqual(
+			await delegate.scanBranchStructure({ start: "root" }, BACKGROUND_CONTEXT),
+		);
+		expect(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(
+			await delegate.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT),
+		);
+		expect(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT)).toEqual(
+			await delegate.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT),
+		);
+		expect(await storage.getStats(BACKGROUND_CONTEXT)).toEqual(await delegate.getStats(BACKGROUND_CONTEXT));
 		expect(storage.getCommitAttempts()).toHaveLength(1);
-		await storage.close();
+		await storage.close(BACKGROUND_CONTEXT);
 	});
 
 	it("delegates close idempotence and admitted commit draining", async () => {
 		const delegate = new MemoryStorage({ now: () => 100 });
 		const storage = new InstrumentedStorage(delegate);
-		const admitted = storage.commit({
-			writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "admitted" }],
-		});
+		const admitted = storage.commit(
+			{
+				writes: [{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "admitted" }],
+			},
+			BACKGROUND_CONTEXT,
+		);
 
-		const firstClose = storage.close();
-		const secondClose = storage.close();
+		const firstClose = storage.close(BACKGROUND_CONTEXT);
+		const secondClose = storage.close(BACKGROUND_CONTEXT);
 		await admitted;
 		await Promise.all([firstClose, secondClose]);
-		await expect(storage.getStats()).rejects.toThrow("MemoryStorage is closed");
+		await expect(storage.getStats(BACKGROUND_CONTEXT)).rejects.toThrow("MemoryStorage is closed");
 		expect(storage.getCommitAttempts()).toHaveLength(1);
 	});
 });

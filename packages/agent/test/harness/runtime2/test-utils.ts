@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "../../../src/harness/context.ts";
 import { MemoryStorage } from "../../../src/harness/session/memory.ts";
 import type { CommitResult, Transaction } from "../../../src/harness/session/types.ts";
 
@@ -7,7 +8,7 @@ export class FailingMemoryStorage extends MemoryStorage {
 	override commit(transaction: Transaction) {
 		const failure = this.failure;
 		this.failure = undefined;
-		return failure === undefined ? super.commit(transaction) : Promise.reject(failure);
+		return failure === undefined ? super.commit(transaction, BACKGROUND_CONTEXT) : Promise.reject(failure);
 	}
 }
 
@@ -18,7 +19,7 @@ export class ControlledMemoryStorage extends MemoryStorage {
 		const beforeCommit = this.beforeNextCommit;
 		this.beforeNextCommit = undefined;
 		await beforeCommit?.();
-		return super.commit(transaction);
+		return super.commit(transaction, BACKGROUND_CONTEXT);
 	}
 }
 

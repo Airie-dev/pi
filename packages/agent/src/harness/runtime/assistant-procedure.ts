@@ -1,13 +1,12 @@
 import type {
+	Context as AiContext,
 	Api,
 	AssistantMessage,
 	AssistantMessageEventStream,
-	Context,
 	Model,
 	SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { AgentTool, AgentToolCall } from "../../types.ts";
 import {
 	type DriveOptions,
@@ -17,6 +16,7 @@ import {
 	type SuspendedOperation,
 } from "../agent-harness.ts";
 import { hasMissingIdentities, missingIdentities } from "../config.ts";
+import { type Context, withAbortSignal } from "../context.ts";
 import { streamHarnessAssistant } from "../execution/assistant.ts";
 import { applyStreamOptionsPatch } from "../hooks.ts";
 import { type RestoredLane, restoreLane } from "../restore.ts";
@@ -57,7 +57,7 @@ export async function recoverAssistantAtActivation<TContext extends object | und
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	runState: RunState,
-	runTelemetry: TelemetryContext,
+	invocationContext: Context,
 	options: DriveOptions,
 ): Promise<ToolBatchExecutionResult> {
 	const phase = runState.phase;
@@ -80,43 +80,50 @@ export async function recoverAssistantAtActivation<TContext extends object | und
 		if (deadlineReached(options)) return { kind: "yielded" };
 		try {
 			runtime.assertOpen();
-			await runtime.sessionStorage.mutate(lane.name, async (mutator) => {
-				const latest = await restoreLane(mutator, lane.name);
-				const state = latest.current?.state;
-				if (
-					latest.current?.operation.operationId !== active.operationId ||
-					state?.kind !== "run" ||
-					state.control.status !== "running" ||
-					state.phase.kind !== "assistant" ||
-					state.phase.generation.status !== "effect_pending" ||
-					state.phase.generation.context.stepId !== context.stepId ||
-					state.phase.generation.attempt !== pending.attempt ||
-					state.phase.generation.responseEntryId !== pending.responseEntryId ||
-					state.phase.generation.usageId !== pending.usageId
-				) {
-					throw new SessionInvariantError("Assistant recovery found another restart point");
-				}
-				await mutator.commit({
-					writes: [
+			await runtime.sessionStorage.mutate(
+				lane.name,
+				async (mutator) => {
+					const latest = await restoreLane(mutator, lane.name, undefined, invocationContext);
+					const state = latest.current?.state;
+					if (
+						latest.current?.operation.operationId !== active.operationId ||
+						state?.kind !== "run" ||
+						state.control.status !== "running" ||
+						state.phase.kind !== "assistant" ||
+						state.phase.generation.status !== "effect_pending" ||
+						state.phase.generation.context.stepId !== context.stepId ||
+						state.phase.generation.attempt !== pending.attempt ||
+						state.phase.generation.responseEntryId !== pending.responseEntryId ||
+						state.phase.generation.usageId !== pending.usageId
+					) {
+						throw new SessionInvariantError("Assistant recovery found another restart point");
+					}
+					await mutator.commit(
 						{
-							kind: "register",
-							op: "set",
-							namespace: "op.state",
-							key: active.operationId,
-							value: {
-								...state,
-								phase: {
-									kind: "assistant",
-									generation: { status: "ready", context, nextAttempt: pending.attempt + 1 },
+							writes: [
+								{
+									kind: "register",
+									op: "set",
+									namespace: "op.state",
+									key: active.operationId,
+									value: {
+										...state,
+										phase: {
+											kind: "assistant",
+											generation: { status: "ready", context, nextAttempt: pending.attempt + 1 },
+										},
+									},
 								},
-							},
+							],
 						},
-					],
-				});
-			});
+						invocationContext,
+					);
+				},
+				invocationContext,
+			);
 		} catch (error) {
 			if (error instanceof HarnessClosed || error instanceof HarnessFault) throw error;
-			throw runtime.fault(error);
+			throw runtime.fault(error, invocationContext);
 		}
 		return { kind: "advanced" };
 	}
@@ -140,28 +147,37 @@ export async function recoverAssistantAtActivation<TContext extends object | und
 		errorMessage: error.message,
 		timestamp: Date.now(),
 	};
-	await runtime.events.emit({
-		type: "turn_start",
-		runId: active.operationId,
-		turnId: context.stepId,
-		lane: lane.name,
-		recovery: true,
-	});
-	await runtime.events.emit({
-		type: "message_start",
-		runId: active.operationId,
-		message,
-		lane: lane.name,
-		recovery: true,
-	});
-	await runtime.events.emit({
-		type: "message_end",
-		runId: active.operationId,
-		message,
-		entryId: pending.responseEntryId,
-		lane: lane.name,
-		recovery: true,
-	});
+	await runtime.events.emit(
+		{
+			type: "turn_start",
+			runId: active.operationId,
+			turnId: context.stepId,
+			lane: lane.name,
+			recovery: true,
+		},
+		invocationContext,
+	);
+	await runtime.events.emit(
+		{
+			type: "message_start",
+			runId: active.operationId,
+			message,
+			lane: lane.name,
+			recovery: true,
+		},
+		invocationContext,
+	);
+	await runtime.events.emit(
+		{
+			type: "message_end",
+			runId: active.operationId,
+			message,
+			entryId: pending.responseEntryId,
+			lane: lane.name,
+			recovery: true,
+		},
+		invocationContext,
+	);
 	await lane.breakpoint.hit({
 		kind: "assistant.recover_settlement",
 		description: "Settle an uncertain final assistant request",
@@ -169,16 +185,14 @@ export async function recoverAssistantAtActivation<TContext extends object | und
 	});
 	if (deadlineReached(options)) return { kind: "yielded" };
 	const committed = await startHarnessSpan(
-		runTelemetry,
 		"pi.harness.turn",
 		{
 			"pi.lane.name": lane.name,
 			"pi.operation.id": active.operationId,
 			"pi.turn.id": context.stepId,
 		},
-		(turnSpan) =>
+		(_turnSpan, turnContext) =>
 			startHarnessSpan(
-				turnSpan,
 				"pi.harness.step",
 				{
 					"pi.lane.name": lane.name,
@@ -186,35 +200,54 @@ export async function recoverAssistantAtActivation<TContext extends object | und
 					"pi.step.kind": "assistant",
 					"pi.step.attempt": pending.attempt,
 				},
-				async (stepSpan) => {
+				async (stepSpan, stepContext) => {
 					stepSpan.setAttributes({ "pi.step.outcome": "failed" });
 					stepSpan.setStatus({ status: "error" });
-					return commitSyntheticAssistantRecovery(runtime, lane.name, active.operationId, pending, message, error);
+					return commitSyntheticAssistantRecovery(
+						runtime,
+						lane.name,
+						active.operationId,
+						pending,
+						message,
+						error,
+						stepContext,
+					);
 				},
+				turnContext,
 			),
+		invocationContext,
 	);
-	await runtime.events.emit({ type: "entry_added", entry: committed.entry, lane: lane.name });
-	await runtime.events.emit({ type: "usage", lane: lane.name, row: committed.row, totals: committed.totals });
-	await runtime.events.emit({
-		type: "turn_end",
-		runId: active.operationId,
-		turnId: context.stepId,
-		message,
-		toolResults: [],
-		lane: lane.name,
-		recovery: true,
-	});
-	if (pending.attempt > 1) {
-		await runtime.events.emit({
-			type: "retry_end",
+	await runtime.events.emit({ type: "entry_added", entry: committed.entry, lane: lane.name }, invocationContext);
+	await runtime.events.emit(
+		{ type: "usage", lane: lane.name, row: committed.row, totals: committed.totals },
+		invocationContext,
+	);
+	await runtime.events.emit(
+		{
+			type: "turn_end",
 			runId: active.operationId,
-			step: context.stepId,
-			attempt: pending.attempt,
-			success: false,
-			finalError: error.message,
+			turnId: context.stepId,
+			message,
+			toolResults: [],
 			lane: lane.name,
 			recovery: true,
-		});
+		},
+		invocationContext,
+	);
+	if (pending.attempt > 1) {
+		await runtime.events.emit(
+			{
+				type: "retry_end",
+				runId: active.operationId,
+				step: context.stepId,
+				attempt: pending.attempt,
+				success: false,
+				finalError: error.message,
+				lane: lane.name,
+				recovery: true,
+			},
+			invocationContext,
+		);
 	}
 	return { kind: "advanced" };
 }
@@ -226,76 +259,84 @@ async function commitSyntheticAssistantRecovery<TContext extends object | undefi
 	pending: Extract<RunState["phase"], { kind: "assistant" }>["generation"] & { status: "effect_pending" },
 	message: SettledAssistantMessage,
 	error: OperationError,
+	context: Context,
 ): Promise<Pick<CommittedAssistantSettlement, "entry" | "row" | "totals">> {
 	try {
 		runtime.assertOpen();
-		const committed = await runtime.sessionStorage.mutate(lane, async (mutator) => {
-			const restored = await restoreLane(mutator, lane);
-			const state = restored.current?.state;
-			if (
-				restored.current?.operation.operationId !== operationId ||
-				state?.kind !== "run" ||
-				state.control.status !== "running" ||
-				state.phase.kind !== "assistant" ||
-				state.phase.generation.status !== "effect_pending" ||
-				state.phase.generation.context.stepId !== pending.context.stepId ||
-				state.phase.generation.attempt !== pending.attempt ||
-				state.phase.generation.responseEntryId !== pending.responseEntryId ||
-				state.phase.generation.usageId !== pending.usageId
-			) {
-				throw new SessionInvariantError("Synthetic assistant recovery found another restart point");
-			}
-			const responseEntry = {
-				id: pending.responseEntryId,
-				parentId: restored.leafId,
-				type: "message" as const,
-				message,
-			};
-			const result = await mutator.commit({
-				writes: [
-					{ kind: "entry", entry: responseEntry },
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: lane, value: pending.responseEntryId },
+		const committed = await runtime.sessionStorage.mutate(
+			lane,
+			async (mutator) => {
+				const restored = await restoreLane(mutator, lane, undefined, context);
+				const state = restored.current?.state;
+				if (
+					restored.current?.operation.operationId !== operationId ||
+					state?.kind !== "run" ||
+					state.control.status !== "running" ||
+					state.phase.kind !== "assistant" ||
+					state.phase.generation.status !== "effect_pending" ||
+					state.phase.generation.context.stepId !== pending.context.stepId ||
+					state.phase.generation.attempt !== pending.attempt ||
+					state.phase.generation.responseEntryId !== pending.responseEntryId ||
+					state.phase.generation.usageId !== pending.usageId
+				) {
+					throw new SessionInvariantError("Synthetic assistant recovery found another restart point");
+				}
+				const responseEntry = {
+					id: pending.responseEntryId,
+					parentId: restored.leafId,
+					type: "message" as const,
+					message,
+				};
+				const result = await mutator.commit(
 					{
-						kind: "usage",
-						row: {
-							id: pending.usageId,
-							usage: message.usage,
-							entryId: pending.responseEntryId,
-							adjustment: false,
-						},
-					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...state,
-							latestAssistantEntryId: pending.responseEntryId,
-							phase: {
-								kind: "failure_drain",
-								error,
-								provenance: { kind: "response", entryId: pending.responseEntryId },
+						writes: [
+							{ kind: "entry", entry: responseEntry },
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: lane, value: pending.responseEntryId },
+							{
+								kind: "usage",
+								row: {
+									id: pending.usageId,
+									usage: message.usage,
+									entryId: pending.responseEntryId,
+									adjustment: false,
+								},
 							},
-						},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...state,
+									latestAssistantEntryId: pending.responseEntryId,
+									phase: {
+										kind: "failure_drain",
+										error,
+										provenance: { kind: "response", entryId: pending.responseEntryId },
+									},
+								},
+							},
+						],
 					},
-				],
-			});
-			return {
-				entry: materializeCommittedEntry(responseEntry, result.seqs[0]!, result.timestamp),
-				row: {
-					id: pending.usageId,
-					seq: result.seqs[2]!,
-					usage: message.usage,
-					entryId: pending.responseEntryId,
-					adjustment: false as const,
-				},
-			};
-		});
-		return { ...committed, totals: (await runtime.sessionStorage.getStats()).usage };
+					context,
+				);
+				return {
+					entry: materializeCommittedEntry(responseEntry, result.seqs[0]!, result.timestamp),
+					row: {
+						id: pending.usageId,
+						seq: result.seqs[2]!,
+						usage: message.usage,
+						entryId: pending.responseEntryId,
+						adjustment: false as const,
+					},
+				};
+			},
+			context,
+		);
+		return { ...committed, totals: (await runtime.sessionStorage.getStats(context)).usage };
 	} catch (caught) {
 		if (caught instanceof HarnessClosed || caught instanceof HarnessFault) throw caught;
-		throw runtime.fault(caught);
+		throw runtime.fault(caught, context);
 	}
 }
 
@@ -304,7 +345,7 @@ export async function driveAssistantRetryWait<TContext extends object | undefine
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	state: RunState,
-	runTelemetry: TelemetryContext,
+	context: Context,
 	options: DriveOptions,
 ): Promise<"advanced" | DriveResult> {
 	if (state.phase.kind !== "assistant" || state.phase.generation.status !== "retry_wait") {
@@ -345,7 +386,6 @@ export async function driveAssistantRetryWait<TContext extends object | undefine
 			return Result.ok({ kind: "yielded", operationId: active.operationId });
 		}
 		timerAdmitted = await startHarnessSpan(
-			runTelemetry,
 			"pi.harness.sleep",
 			{
 				"pi.operation.id": active.operationId,
@@ -355,7 +395,7 @@ export async function driveAssistantRetryWait<TContext extends object | undefine
 				if (deadlineReached(options)) return false;
 				try {
 					active.effectGate.assertOpen();
-					await waitUntil(wait.notBefore, active.effectGate.signal);
+					await waitUntil(wait.notBefore, active.effectGate.context.abortSignal!);
 					sleepSpan.setAttributes({ "pi.sleep.outcome": "elapsed" });
 					return true;
 				} catch (error) {
@@ -363,6 +403,7 @@ export async function driveAssistantRetryWait<TContext extends object | undefine
 					throw error;
 				}
 			},
+			context,
 		);
 		if (!timerAdmitted) return Result.ok({ kind: "yielded", operationId: active.operationId });
 	}
@@ -383,47 +424,54 @@ export async function driveAssistantRetryWait<TContext extends object | undefine
 	}
 	try {
 		runtime.assertOpen();
-		await runtime.sessionStorage.mutate(lane.name, async (mutator) => {
-			const restored = await restoreLane(mutator, lane.name);
-			const latest = restored.current?.state;
-			if (
-				restored.current?.operation.operationId !== active.operationId ||
-				latest?.kind !== "run" ||
-				latest.control.status !== "running" ||
-				latest.phase.kind !== "assistant" ||
-				latest.phase.generation.status !== "retry_wait" ||
-				latest.phase.generation.context.stepId !== wait.context.stepId ||
-				latest.phase.generation.nextAttempt !== wait.nextAttempt ||
-				latest.phase.generation.notBefore !== wait.notBefore ||
-				latest.phase.generation.errorMessage !== wait.errorMessage
-			) {
-				throw new SessionInvariantError("Assistant retry found another wait");
-			}
-			await mutator.commit({
-				writes: [
+		await runtime.sessionStorage.mutate(
+			lane.name,
+			async (mutator) => {
+				const restored = await restoreLane(mutator, lane.name, undefined, context);
+				const latest = restored.current?.state;
+				if (
+					restored.current?.operation.operationId !== active.operationId ||
+					latest?.kind !== "run" ||
+					latest.control.status !== "running" ||
+					latest.phase.kind !== "assistant" ||
+					latest.phase.generation.status !== "retry_wait" ||
+					latest.phase.generation.context.stepId !== wait.context.stepId ||
+					latest.phase.generation.nextAttempt !== wait.nextAttempt ||
+					latest.phase.generation.notBefore !== wait.notBefore ||
+					latest.phase.generation.errorMessage !== wait.errorMessage
+				) {
+					throw new SessionInvariantError("Assistant retry found another wait");
+				}
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: active.operationId,
-						value: {
-							...latest,
-							phase: {
-								kind: "assistant",
-								generation: {
-									status: "ready",
-									context: wait.context,
-									nextAttempt: wait.nextAttempt,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: active.operationId,
+								value: {
+									...latest,
+									phase: {
+										kind: "assistant",
+										generation: {
+											status: "ready",
+											context: wait.context,
+											nextAttempt: wait.nextAttempt,
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			});
-		});
+					context,
+				);
+			},
+			context,
+		);
 	} catch (error) {
 		if (error instanceof HarnessClosed || error instanceof HarnessFault) throw error;
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 	return "advanced";
 }
@@ -435,6 +483,7 @@ export async function waitForDeferred<TContext extends object | undefined>(
 	restored: RestoredLane,
 	state: RunState,
 	recovery: boolean,
+	context: Context,
 ): Promise<DriveResult> {
 	if (state.phase.kind !== "deferred" || state.phase.deferred.status !== "suspended") {
 		throw new SessionInvariantError("Deferred response is not suspended");
@@ -449,14 +498,17 @@ export async function waitForDeferred<TContext extends object | undefined>(
 		deferred: source.message.deferred,
 	};
 	runtime.restoredSuspensions.set(lane.name, descriptor);
-	await runtime.events.emit({
-		type: "run_suspend",
-		runId: active.operationId,
-		reason: "deferred",
-		deferred: source.message.deferred,
-		lane: lane.name,
-		...(recovery ? { recovery: true as const } : {}),
-	});
+	await runtime.events.emit(
+		{
+			type: "run_suspend",
+			runId: active.operationId,
+			reason: "deferred",
+			deferred: source.message.deferred,
+			lane: lane.name,
+			...(recovery ? { recovery: true as const } : {}),
+		},
+		context,
+	);
 	return Result.ok({
 		kind: "waiting",
 		operationId: active.operationId,
@@ -470,14 +522,14 @@ export async function startGeneration<TContext extends object | undefined>(
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	state: RunState,
-	runTelemetry: TelemetryContext,
+	context: Context,
 	options: DriveOptions,
 ): Promise<boolean> {
 	if (state.phase.kind !== "checkpoint" || state.phase.continuation.kind !== "need_assistant") {
 		throw new SessionInvariantError("Generation start is not at a need-assistant checkpoint");
 	}
 	const expectedTriggerEntryId = state.phase.triggerEntryId;
-	const settings = await runtime.snapshotSettings();
+	const settings = await runtime.snapshotSettings(context);
 	await lane.breakpoint.hit({
 		kind: "run.generation_ready",
 		description: "Prepare an assistant generation",
@@ -486,63 +538,73 @@ export async function startGeneration<TContext extends object | undefined>(
 	if (deadlineReached(options)) return false;
 	const stepId = runtime.sessionStorage.idGenerator.next();
 	await startHarnessSpan(
-		runTelemetry,
 		"pi.harness.checkpoint",
 		{
 			"pi.lane.name": lane.name,
 			"pi.operation.id": active.operationId,
 			"pi.checkpoint.kind": "normal",
 		},
-		async () => {
+		async (_span, checkpointContext) => {
 			try {
 				runtime.assertOpen();
-				await runtime.sessionStorage.mutate(lane.name, async (mutator) => {
-					const restored = await restoreLane(mutator, lane.name);
-					const current = restored.current;
-					if (
-						current === undefined ||
-						current.operation.operationId !== active.operationId ||
-						current.state.kind !== "run"
-					) {
-						throw new SessionInvariantError("Generation start lost run ownership");
-					}
-					const latest = current.state;
-					if (
-						latest.phase.kind !== "checkpoint" ||
-						latest.phase.continuation.kind !== "need_assistant" ||
-						latest.phase.triggerEntryId !== expectedTriggerEntryId ||
-						latest.control.status !== "running"
-					) {
-						throw new SessionInvariantError("Generation start found another run phase");
-					}
-					const context = {
-						stepId,
-						triggerEntryId: latest.phase.triggerEntryId,
-						configuration: cloneConfiguration(restored.configuration),
-						streamOptions: { ...settings.streamOptions },
-						retryPolicy: normalizeRetryPolicy(settings.retryPolicy),
-						overflowRecoveryUsed: latest.phase.continuation.overflowRecoveryUsed,
-					};
-					await mutator.commit({
-						writes: [
+				await runtime.sessionStorage.mutate(
+					lane.name,
+					async (mutator) => {
+						const restored = await restoreLane(mutator, lane.name, undefined, checkpointContext);
+						const current = restored.current;
+						if (
+							current === undefined ||
+							current.operation.operationId !== active.operationId ||
+							current.state.kind !== "run"
+						) {
+							throw new SessionInvariantError("Generation start lost run ownership");
+						}
+						const latest = current.state;
+						if (
+							latest.phase.kind !== "checkpoint" ||
+							latest.phase.continuation.kind !== "need_assistant" ||
+							latest.phase.triggerEntryId !== expectedTriggerEntryId ||
+							latest.control.status !== "running"
+						) {
+							throw new SessionInvariantError("Generation start found another run phase");
+						}
+						const generationContext = {
+							stepId,
+							triggerEntryId: latest.phase.triggerEntryId,
+							configuration: cloneConfiguration(restored.configuration),
+							streamOptions: { ...settings.streamOptions },
+							retryPolicy: normalizeRetryPolicy(settings.retryPolicy),
+							overflowRecoveryUsed: latest.phase.continuation.overflowRecoveryUsed,
+						};
+						await mutator.commit(
 							{
-								kind: "register",
-								op: "set",
-								namespace: "op.state",
-								key: active.operationId,
-								value: {
-									...latest,
-									phase: { kind: "assistant", generation: { status: "ready", context, nextAttempt: 1 } },
-								},
+								writes: [
+									{
+										kind: "register",
+										op: "set",
+										namespace: "op.state",
+										key: active.operationId,
+										value: {
+											...latest,
+											phase: {
+												kind: "assistant",
+												generation: { status: "ready", context: generationContext, nextAttempt: 1 },
+											},
+										},
+									},
+								],
 							},
-						],
-					});
-				});
+							checkpointContext,
+						);
+					},
+					checkpointContext,
+				);
 			} catch (error) {
 				if (error instanceof HarnessClosed || error instanceof HarnessFault) throw error;
-				throw runtime.fault(error);
+				throw runtime.fault(error, checkpointContext);
 			}
 		},
+		context,
 	);
 	return true;
 }
@@ -553,7 +615,7 @@ export async function executeAssistantGeneration<TContext extends object | undef
 	active: ActiveOperation,
 	restored: RestoredLane,
 	state: RunState,
-	runTelemetry: TelemetryContext,
+	invocationContext: Context,
 	options: DriveOptions,
 	recovery: boolean,
 ): Promise<AssistantExecutionResult> {
@@ -562,7 +624,8 @@ export async function executeAssistantGeneration<TContext extends object | undef
 	}
 	const ready = state.phase.generation;
 	const context = ready.context;
-	const settings = await runtime.snapshotSettings();
+	const effectContext = withAbortSignal(active.effectGate.context.abortSignal!, invocationContext);
+	const settings = await runtime.snapshotSettings(invocationContext);
 	const missing = missingIdentities(runtime.models, context.configuration, settings.tools);
 	if (hasMissingIdentities(missing)) {
 		const descriptor: SuspendedOperation = {
@@ -571,14 +634,17 @@ export async function executeAssistantGeneration<TContext extends object | undef
 			missing,
 		};
 		runtime.restoredSuspensions.set(lane.name, descriptor);
-		await runtime.events.emit({
-			type: "run_suspend",
-			runId: active.operationId,
-			reason: "missing_identities",
-			missing,
-			lane: lane.name,
-			...(recovery ? { recovery: true as const } : {}),
-		});
+		await runtime.events.emit(
+			{
+				type: "run_suspend",
+				runId: active.operationId,
+				reason: "missing_identities",
+				missing,
+				lane: lane.name,
+				...(recovery ? { recovery: true as const } : {}),
+			},
+			invocationContext,
+		);
 		return { kind: "missing_identities", missing };
 	}
 	runtime.restoredSuspensions.delete(lane.name);
@@ -607,6 +673,7 @@ export async function executeAssistantGeneration<TContext extends object | undef
 				streamOptions,
 			},
 			active.effectGate,
+			effectContext,
 		);
 		if (result?.streamOptions !== undefined) {
 			streamOptions = applyStreamOptionsPatch(streamOptions, result.streamOptions);
@@ -616,7 +683,7 @@ export async function executeAssistantGeneration<TContext extends object | undef
 	const operation = restored.current?.operation;
 	if (operation?.intent.kind !== "run")
 		throw new SessionInvariantError("Assistant generation is missing run metadata");
-	const systemPrompt = operation.intent.systemPromptOverride ?? (await resolveSystemPrompt(runtime));
+	const systemPrompt = operation.intent.systemPromptOverride ?? (await resolveSystemPrompt(runtime, effectContext));
 	const responseEntryId = runtime.sessionStorage.idGenerator.next();
 	const usageId = runtime.sessionStorage.idGenerator.next();
 	await lane.breakpoint.hit({
@@ -627,89 +694,107 @@ export async function executeAssistantGeneration<TContext extends object | undef
 	if (deadlineReached(options)) return { kind: "yielded" };
 	try {
 		runtime.assertOpen();
-		await runtime.sessionStorage.mutate(lane.name, async (mutator) => {
-			const latest = await restoreLane(mutator, lane.name);
-			const current = latest.current;
-			if (
-				current === undefined ||
-				current.operation.operationId !== active.operationId ||
-				current.state.kind !== "run"
-			) {
-				throw new SessionInvariantError("Assistant intent lost run ownership");
-			}
-			const phase = current.state.phase;
-			if (
-				phase.kind !== "assistant" ||
-				phase.generation.status !== "ready" ||
-				phase.generation.context.stepId !== context.stepId ||
-				phase.generation.nextAttempt !== ready.nextAttempt
-			) {
-				throw new SessionInvariantError("Assistant intent found another restart point");
-			}
-			await mutator.commit({
-				writes: [
+		await runtime.sessionStorage.mutate(
+			lane.name,
+			async (mutator) => {
+				const latest = await restoreLane(mutator, lane.name, undefined, invocationContext);
+				const current = latest.current;
+				if (
+					current === undefined ||
+					current.operation.operationId !== active.operationId ||
+					current.state.kind !== "run"
+				) {
+					throw new SessionInvariantError("Assistant intent lost run ownership");
+				}
+				const phase = current.state.phase;
+				if (
+					phase.kind !== "assistant" ||
+					phase.generation.status !== "ready" ||
+					phase.generation.context.stepId !== context.stepId ||
+					phase.generation.nextAttempt !== ready.nextAttempt
+				) {
+					throw new SessionInvariantError("Assistant intent found another restart point");
+				}
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: active.operationId,
-						value: {
-							...current.state,
-							phase: {
-								kind: "assistant",
-								generation: {
-									status: "effect_pending",
-									context,
-									attempt: ready.nextAttempt,
-									responseEntryId,
-									usageId,
-									intendedOutputLimit: model.maxTokens,
-									contextWindow: model.contextWindow,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: active.operationId,
+								value: {
+									...current.state,
+									phase: {
+										kind: "assistant",
+										generation: {
+											status: "effect_pending",
+											context,
+											attempt: ready.nextAttempt,
+											responseEntryId,
+											usageId,
+											intendedOutputLimit: model.maxTokens,
+											contextWindow: model.contextWindow,
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			});
-		});
+					invocationContext,
+				);
+			},
+			invocationContext,
+		);
 	} catch (error) {
 		if (error instanceof HarnessClosed || error instanceof HarnessFault) throw error;
-		throw runtime.fault(error);
+		throw runtime.fault(error, invocationContext);
 	}
 	if (ready.nextAttempt > 1) {
-		await runtime.events.emit({
-			type: "retry_start",
-			runId: active.operationId,
-			step: context.stepId,
-			attempt: ready.nextAttempt,
-			lane: lane.name,
-			...(recovery ? { recovery: true as const } : {}),
-		});
+		await runtime.events.emit(
+			{
+				type: "retry_start",
+				runId: active.operationId,
+				step: context.stepId,
+				attempt: ready.nextAttempt,
+				lane: lane.name,
+				...(recovery ? { recovery: true as const } : {}),
+			},
+			invocationContext,
+		);
 	}
 
-	const newestFirst = await lane.sessionTree.findEntriesOnBranch({ order: "newestFirst", stopAtType: "compaction" });
-	const messages = await buildSessionContext([...newestFirst].reverse(), { entryProjectors: runtime.entryProjectors });
-	await runtime.events.emit({
-		type: "turn_start",
-		runId: active.operationId,
-		turnId: context.stepId,
-		lane: lane.name,
-		...(recovery ? { recovery: true as const } : {}),
-	});
+	const newestFirst = await lane.sessionTree.findEntriesOnBranch(
+		{ order: "newestFirst", stopAtType: "compaction" },
+		invocationContext,
+	);
+	const messages = await buildSessionContext(
+		[...newestFirst].reverse(),
+		{ entryProjectors: runtime.entryProjectors },
+		invocationContext,
+	);
+	await runtime.events.emit(
+		{
+			type: "turn_start",
+			runId: active.operationId,
+			turnId: context.stepId,
+			lane: lane.name,
+			...(recovery ? { recovery: true as const } : {}),
+		},
+		invocationContext,
+	);
 	const providerTools = context.configuration.activeToolNames.map(
 		(name) => settings.tools.find((tool) => tool.name === name)! as unknown as AgentTool,
 	);
 	return startHarnessSpan(
-		runTelemetry,
 		"pi.harness.turn",
 		{
 			"pi.lane.name": lane.name,
 			"pi.operation.id": active.operationId,
 			"pi.turn.id": context.stepId,
 		},
-		async (turnSpan) => {
+		async (_turnSpan, turnContext) => {
 			const message = await startHarnessSpan(
-				turnSpan,
 				"pi.harness.step",
 				{
 					"pi.lane.name": lane.name,
@@ -717,132 +802,152 @@ export async function executeAssistantGeneration<TContext extends object | undef
 					"pi.step.kind": "assistant",
 					"pi.step.attempt": ready.nextAttempt,
 				},
-				async (stepSpan) => {
-					const settled = await streamHarnessAssistant(messages, {
-						model,
-						...(systemPrompt === undefined ? {} : { systemPrompt }),
-						...(providerTools.length === 0 ? {} : { tools: providerTools }),
-						thinkingLevel: context.configuration.thinkingLevel,
-						streamOptions,
-						transformContext: runtime.hooks.has("transform_context")
-							? async (input) => {
+				async (stepSpan, stepContext) => {
+					const streamContext = withAbortSignal(active.effectGate.context.abortSignal!, stepContext);
+					const settled = await streamHarnessAssistant(
+						messages,
+						{
+							model,
+							...(systemPrompt === undefined ? {} : { systemPrompt }),
+							...(providerTools.length === 0 ? {} : { tools: providerTools }),
+							thinkingLevel: context.configuration.thinkingLevel,
+							streamOptions,
+							transformContext: runtime.hooks.has("transform_context")
+								? async (input, hookContext) => {
+										await lane.breakpoint.hit({
+											kind: "hook.transform_context",
+											description: "Transform assistant context",
+											details: { operationId: active.operationId, stepId: context.stepId },
+										});
+										const result = await runtime.hooks.runWithGate(
+											"transform_context",
+											{ lane: lane.name, runId: active.operationId, messages: input },
+											active.effectGate,
+											hookContext,
+										);
+										return result?.messages ?? input;
+									}
+								: undefined,
+							toProviderMessages: runtime.toProviderMessages,
+							beforePayload: runtime.hooks.has("before_payload")
+								? async (payload, requestModel, hookContext) => {
+										await lane.breakpoint.hit({
+											kind: "hook.before_payload",
+											description: "Transform provider payload",
+											details: { operationId: active.operationId, stepId: context.stepId },
+										});
+										return (
+											await runtime.hooks.runWithGate(
+												"before_payload",
+												{ lane: lane.name, runId: active.operationId, model: requestModel, payload },
+												active.effectGate,
+												hookContext,
+											)
+										)?.payload;
+									}
+								: undefined,
+							afterResponse: async (settledMessage, metadata, hookContext) => {
+								let transformed = settledMessage;
+								if (runtime.hooks.has("after_response")) {
 									await lane.breakpoint.hit({
-										kind: "hook.transform_context",
-										description: "Transform assistant context",
+										kind: "hook.after_response",
+										description: "Transform assistant response",
 										details: { operationId: active.operationId, stepId: context.stepId },
 									});
 									const result = await runtime.hooks.runWithGate(
-										"transform_context",
-										{ lane: lane.name, runId: active.operationId, messages: input },
+										"after_response",
+										{
+											lane: lane.name,
+											runId: active.operationId,
+											...metadata,
+											message: transformed,
+										},
 										active.effectGate,
+										hookContext,
 									);
-									return result?.messages ?? input;
+									transformed = result?.message ?? transformed;
 								}
-							: undefined,
-						toProviderMessages: runtime.toProviderMessages,
-						beforePayload: runtime.hooks.has("before_payload")
-							? async (payload, requestModel) => {
-									await lane.breakpoint.hit({
-										kind: "hook.before_payload",
-										description: "Transform provider payload",
-										details: { operationId: active.operationId, stepId: context.stepId },
-									});
-									return (
-										await runtime.hooks.runWithGate(
-											"before_payload",
-											{ lane: lane.name, runId: active.operationId, model: requestModel, payload },
-											active.effectGate,
-										)
-									)?.payload;
-								}
-							: undefined,
-						afterResponse: async (settledMessage, metadata) => {
-							let transformed = settledMessage;
-							if (runtime.hooks.has("after_response")) {
-								await lane.breakpoint.hit({
-									kind: "hook.after_response",
-									description: "Transform assistant response",
-									details: { operationId: active.operationId, stepId: context.stepId },
-								});
-								const result = await runtime.hooks.runWithGate(
-									"after_response",
-									{
-										lane: lane.name,
-										runId: active.operationId,
-										...metadata,
-										message: transformed,
-									},
-									active.effectGate,
-								);
-								transformed = result?.message ?? transformed;
-							}
-							return normalizeInvalidDeferredResponse(transformed, context.configuration, model.api);
-						},
+								return normalizeInvalidDeferredResponse(transformed, context.configuration, model.api);
+							},
 
-						request: async (
-							providerContext: Context,
-							providerOptions: SimpleStreamOptions,
-						): Promise<AssistantMessageEventStream> => {
-							await lane.breakpoint.hit({
-								kind: "assistant.request",
-								description: "Request assistant response",
-								details: {
-									operationId: active.operationId,
-									stepId: context.stepId,
-									attempt: ready.nextAttempt,
-								},
-							});
-							const requestModel = runtime.models.getModel(
-								context.configuration.model.provider,
-								context.configuration.model.modelId,
-							);
-							const requestProvider = runtime.models.getProvider(context.configuration.model.provider);
-							if (requestModel !== model || requestProvider !== providerRegistration) {
+							request: async (
+								providerContext: AiContext,
+								providerOptions: SimpleStreamOptions,
+								_requestContext: Context,
+							): Promise<AssistantMessageEventStream> => {
+								await lane.breakpoint.hit({
+									kind: "assistant.request",
+									description: "Request assistant response",
+									details: {
+										operationId: active.operationId,
+										stepId: context.stepId,
+										attempt: ready.nextAttempt,
+									},
+								});
+								const requestModel = runtime.models.getModel(
+									context.configuration.model.provider,
+									context.configuration.model.modelId,
+								);
+								const requestProvider = runtime.models.getProvider(context.configuration.model.provider);
+								if (requestModel !== model || requestProvider !== providerRegistration) {
+									active.effectGate.assertOpen();
+									return createMissingModelStream(model);
+								}
 								active.effectGate.assertOpen();
-								return createMissingModelStream(model);
-							}
-							active.effectGate.assertOpen();
-							return runtime.models.streamSimple(requestModel, providerContext, providerOptions);
+								return runtime.models.streamSimple(requestModel, providerContext, providerOptions);
+							},
+							observer: {
+								start: (draft, eventContext) =>
+									runtime.events.emit(
+										{
+											type: "message_start",
+											runId: active.operationId,
+											message: draft,
+											lane: lane.name,
+											...(recovery ? { recovery: true as const } : {}),
+										},
+										eventContext,
+									),
+								update: (draft, event, eventContext) =>
+									runtime.events.emit(
+										{
+											type: "message_update",
+											runId: active.operationId,
+											message: draft,
+											event,
+											lane: lane.name,
+											...(recovery ? { recovery: true as const } : {}),
+										},
+										eventContext,
+									),
+								end: (finalMessage, eventContext) =>
+									runtime.events.emit(
+										{
+											type: "message_end",
+											runId: active.operationId,
+											message: finalMessage,
+											entryId: responseEntryId,
+											lane: lane.name,
+											...(recovery ? { recovery: true as const } : {}),
+										},
+										eventContext,
+									),
+							},
 						},
-						observer: {
-							start: (draft) =>
-								runtime.events.emit({
-									type: "message_start",
-									runId: active.operationId,
-									message: draft,
-									lane: lane.name,
-									...(recovery ? { recovery: true as const } : {}),
-								}),
-							update: (draft, event) =>
-								runtime.events.emit({
-									type: "message_update",
-									runId: active.operationId,
-									message: draft,
-									event,
-									lane: lane.name,
-									...(recovery ? { recovery: true as const } : {}),
-								}),
-							end: (finalMessage) =>
-								runtime.events.emit({
-									type: "message_end",
-									runId: active.operationId,
-									message: finalMessage,
-									entryId: responseEntryId,
-									lane: lane.name,
-									...(recovery ? { recovery: true as const } : {}),
-								}),
-						},
-						telemetryContext: stepSpan,
-						signal: active.effectGate.signal,
-					});
+						streamContext,
+					);
 					const outcome = predictAssistantStepOutcome(settled, ready.nextAttempt, context, model.api);
 					stepSpan.setAttributes({ "pi.step.outcome": outcome });
 					if (outcome === "retry" || outcome === "failed") stepSpan.setStatus({ status: "error" });
 					return settled;
 				},
+				turnContext,
 			);
 			if (message.role !== "assistant") {
-				throw runtime.fault(new SessionInvariantError("after_response returned an invalid assistant message"));
+				throw runtime.fault(
+					new SessionInvariantError("after_response returned an invalid assistant message"),
+					turnContext,
+				);
 			}
 			runtime.assertOpen();
 			await lane.breakpoint.hit({
@@ -859,61 +964,80 @@ export async function executeAssistantGeneration<TContext extends object | undef
 				usageId,
 				model.api,
 				message,
+				turnContext,
 			);
-			await runtime.events.emit({ type: "entry_added", entry: settled.entry, lane: lane.name });
-			await runtime.events.emit({ type: "usage", lane: lane.name, row: settled.row, totals: settled.totals });
+			await runtime.events.emit({ type: "entry_added", entry: settled.entry, lane: lane.name }, turnContext);
+			await runtime.events.emit(
+				{ type: "usage", lane: lane.name, row: settled.row, totals: settled.totals },
+				turnContext,
+			);
 			if (settled.outcome.kind !== "tools") {
-				await runtime.events.emit({
-					type: "turn_end",
-					runId: active.operationId,
-					turnId: context.stepId,
-					message: settled.message,
-					toolResults: [],
-					lane: lane.name,
-					...(recovery ? { recovery: true as const } : {}),
-				});
+				await runtime.events.emit(
+					{
+						type: "turn_end",
+						runId: active.operationId,
+						turnId: context.stepId,
+						message: settled.message,
+						toolResults: [],
+						lane: lane.name,
+						...(recovery ? { recovery: true as const } : {}),
+					},
+					turnContext,
+				);
 			}
 			if (settled.outcome.kind === "retry") {
-				await runtime.events.emit({
-					type: "retry_scheduled",
-					runId: active.operationId,
-					step: context.stepId,
-					attempt: settled.outcome.nextAttempt,
-					maxAttempts: context.retryPolicy.maxAttempts,
-					delayMs: settled.outcome.delayMs,
-					errorMessage: settled.outcome.errorMessage,
-					lane: lane.name,
-					...(recovery ? { recovery: true as const } : {}),
-				});
+				await runtime.events.emit(
+					{
+						type: "retry_scheduled",
+						runId: active.operationId,
+						step: context.stepId,
+						attempt: settled.outcome.nextAttempt,
+						maxAttempts: context.retryPolicy.maxAttempts,
+						delayMs: settled.outcome.delayMs,
+						errorMessage: settled.outcome.errorMessage,
+						lane: lane.name,
+						...(recovery ? { recovery: true as const } : {}),
+					},
+					turnContext,
+				);
 			} else if (ready.nextAttempt > 1) {
 				const success =
 					settled.outcome.kind === "completed" ||
 					settled.outcome.kind === "deferred" ||
 					settled.outcome.kind === "tools";
-				await runtime.events.emit({
-					type: "retry_end",
-					runId: active.operationId,
-					step: context.stepId,
-					attempt: ready.nextAttempt,
-					success,
-					...(success || settled.outcome.kind !== "failed" ? {} : { finalError: settled.outcome.error.message }),
-					lane: lane.name,
-					...(recovery ? { recovery: true as const } : {}),
-				});
+				await runtime.events.emit(
+					{
+						type: "retry_end",
+						runId: active.operationId,
+						step: context.stepId,
+						attempt: ready.nextAttempt,
+						success,
+						...(success || settled.outcome.kind !== "failed"
+							? {}
+							: { finalError: settled.outcome.error.message }),
+						lane: lane.name,
+						...(recovery ? { recovery: true as const } : {}),
+					},
+					turnContext,
+				);
 			}
 			if (settled.outcome.kind === "tools") {
-				const toolState = await loadExpected(runtime, lane.name, active.operationId, false);
+				const toolState = await loadExpected(runtime, lane.name, active.operationId, false, turnContext);
 				const current = toolState.current;
 				if (current?.state.kind !== "run" || current.state.phase.kind !== "tools") {
-					throw runtime.fault(new SessionInvariantError("Assistant tool settlement lost its durable batch"));
+					throw runtime.fault(
+						new SessionInvariantError("Assistant tool settlement lost its durable batch"),
+						turnContext,
+					);
 				}
-				return executeOrdinaryToolBatch(runtime, lane, active, toolState, current.state, turnSpan, options, {
+				return executeOrdinaryToolBatch(runtime, lane, active, toolState, current.state, turnContext, options, {
 					eventOrigin: recovery ? "recovery" : "live",
 					turn: "already_started",
 				});
 			}
 			return { kind: "advanced" };
 		},
+		invocationContext,
 	);
 }
 
@@ -926,84 +1050,96 @@ async function commitAssistantSettlement<TContext extends object | undefined>(
 	usageId: string,
 	requestApi: Api,
 	message: SettledAssistantMessage,
+	context: Context,
 ): Promise<CommittedAssistantSettlement> {
 	try {
 		runtime.assertOpen();
 		const sourceCalls = assistantToolCalls(message);
 		const followerTimestamp = uuidV7Timestamp(responseEntryId);
 		const resultEntryIds = sourceCalls.map(() => runtime.sessionStorage.idGenerator.next(followerTimestamp));
-		const committed = await runtime.sessionStorage.mutate(lane, async (mutator) => {
-			const restored = await restoreLane(mutator, lane);
-			const current = restored.current;
-			if (current === undefined || current.operation.operationId !== operationId || current.state.kind !== "run") {
-				throw new SessionInvariantError("Assistant settlement lost run ownership");
-			}
-			const phase = current.state.phase;
-			if (
-				phase.kind !== "assistant" ||
-				phase.generation.status !== "effect_pending" ||
-				phase.generation.context.stepId !== stepId ||
-				phase.generation.responseEntryId !== responseEntryId ||
-				phase.generation.usageId !== usageId
-			) {
-				throw new SessionInvariantError("Assistant settlement found another pending request");
-			}
-			const decision = classifyAssistantSettlement(
-				message,
-				phase.generation,
-				current.state.control.status,
-				responseEntryId,
-				requestApi,
-				Date.now(),
-				sourceCalls,
-				resultEntryIds,
-			);
-			const responseEntry = {
-				id: responseEntryId,
-				parentId: restored.leafId,
-				type: "message" as const,
-				message: decision.message,
-			};
-			const result = await mutator.commit({
-				writes: [
-					{ kind: "entry", entry: responseEntry },
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: lane, value: responseEntryId },
+		const committed = await runtime.sessionStorage.mutate(
+			lane,
+			async (mutator) => {
+				const restored = await restoreLane(mutator, lane, undefined, context);
+				const current = restored.current;
+				if (
+					current === undefined ||
+					current.operation.operationId !== operationId ||
+					current.state.kind !== "run"
+				) {
+					throw new SessionInvariantError("Assistant settlement lost run ownership");
+				}
+				const phase = current.state.phase;
+				if (
+					phase.kind !== "assistant" ||
+					phase.generation.status !== "effect_pending" ||
+					phase.generation.context.stepId !== stepId ||
+					phase.generation.responseEntryId !== responseEntryId ||
+					phase.generation.usageId !== usageId
+				) {
+					throw new SessionInvariantError("Assistant settlement found another pending request");
+				}
+				const decision = classifyAssistantSettlement(
+					message,
+					phase.generation,
+					current.state.control.status,
+					responseEntryId,
+					requestApi,
+					Date.now(),
+					sourceCalls,
+					resultEntryIds,
+				);
+				const responseEntry = {
+					id: responseEntryId,
+					parentId: restored.leafId,
+					type: "message" as const,
+					message: decision.message,
+				};
+				const result = await mutator.commit(
 					{
-						kind: "usage",
-						row: {
-							id: usageId,
-							usage: decision.message.usage,
-							entryId: responseEntryId,
-							adjustment: false,
-						},
+						writes: [
+							{ kind: "entry", entry: responseEntry },
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: lane, value: responseEntryId },
+							{
+								kind: "usage",
+								row: {
+									id: usageId,
+									usage: decision.message.usage,
+									entryId: responseEntryId,
+									adjustment: false,
+								},
+							},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...current.state,
+									latestAssistantEntryId: responseEntryId,
+									phase: decision.phase,
+								},
+							},
+						],
 					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...current.state,
-							latestAssistantEntryId: responseEntryId,
-							phase: decision.phase,
-						},
+					context,
+				);
+				return {
+					entry: materializeCommittedEntry(responseEntry, result.seqs[0]!, result.timestamp),
+					message: decision.message,
+					outcome: decision.outcome,
+					row: {
+						id: usageId,
+						seq: result.seqs[2]!,
+						usage: decision.message.usage,
+						entryId: responseEntryId,
+						adjustment: false as const,
 					},
-				],
-			});
-			return {
-				entry: materializeCommittedEntry(responseEntry, result.seqs[0]!, result.timestamp),
-				message: decision.message,
-				outcome: decision.outcome,
-				row: {
-					id: usageId,
-					seq: result.seqs[2]!,
-					usage: decision.message.usage,
-					entryId: responseEntryId,
-					adjustment: false as const,
-				},
-			};
-		});
-		return { ...committed, totals: (await runtime.sessionStorage.getStats()).usage };
+				};
+			},
+			context,
+		);
+		return { ...committed, totals: (await runtime.sessionStorage.getStats(context)).usage };
 	} catch (error) {
 		if (
 			error instanceof RuntimeSliceNotImplemented ||
@@ -1012,18 +1148,19 @@ async function commitAssistantSettlement<TContext extends object | undefined>(
 		) {
 			throw error;
 		}
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 }
 
 async function resolveSystemPrompt<TContext extends object | undefined>(
 	runtime: RuntimeProcedureContext<TContext>,
+	context: Context,
 ): Promise<string | undefined> {
 	const source = runtime.systemPromptSource;
 	if (source === undefined || typeof source === "string") return source;
 	const contextSource = runtime.toolContext;
-	const context = typeof contextSource === "function" ? await contextSource() : contextSource;
-	return source(context as TContext);
+	const toolContext = typeof contextSource === "function" ? await contextSource(context) : contextSource;
+	return source(toolContext as TContext, context);
 }
 
 function assistantToolCalls(message: SettledAssistantMessage): AgentToolCall[] {

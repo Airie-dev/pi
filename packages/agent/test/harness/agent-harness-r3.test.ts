@@ -8,6 +8,7 @@ import {
 import { InMemoryTelemetryContext, type TelemetryContext } from "@earendil-works/pi-telemetry";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { BACKGROUND_CONTEXT, withTelemetryContext } from "../../src/harness/context.ts";
 import { BreakpointBarrier } from "../../src/harness/execution/breakpoint.ts";
 import { MemoryStorage } from "../../src/harness/session/memory.ts";
 import { StorageBackedSession } from "../../src/harness/session/session.ts";
@@ -55,22 +56,26 @@ async function createFixture(
 	} = {},
 ): Promise<Fixture> {
 	const repo = new MemorySessionRepo();
-	const session = await repo.create({});
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const tools = options.tools ?? [];
-	const { harness } = await AgentHarness.create({
-		session,
-		models,
-		model: faux.getModel(),
-		tools,
-		activeToolNames: options.activeToolNames ?? [],
-		drive: options.drive,
-		retry: options.retry,
-		streamOptions: options.streamOptions,
-		telemetryContext: options.telemetryContext,
-	});
+	const { harness } = await AgentHarness.create(
+		{
+			session,
+			models,
+			model: faux.getModel(),
+			tools,
+			activeToolNames: options.activeToolNames ?? [],
+			drive: options.drive,
+			retry: options.retry,
+			streamOptions: options.streamOptions,
+		},
+		options.telemetryContext === undefined
+			? BACKGROUND_CONTEXT
+			: withTelemetryContext(options.telemetryContext, BACKGROUND_CONTEXT),
+	);
 	const fixture = { harness, session, repo, faux, models, tools };
 	fixtures.push(fixture);
 	return fixture;
@@ -85,21 +90,25 @@ async function reopenFixture(
 		telemetryContext?: TelemetryContext;
 	} = {},
 ) {
-	await fixture.harness.close();
+	await fixture.harness.close(BACKGROUND_CONTEXT);
 	fixtures.splice(fixtures.indexOf(fixture), 1);
-	const session = await fixture.repo.open(fixture.session.metadata);
+	const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
 	const models = createModels();
 	if (options.registerProvider !== false) models.setProvider(fixture.faux.provider);
 	const tools = options.tools ?? fixture.tools;
-	const created = await AgentHarness.create({
-		session,
-		models,
-		model: fixture.faux.getModel(),
-		tools,
-		activeToolNames: [],
-		drive: options.drive,
-		telemetryContext: options.telemetryContext,
-	});
+	const created = await AgentHarness.create(
+		{
+			session,
+			models,
+			model: fixture.faux.getModel(),
+			tools,
+			activeToolNames: [],
+			drive: options.drive,
+		},
+		options.telemetryContext === undefined
+			? BACKGROUND_CONTEXT
+			: withTelemetryContext(options.telemetryContext, BACKGROUND_CONTEXT),
+	);
 	const reopened: Fixture = {
 		harness: created.harness,
 		session,
@@ -114,7 +123,7 @@ async function reopenFixture(
 
 async function waitForAction(harness: AgentHarnessInstance): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		if ((await harness.peekAction()) !== undefined) return;
+		if ((await harness.peekAction(BACKGROUND_CONTEXT)) !== undefined) return;
 		await waitForTick();
 	}
 	throw new Error("action did not park");
@@ -124,13 +133,13 @@ async function advanceToProviderBoundary(
 	harness: AgentHarnessInstance,
 	operationId: string,
 ): Promise<{ drive: Promise<unknown> }> {
-	const drive = harness.drive({ operationId });
+	const drive = harness.drive({ operationId }, BACKGROUND_CONTEXT);
 	for (const expected of ["runtime.dispatch", "run.generation_ready", "assistant.intent"] as const) {
 		await waitForAction(harness);
-		expect((await harness.executeAction())?.kind).toBe(expected);
+		expect((await harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe(expected);
 	}
 	await waitForAction(harness);
-	expect(await harness.peekAction()).toMatchObject({ kind: "assistant.request" });
+	expect(await harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.request" });
 	return { drive };
 }
 
@@ -169,7 +178,7 @@ async function closeAtAutomaticBreakpoint(
 		const hit = originalHit.call(this, info, options);
 		if (info.kind === kind && closePromise === undefined) {
 			queueMicrotask(() => {
-				closePromise ??= fixture.harness.close();
+				closePromise ??= fixture.harness.close(BACKGROUND_CONTEXT);
 			});
 		}
 		return hit;
@@ -182,10 +191,10 @@ async function closeAtAutomaticBreakpoint(
 	await rejected;
 	const fixtureIndex = fixtures.indexOf(fixture);
 	if (fixtureIndex !== -1) fixtures.splice(fixtureIndex, 1);
-	const reopened = await fixture.repo.open(fixture.session.metadata);
-	const state = (await reopened.getRegister("op.state", operationId))?.value;
-	await reopened.close();
-	await fixture.repo.close();
+	const reopened = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+	const state = (await reopened.getRegister("op.state", operationId, BACKGROUND_CONTEXT))?.value;
+	await reopened.close(BACKGROUND_CONTEXT);
+	await fixture.repo.close(BACKGROUND_CONTEXT);
 	return state;
 }
 
@@ -193,8 +202,8 @@ afterEach(async () => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 	for (const fixture of fixtures.splice(0)) {
-		await fixture.harness.close();
-		await fixture.repo.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	}
 });
 
@@ -207,11 +216,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 	] as const)("automatic close at $target preserves the durable prefix", async ({ target, phase }) => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage("boundary")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 
 		const after = await closeAtAutomaticBreakpoint(fixture, accepted.value.operationId, target, () =>
-			fixture.harness.drive({ operationId: accepted.value.operationId }),
+			fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
 		);
 		expect(after).toMatchObject({ kind: "run", phase });
 	});
@@ -229,16 +238,21 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const events = captureEvents(fixture.harness);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
 		const timer = vi.spyOn(globalThis, "setTimeout");
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 
-		const waiting = await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const waiting = await fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		expect(waiting).toEqual({
 			ok: true,
 			value: { kind: "waiting", operationId: accepted.value.operationId, reason: "retry", notBefore: 1_100 },
 		});
 		expect(timer).not.toHaveBeenCalled();
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			latestAssistantEntryId: expect.any(String),
 			phase: {
 				kind: "assistant",
@@ -247,7 +261,10 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		});
 
 		now.mockReturnValue(1_100);
-		const completed = await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const completed = await fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		expect(completed).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed", finalMessage: { content: [{ text: "recovered" }] } } },
@@ -270,17 +287,20 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
 		vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
 		const timer = vi.spyOn(globalThis, "setTimeout");
 
 		expect(
-			await fixture.harness.drive({
-				operationId: accepted.value.operationId,
-				waitForRetry: true,
-				deadline: 1_050,
-			}),
+			await fixture.harness.drive(
+				{
+					operationId: accepted.value.operationId,
+					waitForRetry: true,
+					deadline: 1_050,
+				},
+				BACKGROUND_CONTEXT,
+			),
 		).toEqual({
 			ok: true,
 			value: { kind: "waiting", operationId: accepted.value.operationId, reason: "retry", notBefore: 1_100 },
@@ -296,18 +316,24 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 				fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 			]);
 			const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 			if (!accepted.ok) throw accepted.error;
-			await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+			await fixture.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			);
 			now.mockReturnValue(1_050);
 			const timer = vi.spyOn(globalThis, "setTimeout");
 
 			expect(
-				await fixture.harness.drive({
-					operationId: accepted.value.operationId,
-					waitForRetry,
-					deadline: 1_050,
-				}),
+				await fixture.harness.drive(
+					{
+						operationId: accepted.value.operationId,
+						waitForRetry,
+						deadline: 1_050,
+					},
+					BACKGROUND_CONTEXT,
+				),
 			).toEqual({
 				ok: true,
 				value: {
@@ -330,32 +356,41 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const first = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const first = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.executeAction();
+			const action = await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
 		}
 		expect(await first).toMatchObject({ ok: true, value: { kind: "waiting", notBefore: 1_100 } });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 
-		const second = fixture.harness.drive({
-			operationId: accepted.value.operationId,
-			waitForRetry: true,
-			deadline: 1_200,
-		});
+		const second = fixture.harness.drive(
+			{
+				operationId: accepted.value.operationId,
+				waitForRetry: true,
+				deadline: 1_200,
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.retry_wait" });
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.retry_wait" });
 		now.mockReturnValue(1_300);
 		const timer = vi.spyOn(globalThis, "setTimeout");
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.retry_wait");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.retry_wait");
 		expect(await second).toMatchObject({ ok: true, value: { kind: "yielded" } });
 		expect(timer).not.toHaveBeenCalled();
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toEqual(before);
 	});
 
 	it("yields a due retry when the drive deadline is already reached without erasing the wait", async () => {
@@ -364,23 +399,29 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		now.mockReturnValue(1_100);
 
 		expect(
-			await fixture.harness.drive({
-				operationId: accepted.value.operationId,
-				waitForRetry: false,
-				deadline: 1_100,
-			}),
+			await fixture.harness.drive(
+				{
+					operationId: accepted.value.operationId,
+					waitForRetry: false,
+					deadline: 1_100,
+				},
+				BACKGROUND_CONTEXT,
+			),
 		).toEqual({
 			ok: true,
 			value: { kind: "yielded", operationId: accepted.value.operationId },
 		});
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toEqual(before);
 	});
 
 	it("lets convenience prompting own the local retry timer", async () => {
@@ -390,7 +431,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 			fauxAssistantMessage("ok"),
 		]);
-		const result = fixture.harness.prompt("go");
+		const result = fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT);
 		await vi.advanceTimersByTimeAsync(100);
 		expect(await result).toMatchObject({ ok: true, value: { kind: "completed" } });
 		expect(fixture.faux.state.callCount).toBe(2);
@@ -402,21 +443,26 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		fixture.faux.setResponses([
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
 
-		const driven = fixture.harness.drive({
-			operationId: accepted.value.operationId,
-			waitForRetry: true,
-			deadline: 1_100,
-		});
+		const driven = fixture.harness.drive(
+			{
+				operationId: accepted.value.operationId,
+				waitForRetry: true,
+				deadline: 1_100,
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await vi.advanceTimersByTimeAsync(100);
 		expect(await driven).toEqual({
 			ok: true,
 			value: { kind: "yielded", operationId: accepted.value.operationId },
 		});
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: { kind: "assistant", generation: { status: "ready", nextAttempt: 2 } },
 		});
 		expect(fixture.faux.state.callCount).toBe(1);
@@ -431,9 +477,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		]);
 		const events = captureEvents(fixture.harness);
 		vi.spyOn(Date, "now").mockReturnValue(100);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const waiting = await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const waiting = await fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		expect(waiting).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", notBefore: Number.MAX_SAFE_INTEGER },
@@ -452,12 +501,15 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		]);
 		const events = captureEvents(fixture.harness);
 		vi.spyOn(Date, "now").mockReturnValue(100);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		expect(
-			await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }),
+			await fixture.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			),
 		).toMatchObject({ ok: true, value: { kind: "waiting" } });
-		const stored = await fixture.session.getRegister("op.state", accepted.value.operationId);
+		const stored = await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT);
 		if (
 			stored?.value.kind !== "run" ||
 			stored.value.phase.kind !== "assistant" ||
@@ -467,28 +519,37 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		}
 		const retryGeneration = stored.value.phase.generation;
 		const retryState = stored.value;
-		await fixture.session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await fixture.session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: accepted.value.operationId,
-						value: {
-							...retryState,
-							phase: {
-								kind: "assistant",
-								generation: { ...retryGeneration, notBefore: 100 },
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: accepted.value.operationId,
+								value: {
+									...retryState,
+									phase: {
+										kind: "assistant",
+										generation: { ...retryGeneration, notBefore: 100 },
+									},
+								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
 		expect(
-			await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }),
+			await fixture.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			),
 		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", notBefore: Number.MAX_SAFE_INTEGER },
@@ -510,50 +571,56 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		]);
 		const events = captureEvents(fixture.harness);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const first = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const first = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.executeAction();
+			const action = await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
 		}
 		expect(await first).toMatchObject({ ok: true, value: { kind: "waiting", notBefore: 1_100 } });
 
 		now.mockReturnValue(1_100);
-		const yielded = fixture.harness.drive({
-			operationId: accepted.value.operationId,
-			waitForRetry: false,
-			deadline: 1_150,
-		});
+		const yielded = fixture.harness.drive(
+			{
+				operationId: accepted.value.operationId,
+				waitForRetry: false,
+				deadline: 1_150,
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.retry_ready");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.retry_ready");
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.intent" });
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.intent" });
 		now.mockReturnValue(1_200);
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.intent");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.intent");
 		expect(await yielded).toMatchObject({ ok: true, value: { kind: "yielded" } });
 		expect(events.filter((event) => event.type === "retry_start")).toHaveLength(0);
 
 		now.mockReturnValue(1_100);
-		const admitted = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const admitted = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.intent");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.intent");
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.request" });
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.request" });
 		expect(events.filter((event) => event.type === "retry_start")).toHaveLength(1);
-		await fixture.harness.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(admitted).rejects.toMatchObject({ name: "HarnessClosed" });
 	});
 
 	it("does not repeat before_resume after its completed hook yields to the drive deadline", async () => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage("ok")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const reopened = await reopenFixture(fixture);
 		const now = vi.spyOn(Date, "now").mockReturnValue(100);
@@ -568,12 +635,16 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			{ id: "resume-once" },
 		);
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 })).toEqual({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 }, BACKGROUND_CONTEXT),
+		).toEqual({
 			ok: true,
 			value: { kind: "yielded", operationId: accepted.value.operationId },
 		});
 		now.mockReturnValue(100);
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
@@ -586,7 +657,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 	it("does not repeat run_resume when a deadline yields before the resume hook", async () => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage("ok")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const reopened = await reopenFixture(fixture, { drive: "manual" });
 		const now = vi.spyOn(Date, "now").mockReturnValue(100);
@@ -600,20 +671,23 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			{ id: "resume-once" },
 		);
 
-		const first = reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 });
+		const first = reopened.harness.drive(
+			{ operationId: accepted.value.operationId, deadline: 150 },
+			BACKGROUND_CONTEXT,
+		);
 		await waitForAction(reopened.harness);
-		expect((await reopened.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await reopened.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({ kind: "hook.before_resume" });
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "hook.before_resume" });
 		now.mockReturnValue(200);
-		expect((await reopened.harness.executeAction())?.kind).toBe("hook.before_resume");
+		expect((await reopened.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("hook.before_resume");
 		expect(await first).toMatchObject({ ok: true, value: { kind: "yielded" } });
 		expect(resumes).toBe(0);
 
 		now.mockReturnValue(100);
-		const second = reopened.harness.drive({ operationId: accepted.value.operationId });
+		const second = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(reopened.harness);
-		await reopened.harness.runToCompletion();
+		await reopened.harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await second).toMatchObject({ ok: true, value: { kind: "settled", outcome: { kind: "completed" } } });
 		expect(resumes).toBe(1);
 		expect(events.filter((event) => event.type === "run_resume")).toHaveLength(1);
@@ -627,22 +701,30 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage("ok"),
 		]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
 		const reopened = await reopenFixture(fixture);
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false })).toEqual({
+		expect(
+			await reopened.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			),
+		).toEqual({
 			ok: true,
 			value: { kind: "waiting", operationId: accepted.value.operationId, reason: "retry", notBefore: 1_100 },
 		});
-		const execution = await reopened.harness.inspectExecution();
+		const execution = await reopened.harness.inspectExecution(BACKGROUND_CONTEXT);
 		expect(execution.current).toMatchObject({ status: "suspended" });
 		expect(execution.current).not.toHaveProperty("suspended");
 		expect(fixture.faux.state.callCount).toBe(1);
 		now.mockReturnValue(1_100);
 		expect(
-			await reopened.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }),
+			await reopened.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			),
 		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
@@ -656,10 +738,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
 		});
 		fixture.faux.setResponses([fauxAssistantMessage("second attempt")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const pending = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const pending = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		if (
 			pending?.kind !== "run" ||
 			pending.phase.kind !== "assistant" ||
@@ -672,14 +755,16 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
 		expect(fixture.faux.state.callCount).toBe(1);
-		expect(await reopened.fixture.session.getEntries([abandoned.responseEntryId, abandoned.usageId])).toEqual(
-			new Map(),
-		);
+		expect(
+			await reopened.fixture.session.getEntries([abandoned.responseEntryId, abandoned.usageId], BACKGROUND_CONTEXT),
+		).toEqual(new Map());
 		expect(events.map((event) => event.type)).toEqual([
 			"run_resume",
 			"retry_start",
@@ -707,10 +792,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
 		});
 		fixture.faux.setResponses([fauxAssistantMessage("must not run")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const pending = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const pending = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		if (
 			pending?.kind !== "run" ||
 			pending.phase.kind !== "assistant" ||
@@ -724,7 +810,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive(
+				{ operationId: accepted.value.operationId },
+				withTelemetryContext(telemetry, BACKGROUND_CONTEXT),
+			),
+		).toMatchObject({
 			ok: true,
 			value: {
 				kind: "settled",
@@ -732,7 +823,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			},
 		});
 		expect(fixture.faux.state.callCount).toBe(0);
-		expect(await reopened.fixture.session.getEntries([reserved.responseEntryId])).toMatchObject(
+		expect(await reopened.fixture.session.getEntries([reserved.responseEntryId], BACKGROUND_CONTEXT)).toMatchObject(
 			new Map([
 				[
 					reserved.responseEntryId,
@@ -761,12 +852,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const fixture = await createFixture({ tools: [tool], activeToolNames: [tool.name] });
 		fixture.faux.setResponses([fauxAssistantMessage("ok")]);
 		const events = captureEvents(fixture.harness);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		fixture.models.deleteProvider(fixture.faux.provider.id);
-		await fixture.harness.setTools([]);
+		await fixture.harness.setTools([], BACKGROUND_CONTEXT);
 
-		const waiting = await fixture.harness.drive({ operationId: accepted.value.operationId });
+		const waiting = await fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		expect(waiting).toMatchObject({
 			ok: true,
 			value: {
@@ -776,20 +867,24 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			},
 		});
 		expect(fixture.faux.state.callCount).toBe(0);
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: { kind: "assistant", generation: { status: "ready", nextAttempt: 1 } },
 		});
 		expect(events.find((event) => event.type === "run_suspend")).toMatchObject({
 			reason: "missing_identities",
 		});
-		expect((await fixture.harness.inspectExecution()).current).toMatchObject({
+		expect((await fixture.harness.inspectExecution(BACKGROUND_CONTEXT)).current).toMatchObject({
 			status: "suspended",
 			suspended: { reason: "missing_identities" },
 		});
 
 		fixture.models.setProvider(fixture.faux.provider);
-		await fixture.harness.setTools([tool]);
-		expect(await fixture.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		await fixture.harness.setTools([tool], BACKGROUND_CONTEXT);
+		expect(
+			await fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
@@ -800,13 +895,15 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
 		const reopened = await reopenFixture(fixture, { registerProvider: false });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "failed", error: { code: "assistant_error" } } },
 		});
@@ -817,22 +914,25 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
 		const reopened = await reopenFixture(fixture, { registerProvider: false });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities" },
 		});
-		expect((await reopened.fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject(
-			{
-				phase: { kind: "assistant", generation: { status: "ready", nextAttempt: 2 } },
-			},
-		);
+		expect(
+			(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+				?.value,
+		).toMatchObject({
+			phase: { kind: "assistant", generation: { status: "ready", nextAttempt: 2 } },
+		});
 		expect(events.some((event) => event.type === "retry_start")).toBe(false);
 	});
 
@@ -849,14 +949,15 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		}));
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "deferred", deferred: handle })]);
 		const events = captureEvents(fixture.harness);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 
-		expect(await fixture.harness.drive({ operationId: accepted.value.operationId })).toEqual({
+		expect(await fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT)).toEqual({
 			ok: true,
 			value: { kind: "waiting", operationId: accepted.value.operationId, reason: "deferred", deferred: handle },
 		});
-		const state = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const state = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		expect(state).toMatchObject({
 			latestAssistantEntryId: expect.any(String),
 			phase: {
@@ -864,7 +965,9 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 				deferred: {
 					status: "suspended",
 					poll: 0,
-					configuration: { model: { provider: fixture.faux.provider.id, modelId: fixture.faux.getModel().id } },
+					configuration: {
+						model: { provider: fixture.faux.provider.id, modelId: fixture.faux.getModel().id },
+					},
 					streamOptions: { headers: { captured: "yes" } },
 				},
 			},
@@ -881,7 +984,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		expect(reopened.suspended).toMatchObject([
 			{ operationId: accepted.value.operationId, reason: "deferred", deferred: handle },
 		]);
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId, pollDeferred: true })).toEqual({
+		expect(
+			await reopened.harness.drive(
+				{ operationId: accepted.value.operationId, pollDeferred: true },
+				BACKGROUND_CONTEXT,
+			),
+		).toEqual({
 			ok: true,
 			value: {
 				kind: "waiting",
@@ -902,7 +1010,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			id: "convenience-deferred",
 		};
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "deferred", deferred: handle })]);
-		expect(await fixture.harness.prompt("go")).toMatchObject({
+		expect(await fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: true,
 			value: {
 				kind: "suspended",
@@ -924,12 +1032,14 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		};
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "deferred", deferred: handle })]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId });
+		await fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 
 		now.mockReturnValue(1_100);
-		expect(await fixture.harness.drive({ operationId: accepted.value.operationId, deadline: 1_100 })).toEqual({
+		expect(
+			await fixture.harness.drive({ operationId: accepted.value.operationId, deadline: 1_100 }, BACKGROUND_CONTEXT),
+		).toEqual({
 			ok: true,
 			value: { kind: "waiting", operationId: accepted.value.operationId, reason: "deferred", deferred: handle },
 		});
@@ -939,7 +1049,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "deferred" })]);
 		const events = captureEvents(fixture.harness);
-		expect(await fixture.harness.prompt("go")).toMatchObject({
+		expect(await fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: true,
 			value: { kind: "failed", error: { message: expect.stringContaining("Invalid deferred") } },
 		});
@@ -976,14 +1086,14 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 				deferred: { ...bad, api: bad.api === "faux" ? fixture.faux.api : bad.api },
 			}),
 		]);
-		const result = await fixture.harness.prompt("go");
+		const result = await fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT);
 		expect(result).toMatchObject({
 			ok: true,
 			value: { kind: "failed", error: { message: expect.stringContaining("Invalid deferred") } },
 		});
-		const leaf = await fixture.harness.getLeafId();
+		const leaf = await fixture.harness.getLeafId(BACKGROUND_CONTEXT);
 		if (leaf === null) throw new Error("missing failed response");
-		expect(await fixture.harness.sessionTree.getEntry(leaf)).toMatchObject({
+		expect(await fixture.harness.sessionTree.getEntry(leaf, BACKGROUND_CONTEXT)).toMatchObject({
 			message: { stopReason: "error", errorMessage: expect.stringContaining("Invalid deferred") },
 		});
 	});
@@ -997,7 +1107,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			},
 		}));
 		fixture.faux.setResponses([fauxAssistantMessage("truncated", { stopReason: "length" })]);
-		expect(await fixture.harness.prompt("go")).toMatchObject({
+		expect(await fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: true,
 			value: { kind: "completed", finalMessage: { stopReason: "length" } },
 		});
@@ -1008,12 +1118,14 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		fixture.faux.setResponses([
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "prompt is too long for this model" }),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await expect(fixture.harness.drive({ operationId: accepted.value.operationId })).rejects.toThrow(
-			/assistant settlement\(overflow\).*later AgentHarness runtime slice/,
-		);
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		await expect(
+			fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).rejects.toThrow(/assistant settlement\(overflow\).*later AgentHarness runtime slice/);
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: { kind: "assistant", generation: { status: "effect_pending" } },
 		});
 	});
@@ -1021,7 +1133,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 	it("fails an attempt in-band when the request-time model registration was swapped", async () => {
 		const fixture = await createFixture({ drive: "manual" });
 		fixture.faux.setResponses([fauxAssistantMessage("original must not run")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
 		const replacement = fauxProvider({
@@ -1032,8 +1144,8 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		replacement.setResponses([fauxAssistantMessage("replacement must not run")]);
 		fixture.models.setProvider(replacement.provider);
 
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.request");
-		await fixture.harness.runToCompletion();
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.request");
+		await fixture.harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await drive).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "failed", error: { code: "assistant_error" } } },
@@ -1045,11 +1157,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 	it("treats provider aborted under running control as corruption", async () => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "aborted" })]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await expect(fixture.harness.drive({ operationId: accepted.value.operationId })).rejects.toBeInstanceOf(
-			HarnessFault,
-		);
+		await expect(
+			fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).rejects.toBeInstanceOf(HarnessFault);
 	});
 
 	it("keeps convenience and explicit retry writes and events equivalent", async () => {
@@ -1057,30 +1169,39 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const createInstrumented = async (id: string) => {
 			const storage = new InstrumentedStorage(new MemoryStorage({ now: () => 1_000 }));
 			const session = new StorageBackedSession({ id, createdAt: 1_000, storageVersion: 1 }, storage);
-			await session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [
-						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
+			await session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
 						{
-							kind: "register",
-							op: "set",
-							namespace: "lane.state",
-							key: "main",
-							value: { currentOperationId: null, pendingNextRun: [] },
+							writes: [
+								{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
+								{
+									kind: "register",
+									op: "set",
+									namespace: "lane.state",
+									key: "main",
+									value: { currentOperationId: null, pendingNextRun: [] },
+								},
+							],
 						},
-					],
-				}),
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 			const faux = fauxProvider({ api: "faux-equivalence", tokenSize: { min: 1, max: 1 } });
 			const models = createModels();
 			models.setProvider(faux.provider);
-			const { harness } = await AgentHarness.create({
-				session,
-				models,
-				model: faux.getModel(),
-				activeToolNames: [],
-				retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
-			});
+			const { harness } = await AgentHarness.create(
+				{
+					session,
+					models,
+					model: faux.getModel(),
+					activeToolNames: [],
+					retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
+				},
+				BACKGROUND_CONTEXT,
+			);
 			storage.clearCommitAttempts();
 			faux.setResponses([
 				fauxAssistantMessage([], {
@@ -1114,12 +1235,18 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const explicit = await createInstrumented("explicit");
 		const convenience = await createInstrumented("convenience");
 		try {
-			const accepted = await explicit.harness.accept({ kind: "prompt", prompt: "go" });
+			const accepted = await explicit.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 			if (!accepted.ok) throw accepted.error;
 			expect(
-				await explicit.harness.drive({ operationId: accepted.value.operationId, waitForRetry: true }),
+				await explicit.harness.drive(
+					{ operationId: accepted.value.operationId, waitForRetry: true },
+					BACKGROUND_CONTEXT,
+				),
 			).toMatchObject({ ok: true, value: { kind: "settled", outcome: { kind: "completed" } } });
-			expect(await convenience.harness.prompt("go")).toMatchObject({ ok: true, value: { kind: "completed" } });
+			expect(await convenience.harness.prompt("go", undefined, BACKGROUND_CONTEXT)).toMatchObject({
+				ok: true,
+				value: { kind: "completed" },
+			});
 
 			const normalize = (value: unknown): unknown => {
 				const ids = new Map<string, string>();
@@ -1143,10 +1270,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			expect(normalize({ writes: explicit.storage.getCommitAttempts(), events: explicit.events })).toEqual(
 				normalize({ writes: convenience.storage.getCommitAttempts(), events: convenience.events }),
 			);
-			expect(await explicit.session.getStats()).toEqual(await convenience.session.getStats());
+			expect(await explicit.session.getStats(BACKGROUND_CONTEXT)).toEqual(
+				await convenience.session.getStats(BACKGROUND_CONTEXT),
+			);
 		} finally {
-			await explicit.harness.close();
-			await convenience.harness.close();
+			await explicit.harness.close(BACKGROUND_CONTEXT);
+			await convenience.harness.close(BACKGROUND_CONTEXT);
 		}
 	});
 
@@ -1160,7 +1289,9 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 secret failure" }),
 			fauxAssistantMessage("secret completion"),
 		]);
-		expect(await fixture.harness.prompt("secret prompt")).toMatchObject({
+		expect(
+			await fixture.harness.prompt("secret prompt", undefined, withTelemetryContext(telemetry, BACKGROUND_CONTEXT)),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "completed" },
 		});
@@ -1183,7 +1314,12 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		failed.faux.setResponses([
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "deterministic failure" }),
 		]);
-		expect(await failed.harness.prompt("fail")).toMatchObject({ ok: true, value: { kind: "failed" } });
+		expect(
+			await failed.harness.prompt("fail", undefined, withTelemetryContext(failedTelemetry, BACKGROUND_CONTEXT)),
+		).toMatchObject({
+			ok: true,
+			value: { kind: "failed" },
+		});
 		const failedStep = failedTelemetry.getSpans().find((span) => span.name === "pi.harness.step");
 		expect(failedStep?.attributes).toMatchObject({ "pi.step.outcome": "failed" });
 		expect(failedStep?.status).toEqual({ status: "error" });
@@ -1211,9 +1347,14 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 				},
 			}),
 		]);
-		const accepted = await deferredFixture.harness.accept({ kind: "prompt", prompt: "defer" });
+		const accepted = await deferredFixture.harness.accept({ kind: "prompt", prompt: "defer" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		expect(await deferredFixture.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await deferredFixture.harness.drive(
+				{ operationId: accepted.value.operationId },
+				withTelemetryContext(deferredTelemetry, BACKGROUND_CONTEXT),
+			),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "deferred" },
 		});
@@ -1232,7 +1373,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 second" }),
 		]);
 		const events = captureEvents(fixture.harness);
-		expect(await fixture.harness.prompt("go")).toMatchObject({
+		expect(await fixture.harness.prompt("go", undefined, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: true,
 			value: { kind: "failed", error: { message: "503 second" } },
 		});
@@ -1250,12 +1391,14 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage("ok"),
 		]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
 		now.mockReturnValue(1_010);
 		const timer = vi.spyOn(globalThis, "setTimeout");
-		expect(await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry })).toMatchObject({
+		expect(
+			await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
@@ -1265,12 +1408,16 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 	it("aborts a started local retry timer on close without advancing durable state", async () => {
 		const fixture = await createFixture({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 60_000 } });
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 first" })]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT);
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		const timer = vi.spyOn(globalThis, "setTimeout");
-		const waiting = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: true });
+		const waiting = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: true },
+			BACKGROUND_CONTEXT,
+		);
 		for (
 			let attempt = 0;
 			attempt < 100 && !timer.mock.calls.some(([, delay]) => typeof delay === "number" && delay > 1_000);
@@ -1279,13 +1426,15 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			await waitForTick();
 		}
 		expect(timer.mock.calls.some(([, delay]) => typeof delay === "number" && delay > 1_000)).toBe(true);
-		await fixture.harness.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(waiting).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(fixture), 1);
-		const session = await fixture.repo.open(fixture.session.metadata);
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
-		await session.close();
-		await fixture.repo.close();
+		const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect((await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value).toEqual(
+			before,
+		);
+		await session.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 
 	it("keeps retry_wait durable when close wins after the timer but before retry-ready commit", async () => {
@@ -1297,37 +1446,46 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 first" })]);
 		const waitForFakeAction = async () => {
 			for (let attempt = 0; attempt < 100; attempt++) {
-				if ((await fixture.harness.peekAction()) !== undefined) return;
+				if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT)) !== undefined) return;
 				await vi.advanceTimersByTimeAsync(0);
 			}
 			throw new Error("action did not park");
 		};
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const first = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const first = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForFakeAction();
-			const action = await fixture.harness.executeAction();
+			const action = await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
 		}
 		expect(await first).toMatchObject({ ok: true, value: { kind: "waiting", notBefore: 1_100 } });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 
-		const second = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: true });
+		const second = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: true },
+			BACKGROUND_CONTEXT,
+		);
 		await waitForFakeAction();
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForFakeAction();
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.retry_wait");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.retry_wait");
 		await vi.advanceTimersByTimeAsync(100);
 		await waitForFakeAction();
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.retry_ready" });
-		await fixture.harness.close();
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.retry_ready" });
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(second).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(fixture), 1);
-		const session = await fixture.repo.open(fixture.session.metadata);
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
-		await session.close();
-		await fixture.repo.close();
+		const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect((await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value).toEqual(
+			before,
+		);
+		await session.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 
 	it("automatic close before orphan-retry mutation preserves the pending effect", async () => {
@@ -1335,10 +1493,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		const reopened = await reopenFixture(fixture);
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
@@ -1346,7 +1505,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			reopened.fixture,
 			accepted.value.operationId,
 			"assistant.recover_retry",
-			() => reopened.harness.drive({ operationId: accepted.value.operationId }),
+			() => reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
 		);
 		expect(after).toEqual(before);
 	});
@@ -1356,10 +1515,11 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		const reopened = await reopenFixture(fixture);
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
@@ -1367,7 +1527,7 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			reopened.fixture,
 			accepted.value.operationId,
 			"assistant.recover_settlement",
-			() => reopened.harness.drive({ operationId: accepted.value.operationId }),
+			() => reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
 		);
 		expect(after).toEqual(before);
 	});
@@ -1376,16 +1536,20 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		const fixture = await createFixture({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 100 } });
 		fixture.faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 first" })]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		expect(
-			await fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }),
+			await fixture.harness.drive(
+				{ operationId: accepted.value.operationId, waitForRetry: false },
+				BACKGROUND_CONTEXT,
+			),
 		).toMatchObject({ ok: true, value: { kind: "waiting", notBefore: 1_100 } });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		now.mockReturnValue(1_100);
 
 		const after = await closeAtAutomaticBreakpoint(fixture, accepted.value.operationId, "assistant.retry_ready", () =>
-			fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }),
+			fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false }, BACKGROUND_CONTEXT),
 		);
 		expect(after).toEqual(before);
 	});
@@ -1395,27 +1559,30 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: true, maxRetries: 1, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		const reopened = await reopenFixture(fixture, { drive: "manual" });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
-		const drive = reopened.harness.drive({ operationId: accepted.value.operationId });
+		const drive = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(reopened.harness);
-		expect((await reopened.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await reopened.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({
 			kind: "assistant.recover_retry",
 			details: { operationId: accepted.value.operationId, attempt: 1, nextAttempt: 2 },
 		});
-		await reopened.harness.close();
+		await reopened.harness.close(BACKGROUND_CONTEXT);
 		await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(reopened.fixture), 1);
-		const session = await fixture.repo.open(fixture.session.metadata);
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
-		await session.close();
-		await fixture.repo.close();
+		const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect((await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value).toEqual(
+			before,
+		);
+		await session.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 
 	it("rechecks the deadline after the retry-ready breakpoint before committing", async () => {
@@ -1427,37 +1594,46 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
 		const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const first = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const first = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.executeAction();
+			const action = await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
 		}
 		expect(await first).toMatchObject({ ok: true, value: { kind: "waiting", notBefore: 1_100 } });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		now.mockReturnValue(1_100);
 
-		const second = fixture.harness.drive({
-			operationId: accepted.value.operationId,
-			waitForRetry: false,
-			deadline: 1_150,
-		});
+		const second = fixture.harness.drive(
+			{
+				operationId: accepted.value.operationId,
+				waitForRetry: false,
+				deadline: 1_150,
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({
 			kind: "assistant.retry_ready",
 			details: { operationId: accepted.value.operationId, attempt: 2 },
 		});
 		now.mockReturnValue(1_200);
-		expect((await fixture.harness.executeAction())?.kind).toBe("assistant.retry_ready");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("assistant.retry_ready");
 		expect(await second).toEqual({
 			ok: true,
 			value: { kind: "yielded", operationId: accepted.value.operationId },
 		});
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toEqual(before);
 	});
 
 	it("parks before the orphan-cap synthetic settlement and close preserves the pending effect", async () => {
@@ -1465,29 +1641,32 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 			drive: "manual",
 			retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
 		});
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const { drive: firstDrive } = await advanceToProviderBoundary(fixture.harness, accepted.value.operationId);
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 		const reopened = await reopenFixture(fixture, { drive: "manual" });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
-		const drive = reopened.harness.drive({ operationId: accepted.value.operationId });
+		const drive = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(reopened.harness);
-		expect((await reopened.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await reopened.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({
 			kind: "assistant.recover_settlement",
 			details: { operationId: accepted.value.operationId, attempt: 1 },
 		});
 		expect(events.map((event) => event.type)).toEqual(["run_resume", "turn_start", "message_start", "message_end"]);
-		await reopened.harness.close();
+		await reopened.harness.close(BACKGROUND_CONTEXT);
 		await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(reopened.fixture), 1);
-		const session = await fixture.repo.open(fixture.session.metadata);
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
-		await session.close();
-		await fixture.repo.close();
+		const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect((await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value).toEqual(
+			before,
+		);
+		await session.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 
 	it("parks at stable retry breakpoints and close leaves the durable wait unchanged", async () => {
@@ -1498,32 +1677,41 @@ describe("AgentHarness R3 generation recovery and retry", () => {
 		fixture.faux.setResponses([
 			fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 service unavailable" }),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "go" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const first = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: false });
+		const first = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: false },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.executeAction();
+			const action = await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
 		}
 		expect(await first).toMatchObject({ ok: true, value: { kind: "waiting", reason: "retry" } });
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
 
-		const second = fixture.harness.drive({ operationId: accepted.value.operationId, waitForRetry: true });
+		const second = fixture.harness.drive(
+			{ operationId: accepted.value.operationId, waitForRetry: true },
+			BACKGROUND_CONTEXT,
+		);
 		await waitForAction(fixture.harness);
-		expect((await fixture.harness.executeAction())?.kind).toBe("runtime.dispatch");
+		expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe("runtime.dispatch");
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({
 			kind: "assistant.retry_wait",
 			details: { operationId: accepted.value.operationId, attempt: 2, notBefore: expect.any(Number) },
 		});
-		await fixture.harness.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(second).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(fixture), 1);
-		const session = await fixture.repo.open(fixture.session.metadata);
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(before);
-		await session.close();
-		await fixture.repo.close();
+		const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect((await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value).toEqual(
+			before,
+		);
+		await session.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 });
 

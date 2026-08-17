@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 import { LaneMutationLine } from "../../src/harness/session/lane-mutations.ts";
 import { MemoryStorage } from "../../src/harness/session/memory.ts";
 import { SessionInvariantError, StorageBackedSession } from "../../src/harness/session/session.ts";
@@ -56,7 +57,7 @@ const runState = {
 } satisfies RunState;
 
 function commitSession(session: Session, transaction: Transaction) {
-	return session.mutate("main", (mutator) => mutator.commit(transaction));
+	return session.mutate("main", (mutator) => mutator.commit(transaction, BACKGROUND_CONTEXT), BACKGROUND_CONTEXT);
 }
 
 function laneWrites(leafId: string | null, state: LaneState = idleLaneState) {
@@ -101,8 +102,11 @@ class CountingLaneMutationLine extends LaneMutationLine {
 class RejectingCommitStorage extends MemoryStorage {
 	rejection: Error | undefined;
 
-	override commit(transaction: Parameters<MemoryStorage["commit"]>[0]) {
-		return this.rejection === undefined ? super.commit(transaction) : Promise.reject(this.rejection);
+	override commit(
+		transaction: Parameters<MemoryStorage["commit"]>[0],
+		context: Parameters<MemoryStorage["commit"]>[1],
+	) {
+		return this.rejection === undefined ? super.commit(transaction, context) : Promise.reject(this.rejection);
 	}
 }
 
@@ -111,14 +115,17 @@ class BlockingCommitStorage extends MemoryStorage {
 	admitted = false;
 	private releaseCommit: (() => void) | undefined;
 
-	override async commit(transaction: Parameters<MemoryStorage["commit"]>[0]) {
+	override async commit(
+		transaction: Parameters<MemoryStorage["commit"]>[0],
+		context: Parameters<MemoryStorage["commit"]>[1],
+	) {
 		if (this.block) {
 			this.admitted = true;
 			await new Promise<void>((resolve) => {
 				this.releaseCommit = resolve;
 			});
 		}
-		return super.commit(transaction);
+		return super.commit(transaction, context);
 	}
 
 	release(): void {
@@ -132,107 +139,112 @@ describe("StorageBackedSession SessionTree", () => {
 		const session = await createTreeSession();
 		const other = session.view("other");
 
-		expect(await session.getLeafId()).toBe(CUSTOM_ID);
-		expect(await other.getLeafId()).toBe(OTHER_ID);
-		expect(await session.getEntry(CHILD_ID)).toMatchObject({ id: CHILD_ID, parentId: ROOT_ID });
-		expect(await session.getEntry("00000000-0000-7000-8000-000000000099")).toBeUndefined();
-		expect(await session.getStats()).toMatchObject({ messageCount: 1 });
-		expect(await other.getStats()).toEqual(await session.getStats());
+		expect(await session.getLeafId(BACKGROUND_CONTEXT)).toBe(CUSTOM_ID);
+		expect(await other.getLeafId(BACKGROUND_CONTEXT)).toBe(OTHER_ID);
+		expect(await session.getEntry(CHILD_ID, BACKGROUND_CONTEXT)).toMatchObject({ id: CHILD_ID, parentId: ROOT_ID });
+		expect(await session.getEntry("00000000-0000-7000-8000-000000000099", BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getStats(BACKGROUND_CONTEXT)).toMatchObject({ messageCount: 1 });
+		expect(await other.getStats(BACKGROUND_CONTEXT)).toEqual(await session.getStats(BACKGROUND_CONTEXT));
 
-		await session.setName("shared");
-		expect(await other.getName()).toBe("shared");
-		await session.close();
+		await session.setName("shared", BACKGROUND_CONTEXT);
+		expect(await other.getName(BACKGROUND_CONTEXT)).toBe("shared");
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("rejects missing lanes", async () => {
 		const session = await createTreeSession();
-		await expect(session.view("missing").getLeafId()).rejects.toThrow("Unknown lane");
-		await session.close();
+		await expect(session.view("missing").getLeafId(BACKGROUND_CONTEXT)).rejects.toThrow("Unknown lane");
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("reads, sets, and deletes global facts while preserving JSON null", async () => {
 		const session = await createTreeSession();
 		const other = session.view("other");
 
-		expect(await session.getName()).toBeUndefined();
-		expect(await session.getLabel(ROOT_ID)).toBeUndefined();
-		expect(await session.getCustomFact("state")).toBeUndefined();
+		expect(await session.getName(BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getLabel(ROOT_ID, BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getCustomFact("state", BACKGROUND_CONTEXT)).toBeUndefined();
 
-		await session.setName("name");
-		await other.setLabel(ROOT_ID, "root label");
-		await session.setCustomFact("state", null);
-		expect(await other.getName()).toBe("name");
-		expect(await session.getLabel(ROOT_ID)).toBe("root label");
-		expect(await other.getCustomFact("state")).toBeNull();
+		await session.setName("name", BACKGROUND_CONTEXT);
+		await other.setLabel(ROOT_ID, "root label", BACKGROUND_CONTEXT);
+		await session.setCustomFact("state", null, BACKGROUND_CONTEXT);
+		expect(await other.getName(BACKGROUND_CONTEXT)).toBe("name");
+		expect(await session.getLabel(ROOT_ID, BACKGROUND_CONTEXT)).toBe("root label");
+		expect(await other.getCustomFact("state", BACKGROUND_CONTEXT)).toBeNull();
 
-		await other.setName(undefined);
-		await session.setLabel(ROOT_ID, undefined);
-		await other.setCustomFact("state", undefined);
-		expect(await session.getName()).toBeUndefined();
-		expect(await other.getLabel(ROOT_ID)).toBeUndefined();
-		expect(await session.getCustomFact("state")).toBeUndefined();
-		await session.close();
+		await other.setName(undefined, BACKGROUND_CONTEXT);
+		await session.setLabel(ROOT_ID, undefined, BACKGROUND_CONTEXT);
+		await other.setCustomFact("state", undefined, BACKGROUND_CONTEXT);
+		expect(await session.getName(BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await other.getLabel(ROOT_ID, BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getCustomFact("state", BACKGROUND_CONTEXT)).toBeUndefined();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("passes fact values directly to storage", async () => {
 		const session = await createTreeSession();
 		const value = { nested: ["original"] };
 
-		await session.setCustomFact("state", value);
-		expect(await session.getCustomFact("state")).toBe(value);
-		await session.close();
+		await session.setCustomFact("state", value, BACKGROUND_CONTEXT);
+		expect(await session.getCustomFact("state", BACKGROUND_CONTEXT)).toBe(value);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("applies global query ordering, filters, exclusive cursors, and limits", async () => {
 		const session = await createTreeSession();
-		const all = await session.findEntries();
+		const all = await session.findEntries(undefined, BACKGROUND_CONTEXT);
 		const custom = all.find((entry) => entry.id === CUSTOM_ID);
 		if (custom === undefined) throw new Error("Expected custom entry");
 
 		expect(all.map((entry) => entry.id)).toEqual([OTHER_ID, CUSTOM_ID, CHILD_ID, ROOT_ID]);
-		expect((await session.findEntries({ order: "asc", type: "custom" })).map((entry) => entry.id)).toEqual([
-			ROOT_ID,
-			CUSTOM_ID,
-			OTHER_ID,
-		]);
-		expect((await session.findEntries({ customType: "note", limit: 1 })).map((entry) => entry.id)).toEqual([
-			CUSTOM_ID,
-		]);
-		expect((await session.findEntries({ cursor: { seq: custom.seq } })).map((entry) => entry.id)).toEqual([
-			CHILD_ID,
-			ROOT_ID,
-		]);
 		expect(
-			(await session.findEntries({ order: "asc", cursor: { seq: custom.seq } })).map((entry) => entry.id),
+			(await session.findEntries({ order: "asc", type: "custom" }, BACKGROUND_CONTEXT)).map((entry) => entry.id),
+		).toEqual([ROOT_ID, CUSTOM_ID, OTHER_ID]);
+		expect(
+			(await session.findEntries({ customType: "note", limit: 1 }, BACKGROUND_CONTEXT)).map((entry) => entry.id),
+		).toEqual([CUSTOM_ID]);
+		expect(
+			(await session.findEntries({ cursor: { seq: custom.seq } }, BACKGROUND_CONTEXT)).map((entry) => entry.id),
+		).toEqual([CHILD_ID, ROOT_ID]);
+		expect(
+			(await session.findEntries({ order: "asc", cursor: { seq: custom.seq } }, BACKGROUND_CONTEXT)).map(
+				(entry) => entry.id,
+			),
 		).toEqual([OTHER_ID]);
-		expect((await session.findEntry({ type: "message" }))?.id).toBe(CHILD_ID);
-		expect(await session.findEntry({ customType: "missing" })).toBeUndefined();
-		await session.close();
+		expect((await session.findEntry({ type: "message" }, BACKGROUND_CONTEXT))?.id).toBe(CHILD_ID);
+		expect(await session.findEntry({ customType: "missing" }, BACKGROUND_CONTEXT)).toBeUndefined();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("applies branch defaults, inclusive stops, filters, cursors, and lane leaves", async () => {
 		const session = await createTreeSession();
-		const path = await session.findEntriesOnBranch();
+		const path = await session.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT);
 		const child = path.find((entry) => entry.id === CHILD_ID);
 		if (child === undefined) throw new Error("Expected child entry");
 
 		expect(path.map((entry) => entry.id)).toEqual([CUSTOM_ID, CHILD_ID, ROOT_ID]);
-		expect((await session.findEntriesOnBranch({ stopAtId: CHILD_ID })).map((entry) => entry.id)).toEqual([
-			CUSTOM_ID,
-			CHILD_ID,
-		]);
-		expect((await session.view("other").findEntriesOnBranch()).map((entry) => entry.id)).toEqual([OTHER_ID, ROOT_ID]);
 		expect(
-			(await session.findEntriesOnBranch({ stopAtType: "message", type: "custom" })).map((entry) => entry.id),
-		).toEqual([CUSTOM_ID]);
+			(await session.findEntriesOnBranch({ stopAtId: CHILD_ID }, BACKGROUND_CONTEXT)).map((entry) => entry.id),
+		).toEqual([CUSTOM_ID, CHILD_ID]);
 		expect(
-			(await session.findEntriesOnBranch({ order: "oldestFirst", cursor: { seq: child.seq }, limit: 1 })).map(
+			(await session.view("other").findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).map((entry) => entry.id),
+		).toEqual([OTHER_ID, ROOT_ID]);
+		expect(
+			(await session.findEntriesOnBranch({ stopAtType: "message", type: "custom" }, BACKGROUND_CONTEXT)).map(
 				(entry) => entry.id,
 			),
 		).toEqual([CUSTOM_ID]);
-		expect((await session.findEntryOnBranch({ customType: "root" }))?.id).toBe(ROOT_ID);
-		expect(await session.findEntryOnBranch({ customType: "missing" })).toBeUndefined();
-		await session.close();
+		expect(
+			(
+				await session.findEntriesOnBranch(
+					{ order: "oldestFirst", cursor: { seq: child.seq }, limit: 1 },
+					BACKGROUND_CONTEXT,
+				)
+			).map((entry) => entry.id),
+		).toEqual([CUSTOM_ID]);
+		expect((await session.findEntryOnBranch({ customType: "root" }, BACKGROUND_CONTEXT))?.id).toBe(ROOT_ID);
+		expect(await session.findEntryOnBranch({ customType: "missing" }, BACKGROUND_CONTEXT)).toBeUndefined();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("returns an empty default branch for a lane at the root", async () => {
@@ -241,9 +253,9 @@ describe("StorageBackedSession SessionTree", () => {
 			writes: [{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null }],
 		});
 
-		expect(await session.findEntriesOnBranch()).toEqual([]);
-		expect(await session.findEntryOnBranch()).toBeUndefined();
-		await session.close();
+		expect(await session.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).toEqual([]);
+		expect(await session.findEntryOnBranch(undefined, BACKGROUND_CONTEXT)).toBeUndefined();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("atomically appends messages and custom entries to the bound lane", async () => {
@@ -258,9 +270,12 @@ describe("StorageBackedSession SessionTree", () => {
 		});
 		storage.clearCommitAttempts();
 
-		const messageId = await session.appendMessage({ role: "user", content: "hello", timestamp: NOW });
-		const customId = await session.appendCustomEntry("note", { nested: ["value"] });
-		const withoutDataId = await session.view("other").appendCustomEntry("marker");
+		const messageId = await session.appendMessage(
+			{ role: "user", content: "hello", timestamp: NOW },
+			BACKGROUND_CONTEXT,
+		);
+		const customId = await session.appendCustomEntry("note", { nested: ["value"] }, BACKGROUND_CONTEXT);
+		const withoutDataId = await session.view("other").appendCustomEntry("marker", undefined, BACKGROUND_CONTEXT);
 
 		expect(storage.getCommitAttempts().map((attempt) => attempt.writes)).toEqual([
 			[
@@ -301,10 +316,10 @@ describe("StorageBackedSession SessionTree", () => {
 				{ kind: "register", op: "set", namespace: "lane.leaf", key: "other", value: withoutDataId },
 			],
 		]);
-		expect(await session.getLeafId()).toBe(customId);
-		expect(await session.view("other").getLeafId()).toBe(withoutDataId);
-		expect(await session.getEntry(messageId)).toMatchObject({ parentId: null, type: "message" });
-		expect(await session.getEntry(customId)).toEqual(
+		expect(await session.getLeafId(BACKGROUND_CONTEXT)).toBe(customId);
+		expect(await session.view("other").getLeafId(BACKGROUND_CONTEXT)).toBe(withoutDataId);
+		expect(await session.getEntry(messageId, BACKGROUND_CONTEXT)).toMatchObject({ parentId: null, type: "message" });
+		expect(await session.getEntry(customId, BACKGROUND_CONTEXT)).toEqual(
 			expect.objectContaining({
 				parentId: messageId,
 				type: "custom",
@@ -312,10 +327,10 @@ describe("StorageBackedSession SessionTree", () => {
 				data: { nested: ["value"] },
 			}),
 		);
-		const withoutData = await session.getEntry(withoutDataId);
+		const withoutData = await session.getEntry(withoutDataId, BACKGROUND_CONTEXT);
 		expect(withoutData).toEqual(expect.objectContaining({ parentId: null, type: "custom", customType: "marker" }));
 		expect(withoutData).not.toHaveProperty("data");
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("defers appends into an active run without moving the lane leaf", async () => {
@@ -332,23 +347,23 @@ describe("StorageBackedSession SessionTree", () => {
 		storage.clearCommitAttempts();
 
 		const [customId, messageId] = await Promise.all([
-			session.appendCustomEntry("note", { deferred: true }),
-			session.appendMessage({ role: "user", content: "later", timestamp: NOW }),
+			session.appendCustomEntry("note", { deferred: true }, BACKGROUND_CONTEXT),
+			session.appendMessage({ role: "user", content: "later", timestamp: NOW }, BACKGROUND_CONTEXT),
 		]);
 
-		expect(await session.getLeafId()).toBe(ROOT_ID);
-		expect(await session.getEntries([customId, messageId])).toEqual(new Map());
-		expect(await session.getRegister("pending.entry", customId)).toMatchObject({
+		expect(await session.getLeafId(BACKGROUND_CONTEXT)).toBe(ROOT_ID);
+		expect(await session.getEntries([customId, messageId], BACKGROUND_CONTEXT)).toEqual(new Map());
+		expect(await session.getRegister("pending.entry", customId, BACKGROUND_CONTEXT)).toMatchObject({
 			value: { type: "custom", customType: "note", payload: { deferred: true } },
 		});
-		expect(await session.getRegister("pending.entry", messageId)).toMatchObject({
+		expect(await session.getRegister("pending.entry", messageId, BACKGROUND_CONTEXT)).toMatchObject({
 			value: { type: "message", payload: { role: "user", content: "later", timestamp: NOW } },
 		});
-		expect(await session.getRegister("op.state", OPERATION_ID)).toMatchObject({
+		expect(await session.getRegister("op.state", OPERATION_ID, BACKGROUND_CONTEXT)).toMatchObject({
 			value: { inbox: { writes: [customId, messageId] } },
 		});
 		expect(storage.getCommitAttempts()).toHaveLength(2);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("rejects without writing while structural-operation waiting is not implemented", async () => {
@@ -375,11 +390,11 @@ describe("StorageBackedSession SessionTree", () => {
 		});
 
 		storage.clearCommitAttempts();
-		const append = session.appendCustomEntry("during-structural");
+		const append = session.appendCustomEntry("during-structural", undefined, BACKGROUND_CONTEXT);
 		await expect(append).rejects.toThrow("Cannot append while structural operation");
 		expect(storage.getCommitAttempts()).toEqual([]);
-		expect(await session.getLeafId()).toBe(ROOT_ID);
-		await session.close();
+		expect(await session.getLeafId(BACKGROUND_CONTEXT)).toBe(ROOT_ID);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("diverges lanes that append from the same shared leaf", async () => {
@@ -392,18 +407,24 @@ describe("StorageBackedSession SessionTree", () => {
 			thinkingLevel: "off" as const,
 			activeToolNames: [],
 		};
-		const review = await session.createLane("review", ROOT_ID, configuration);
+		const review = await session.createLane("review", ROOT_ID, configuration, BACKGROUND_CONTEXT);
 
 		const [mainId, reviewId] = await Promise.all([
-			session.appendCustomEntry("main-child"),
-			review.appendCustomEntry("review-child"),
+			session.appendCustomEntry("main-child", undefined, BACKGROUND_CONTEXT),
+			review.appendCustomEntry("review-child", undefined, BACKGROUND_CONTEXT),
 		]);
 
-		expect((await session.findEntriesOnBranch()).map((entry) => entry.id)).toEqual([mainId, ROOT_ID]);
-		expect((await review.findEntriesOnBranch()).map((entry) => entry.id)).toEqual([reviewId, ROOT_ID]);
-		expect((await session.getEntry(mainId))?.parentId).toBe(ROOT_ID);
-		expect((await session.getEntry(reviewId))?.parentId).toBe(ROOT_ID);
-		await session.close();
+		expect((await session.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([
+			mainId,
+			ROOT_ID,
+		]);
+		expect((await review.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([
+			reviewId,
+			ROOT_ID,
+		]);
+		expect((await session.getEntry(mainId, BACKGROUND_CONTEXT))?.parentId).toBe(ROOT_ID);
+		expect((await session.getEntry(reviewId, BACKGROUND_CONTEXT))?.parentId).toBe(ROOT_ID);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("serializes concurrent appends into one linear lane branch", async () => {
@@ -413,12 +434,16 @@ describe("StorageBackedSession SessionTree", () => {
 		});
 
 		const [firstId, secondId] = await Promise.all([
-			session.appendCustomEntry("first"),
-			session.appendCustomEntry("second"),
+			session.appendCustomEntry("first", undefined, BACKGROUND_CONTEXT),
+			session.appendCustomEntry("second", undefined, BACKGROUND_CONTEXT),
 		]);
 
-		expect((await session.findEntriesOnBranch()).map((entry) => entry.id)).toEqual([secondId, firstId, ROOT_ID]);
-		await session.close();
+		expect((await session.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([
+			secondId,
+			firstId,
+			ROOT_ID,
+		]);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("passes append payloads directly to storage", async () => {
@@ -430,18 +455,18 @@ describe("StorageBackedSession SessionTree", () => {
 		const data = { nested: ["original"] };
 		const runCountBeforeAppends = laneMutationLine.runCount;
 
-		const id = await session.appendCustomEntry("note", data);
-		const entry = await session.getEntry(id);
+		const id = await session.appendCustomEntry("note", data, BACKGROUND_CONTEXT);
+		const entry = await session.getEntry(id, BACKGROUND_CONTEXT);
 		if (entry?.type !== "custom") throw new Error("Expected custom entry");
 		expect(entry.data).toBe(data);
 		expect(storage.getCommitAttempts()).toHaveLength(1);
 		const message = { role: "user" as const, content: "original", timestamp: NOW };
-		const messageId = await session.appendMessage(message);
-		const messageEntry = await session.getEntry(messageId);
+		const messageId = await session.appendMessage(message, BACKGROUND_CONTEXT);
+		const messageEntry = await session.getEntry(messageId, BACKGROUND_CONTEXT);
 		if (messageEntry?.type !== "message") throw new Error("Expected message entry");
 		expect(messageEntry.message).toBe(message);
 		expect(laneMutationLine.runCount - runCountBeforeAppends).toBe(2);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("fails fast when active operation registers are inconsistent", async () => {
@@ -452,27 +477,30 @@ describe("StorageBackedSession SessionTree", () => {
 		});
 		storage.clearCommitAttempts();
 
-		const append = session.appendCustomEntry("note");
+		const append = session.appendCustomEntry("note", undefined, BACKGROUND_CONTEXT);
 		await expect(append).rejects.toBeInstanceOf(SessionInvariantError);
 		await expect(append).rejects.toThrow("missing op.meta");
 		expect(storage.getCommitAttempts()).toEqual([]);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("propagates append storage failures without moving the leaf", async () => {
 		const storage = new RejectingCommitStorage({ now: () => NOW });
-		await storage.commit({
-			writes: [{ kind: "entry", entry: customEntry(ROOT_ID, null) }, ...laneWrites(ROOT_ID)],
-		});
+		await storage.commit(
+			{
+				writes: [{ kind: "entry", entry: customEntry(ROOT_ID, null) }, ...laneWrites(ROOT_ID)],
+			},
+			BACKGROUND_CONTEXT,
+		);
 		const session = new StorageBackedSession(metadata, storage);
 		const rejection = new Error("commit failed");
 		storage.rejection = rejection;
 
-		await expect(session.appendCustomEntry("note")).rejects.toBe(rejection);
+		await expect(session.appendCustomEntry("note", undefined, BACKGROUND_CONTEXT)).rejects.toBe(rejection);
 		storage.rejection = undefined;
-		expect(await session.getLeafId()).toBe(ROOT_ID);
-		expect((await session.findEntries()).map((entry) => entry.id)).toEqual([ROOT_ID]);
-		await session.close();
+		expect(await session.getLeafId(BACKGROUND_CONTEXT)).toBe(ROOT_ID);
+		expect((await session.findEntries(undefined, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([ROOT_ID]);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("drains an append whose storage commit was admitted before close", async () => {
@@ -481,9 +509,9 @@ describe("StorageBackedSession SessionTree", () => {
 		await commitSession(session, { writes: [...laneWrites(null)] });
 		storage.block = true;
 
-		const append = session.appendCustomEntry("admitted");
+		const append = session.appendCustomEntry("admitted", undefined, BACKGROUND_CONTEXT);
 		while (!storage.admitted) await Promise.resolve();
-		const close = session.close();
+		const close = session.close(BACKGROUND_CONTEXT);
 		storage.release();
 
 		const id = await append;
@@ -494,17 +522,17 @@ describe("StorageBackedSession SessionTree", () => {
 	it("rejects all SessionTree operations after close, including existing views", async () => {
 		const session = await createTreeSession();
 		const view = session.view("other");
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 
 		const operations: Array<() => Promise<unknown>> = [
-			() => session.getLeafId(),
-			() => view.getEntry(ROOT_ID),
-			() => session.getStats(),
-			() => view.getName(),
-			() => session.setName("closed"),
-			() => view.findEntries(),
-			() => session.findEntriesOnBranch(),
-			() => view.appendCustomEntry("closed"),
+			() => session.getLeafId(BACKGROUND_CONTEXT),
+			() => view.getEntry(ROOT_ID, BACKGROUND_CONTEXT),
+			() => session.getStats(BACKGROUND_CONTEXT),
+			() => view.getName(BACKGROUND_CONTEXT),
+			() => session.setName("closed", BACKGROUND_CONTEXT),
+			() => view.findEntries(undefined, BACKGROUND_CONTEXT),
+			() => session.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT),
+			() => view.appendCustomEntry("closed", undefined, BACKGROUND_CONTEXT),
 		];
 		for (const operation of operations) await expect(operation()).rejects.toThrow("Session is closed");
 	});

@@ -1,6 +1,6 @@
 import { type ToolResultMessage, validateToolArguments } from "@earendil-works/pi-ai";
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { AgentTool, AgentToolCall, AgentToolResult } from "../../types.ts";
+import type { Context } from "../context.ts";
 import type { JsonValue } from "../session/types.ts";
 import type { EffectGate } from "./effect-gate.ts";
 
@@ -122,12 +122,12 @@ export async function executeToolCall(
 	call: ClearedToolCall,
 	effectGate: EffectGate,
 	onUpdate: (partial: AgentToolResult<unknown>) => void,
-	_telemetryContext: TelemetryContext,
+	_context: Context,
 ): Promise<ExecutedToolCall> {
 	let acceptingUpdates = true;
 	effectGate.assertOpen();
 	try {
-		const result = await call.tool.execute(call.toolCall.id, call.args, effectGate.signal, (partial) => {
+		const result = await call.tool.execute(call.toolCall.id, call.args, effectGate.context.abortSignal, (partial) => {
 			if (acceptingUpdates) onUpdate(partial);
 		});
 		return { result, isError: false };

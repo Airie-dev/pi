@@ -2,6 +2,7 @@ import type { Api, AssistantMessage, RetryPolicy, Usage } from "@earendil-works/
 import { isContextOverflow, isRecoverableLength, isRetryableAssistantError } from "@earendil-works/pi-ai";
 import type { AgentMessage, AgentToolCall } from "../../types.ts";
 import type { DriveOptions, SuspendedOperation, TerminalOperationOutcome } from "../agent-harness.ts";
+import type { Context } from "../context.ts";
 import type { RestoredLane } from "../restore.ts";
 import { SessionInvariantError } from "../session/session.ts";
 import type {
@@ -249,6 +250,7 @@ export function isPendingAssistant(message: AgentMessage): boolean {
 export async function hydrateTerminalOutcome(
 	reader: Pick<SessionMutator, "getEntries">,
 	lastResult: LaneLastResult,
+	context: Context,
 ): Promise<TerminalOperationOutcome> {
 	const referencedIds = [
 		...(lastResult.leafId === null ? [] : [lastResult.leafId]),
@@ -261,7 +263,7 @@ export async function hydrateTerminalOutcome(
 			? [lastResult.summaryEntryId]
 			: []),
 	];
-	const entries = await reader.getEntries([...new Set(referencedIds)]);
+	const entries = await reader.getEntries([...new Set(referencedIds)], context);
 	if (lastResult.leafId !== null && !entries.has(lastResult.leafId)) {
 		throw new SessionInvariantError(`Terminal leaf ${lastResult.leafId} is missing`);
 	}

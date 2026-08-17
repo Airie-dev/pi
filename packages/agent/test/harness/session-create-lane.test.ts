@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 // Implements Part 8, slice 2.
 // Full state validation is R1; harness-wide close admission is R6.
 
@@ -40,7 +41,7 @@ function rootTransaction(): Transaction {
 }
 
 function commitSession(session: Session, transaction: Transaction) {
-	return session.mutate("main", (mutator) => mutator.commit(transaction));
+	return session.mutate("main", (mutator) => mutator.commit(transaction, BACKGROUND_CONTEXT), BACKGROUND_CONTEXT);
 }
 
 function expectedLaneWrites(name: string, at: string | null, value: LaneConfiguration): Transaction["writes"] {
@@ -69,7 +70,9 @@ class RejectingCommitStorage extends StorageDecorator {
 	rejection: Error | undefined;
 
 	override commit(transaction: Transaction) {
-		return this.rejection === undefined ? super.commit(transaction) : Promise.reject(this.rejection);
+		return this.rejection === undefined
+			? super.commit(transaction, BACKGROUND_CONTEXT)
+			: Promise.reject(this.rejection);
 	}
 }
 
@@ -87,7 +90,7 @@ class BlockingCommitStorage extends StorageDecorator {
 			this.admittedGate.resolve();
 			await this.releaseGate.promise;
 		}
-		return super.commit(transaction);
+		return super.commit(transaction, BACKGROUND_CONTEXT);
 	}
 
 	release(): void {
@@ -106,20 +109,26 @@ describe("StorageBackedSession.createLane", () => {
 		await commitSession(session, rootTransaction());
 		storage.clearCommitAttempts();
 
-		const rooted = await session.createLane("rooted", ROOT_ID, configuration);
-		const empty = await session.createLane("empty", null, configuration);
+		const rooted = await session.createLane("rooted", ROOT_ID, configuration, BACKGROUND_CONTEXT);
+		const empty = await session.createLane("empty", null, configuration, BACKGROUND_CONTEXT);
 
 		expect(storage.getCommitAttempts().map((attempt) => attempt.writes)).toEqual([
 			expectedLaneWrites("rooted", ROOT_ID, configuration),
 			expectedLaneWrites("empty", null, configuration),
 		]);
-		expect(await rooted.getLeafId()).toBe(ROOT_ID);
-		expect((await rooted.findEntriesOnBranch()).map((entry: Entry) => entry.id)).toEqual([ROOT_ID]);
-		expect(await empty.getLeafId()).toBeNull();
-		expect(await empty.findEntriesOnBranch()).toEqual([]);
-		expect(await session.getRegister("lane.config", "rooted")).toMatchObject({ value: configuration });
-		expect(await session.getRegister("lane.state", "rooted")).toMatchObject({ value: idleLaneState });
-		await session.close();
+		expect(await rooted.getLeafId(BACKGROUND_CONTEXT)).toBe(ROOT_ID);
+		expect((await rooted.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).map((entry: Entry) => entry.id)).toEqual(
+			[ROOT_ID],
+		);
+		expect(await empty.getLeafId(BACKGROUND_CONTEXT)).toBeNull();
+		expect(await empty.findEntriesOnBranch(undefined, BACKGROUND_CONTEXT)).toEqual([]);
+		expect(await session.getRegister("lane.config", "rooted", BACKGROUND_CONTEXT)).toMatchObject({
+			value: configuration,
+		});
+		expect(await session.getRegister("lane.state", "rooted", BACKGROUND_CONTEXT)).toMatchObject({
+			value: idleLaneState,
+		});
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("passes configuration directly to storage", async () => {
@@ -133,11 +142,11 @@ describe("StorageBackedSession.createLane", () => {
 			activeToolNames: [...configuration.activeToolNames],
 		};
 
-		await session.createLane("captured", ROOT_ID, supplied);
+		await session.createLane("captured", ROOT_ID, supplied, BACKGROUND_CONTEXT);
 
-		expect((await session.getRegister("lane.config", "captured"))?.value).toBe(supplied);
+		expect((await session.getRegister("lane.config", "captured", BACKGROUND_CONTEXT))?.value).toBe(supplied);
 		expect(storage.getCommitAttempts()).toHaveLength(1);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	// Slice 2 defines classifiable session failures. Mapping them to AgentHarness
@@ -148,29 +157,29 @@ describe("StorageBackedSession.createLane", () => {
 		await commitSession(session, rootTransaction());
 		storage.clearCommitAttempts();
 
-		await expect(session.createLane("", ROOT_ID, configuration)).rejects.toMatchObject({
+		await expect(session.createLane("", ROOT_ID, configuration, BACKGROUND_CONTEXT)).rejects.toMatchObject({
 			name: "SessionInvalidLaneError",
 			lane: "",
 		});
 		expect(storage.getCommitAttempts()).toEqual([]);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("rejects existing configured lanes and fresh unconfigured main without writing", async () => {
 		const storage = new InstrumentedStorage(new MemoryStorage({ now: () => NOW }));
 		const session = new StorageBackedSession(metadata, storage);
 		await commitSession(session, rootTransaction());
-		await session.createLane("existing", ROOT_ID, configuration);
+		await session.createLane("existing", ROOT_ID, configuration, BACKGROUND_CONTEXT);
 		storage.clearCommitAttempts();
 
 		for (const name of ["existing", "main"]) {
-			await expect(session.createLane(name, null, configuration)).rejects.toMatchObject({
+			await expect(session.createLane(name, null, configuration, BACKGROUND_CONTEXT)).rejects.toMatchObject({
 				name: "SessionLaneExistsError",
 				lane: name,
 			});
 		}
 		expect(storage.getCommitAttempts()).toEqual([]);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("rejects unknown non-null anchors without writing", async () => {
@@ -179,12 +188,14 @@ describe("StorageBackedSession.createLane", () => {
 		await commitSession(session, rootTransaction());
 		storage.clearCommitAttempts();
 
-		await expect(session.createLane("missing-target", MISSING_ID, configuration)).rejects.toMatchObject({
+		await expect(
+			session.createLane("missing-target", MISSING_ID, configuration, BACKGROUND_CONTEXT),
+		).rejects.toMatchObject({
 			name: "SessionUnknownTargetError",
 			targetId: MISSING_ID,
 		});
 		expect(storage.getCommitAttempts()).toEqual([]);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("fails fast on every partial lane-register combination instead of repairing it", async () => {
@@ -215,9 +226,11 @@ describe("StorageBackedSession.createLane", () => {
 			await commitSession(session, { writes: partialWrites.filter((_, index) => (mask & (1 << index)) !== 0) });
 			storage.clearCommitAttempts();
 
-			await expect(session.createLane("broken", null, configuration)).rejects.toBeInstanceOf(SessionInvariantError);
+			await expect(session.createLane("broken", null, configuration, BACKGROUND_CONTEXT)).rejects.toBeInstanceOf(
+				SessionInvariantError,
+			);
 			expect(storage.getCommitAttempts()).toEqual([]);
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 		}
 	});
 
@@ -228,8 +241,8 @@ describe("StorageBackedSession.createLane", () => {
 		storage.clearCommitAttempts();
 
 		const results = await Promise.allSettled([
-			session.createLane("race", ROOT_ID, configuration),
-			session.createLane("race", null, configuration),
+			session.createLane("race", ROOT_ID, configuration, BACKGROUND_CONTEXT),
+			session.createLane("race", null, configuration, BACKGROUND_CONTEXT),
 		]);
 
 		const fulfilled = results.filter((result) => result.status === "fulfilled");
@@ -238,28 +251,31 @@ describe("StorageBackedSession.createLane", () => {
 		expect(rejected).toHaveLength(1);
 		expect(rejected[0]).toMatchObject({ reason: { name: "SessionLaneExistsError", lane: "race" } });
 		expect(storage.getCommitAttempts()).toHaveLength(1);
-		const leaf = await session.view("race").getLeafId();
+		const leaf = await session.view("race").getLeafId(BACKGROUND_CONTEXT);
 		expect([ROOT_ID, null]).toContain(leaf);
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("orders lane creation with appends submitted through the prospective view", async () => {
 		const session = new StorageBackedSession(metadata, new MemoryStorage({ now: () => NOW }));
 		await commitSession(session, rootTransaction());
 
-		const creating = session.createLane("created-first", ROOT_ID, configuration);
-		const appended = session.view("created-first").appendCustomEntry("note");
+		const creating = session.createLane("created-first", ROOT_ID, configuration, BACKGROUND_CONTEXT);
+		const appended = session.view("created-first").appendCustomEntry("note", undefined, BACKGROUND_CONTEXT);
 		const [, entryId] = await Promise.all([creating, appended]);
-		expect(await session.view("created-first").getLeafId()).toBe(entryId);
-		expect(await session.getEntry(entryId)).toMatchObject({ parentId: ROOT_ID, customType: "note" });
+		expect(await session.view("created-first").getLeafId(BACKGROUND_CONTEXT)).toBe(entryId);
+		expect(await session.getEntry(entryId, BACKGROUND_CONTEXT)).toMatchObject({
+			parentId: ROOT_ID,
+			customType: "note",
+		});
 
-		const rejectedAppend = session.view("append-first").appendCustomEntry("note");
-		const laterCreation = session.createLane("append-first", ROOT_ID, configuration);
+		const rejectedAppend = session.view("append-first").appendCustomEntry("note", undefined, BACKGROUND_CONTEXT);
+		const laterCreation = session.createLane("append-first", ROOT_ID, configuration, BACKGROUND_CONTEXT);
 		await expect(rejectedAppend).rejects.toBeInstanceOf(SessionInvariantError);
 		await laterCreation;
-		expect(await session.view("append-first").getLeafId()).toBe(ROOT_ID);
-		expect(await session.findEntries({ customType: "note" })).toHaveLength(1);
-		await session.close();
+		expect(await session.view("append-first").getLeafId(BACKGROUND_CONTEXT)).toBe(ROOT_ID);
+		expect(await session.findEntries({ customType: "note" }, BACKGROUND_CONTEXT)).toHaveLength(1);
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("propagates commit failure without publishing partial lane state", async () => {
@@ -269,12 +285,12 @@ describe("StorageBackedSession.createLane", () => {
 		const rejection = new Error("commit failed");
 		storage.rejection = rejection;
 
-		await expect(session.createLane("failed", ROOT_ID, configuration)).rejects.toBe(rejection);
+		await expect(session.createLane("failed", ROOT_ID, configuration, BACKGROUND_CONTEXT)).rejects.toBe(rejection);
 		storage.rejection = undefined;
-		expect(await session.getRegister("lane.config", "failed")).toBeUndefined();
-		expect(await session.getRegister("lane.leaf", "failed")).toBeUndefined();
-		expect(await session.getRegister("lane.state", "failed")).toBeUndefined();
-		await session.close();
+		expect(await session.getRegister("lane.config", "failed", BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getRegister("lane.leaf", "failed", BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getRegister("lane.state", "failed", BACKGROUND_CONTEXT)).toBeUndefined();
+		await session.close(BACKGROUND_CONTEXT);
 	});
 
 	it("drains creation after its commit is admitted to storage and rejects creation after close", async () => {
@@ -283,14 +299,16 @@ describe("StorageBackedSession.createLane", () => {
 		await commitSession(session, rootTransaction());
 		storage.block = true;
 
-		const creation = session.createLane("admitted", ROOT_ID, configuration);
+		const creation = session.createLane("admitted", ROOT_ID, configuration, BACKGROUND_CONTEXT);
 		await storage.admitted;
-		const close = session.close();
+		const close = session.close(BACKGROUND_CONTEXT);
 		storage.release();
 
 		await creation;
 		await close;
-		await expect(session.createLane("late", null, configuration)).rejects.toThrow("Session is closed");
+		await expect(session.createLane("late", null, configuration, BACKGROUND_CONTEXT)).rejects.toThrow(
+			"Session is closed",
+		);
 	});
 
 	it("rejects queued duplicate creation when close seals the lane mutation line", async () => {
@@ -299,10 +317,10 @@ describe("StorageBackedSession.createLane", () => {
 		await commitSession(session, rootTransaction());
 		storage.block = true;
 
-		const admitted = session.createLane("queued", ROOT_ID, configuration);
+		const admitted = session.createLane("queued", ROOT_ID, configuration, BACKGROUND_CONTEXT);
 		await storage.admitted;
-		const queued = session.createLane("queued", null, configuration);
-		const close = session.close();
+		const queued = session.createLane("queued", null, configuration, BACKGROUND_CONTEXT);
+		const close = session.close(BACKGROUND_CONTEXT);
 		storage.release();
 
 		await admitted;

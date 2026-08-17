@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT, withTelemetryContext } from "../../../src/harness/context.ts";
 // AgentHarness R4 context-bound tool example.
 // Run from packages/agent: node test/harness/scratch/r4.ts
 // Uses the faux provider and makes no external requests.
@@ -13,7 +14,7 @@ import { AgentHarness, createReadTool, getOrThrow, MemorySessionRepo } from "../
 const directory = await mkdtemp(join(tmpdir(), "pi-agent-r4-"));
 const env = new NodeExecutionEnv({ cwd: directory });
 const repo = new MemorySessionRepo();
-const session = await repo.create({});
+const session = await repo.create({}, BACKGROUND_CONTEXT);
 const faux = fauxProvider({ tokenSize: { min: 1, max: 1 } });
 const models = createModels();
 models.setProvider(faux.provider);
@@ -22,7 +23,7 @@ const telemetry = new InMemoryTelemetryContext();
 function printJson(label: string, value: unknown): void {
 	console.log(`${label}:\n${JSON.stringify(value, null, 2)}`);
 }
-await env.writeFile("example.txt", "durable tool output\n");
+await env.writeFile("example.txt", "durable tool output\n", BACKGROUND_CONTEXT);
 
 faux.setResponses([
 	fauxAssistantMessage(fauxToolCall("read", { path: "example.txt" }, { id: "read-call" }), {
@@ -37,15 +38,17 @@ faux.setResponses([
 	},
 ]);
 
-const { harness } = await AgentHarness.create({
-	session,
-	models,
-	model: faux.getModel(),
-	tools: [createReadTool()],
-	activeToolNames: ["read"],
-	toolContext: { env },
-	telemetryContext: telemetry,
-});
+const { harness } = await AgentHarness.create(
+	{
+		session,
+		models,
+		model: faux.getModel(),
+		tools: [createReadTool()],
+		activeToolNames: ["read"],
+		toolContext: { env },
+	},
+	withTelemetryContext(telemetry, BACKGROUND_CONTEXT),
+);
 
 for (const type of ["tool_start", "tool_end", "turn_end"] as const) {
 	harness.events.on(type, (event) => {
@@ -53,7 +56,7 @@ for (const type of ["tool_start", "tool_end", "turn_end"] as const) {
 	});
 }
 harness.hooks.on("before_tool", async ({ runId, toolCallId }) => {
-	const state = await session.getRegister("op.state", runId);
+	const state = await session.getRegister("op.state", runId, BACKGROUND_CONTEXT);
 	if (state?.value.kind !== "run" || state.value.phase.kind !== "tools") return undefined;
 	printJson("invocation", {
 		toolCallId,
@@ -63,15 +66,17 @@ harness.hooks.on("before_tool", async ({ runId, toolCallId }) => {
 });
 
 try {
-	const admission = getOrThrow(await harness.accept({ kind: "prompt", prompt: "Read example.txt" }));
+	const admission = getOrThrow(
+		await harness.accept({ kind: "prompt", prompt: "Read example.txt" }, BACKGROUND_CONTEXT),
+	);
 	printJson("accepted", admission);
-	const driven = getOrThrow(await harness.drive({ operationId: admission.operationId }));
+	const driven = getOrThrow(await harness.drive({ operationId: admission.operationId }, BACKGROUND_CONTEXT));
 	printJson("drive", driven);
-	console.log("verified:", getOrThrow(await env.readTextFile("example.txt")).trim());
+	console.log("verified:", getOrThrow(await env.readTextFile("example.txt", BACKGROUND_CONTEXT)).trim());
 	printJson("telemetry spans", telemetry.getSpans());
 } finally {
-	await harness.close();
-	await env.cleanup();
-	await repo.close();
+	await harness.close(BACKGROUND_CONTEXT);
+	await env.cleanup(BACKGROUND_CONTEXT);
+	await repo.close(BACKGROUND_CONTEXT);
 	await rm(directory, { recursive: true, force: true });
 }

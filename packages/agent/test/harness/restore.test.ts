@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 import { restoreLane } from "../../src/harness/restore.ts";
 import {
 	DEFAULT_COMPACTION_SETTINGS,
@@ -23,16 +24,22 @@ const zeroUsage = {
 async function createConfiguredSession(): Promise<Session> {
 	const repo = new MemorySessionRepo();
 	repos.push(repo);
-	const session = await repo.create({});
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
 	const configuration: LaneConfiguration = {
 		model: { provider: "test", modelId: "model" },
 		thinkingLevel: "off",
 		activeToolNames: [],
 	};
-	await session.mutate("main", (mutator) =>
-		mutator.commit({
-			writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration }],
-		}),
+	await session.mutate(
+		"main",
+		(mutator) =>
+			mutator.commit(
+				{
+					writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration }],
+				},
+				BACKGROUND_CONTEXT,
+			),
+		BACKGROUND_CONTEXT,
 	);
 	return session;
 }
@@ -69,30 +76,36 @@ async function installRun(session: Session): Promise<{
 		inbox: { steer: [], followUp: [], writes: [] },
 		latestAssistantEntryId: null,
 	};
-	await session.mutate("main", (mutator) =>
-		mutator.commit({
-			writes: [
+	await session.mutate(
+		"main",
+		(mutator) =>
+			mutator.commit(
 				{
-					kind: "entry",
-					entry: {
-						id: promptEntryId,
-						parentId: null,
-						type: "message",
-						message: { role: "user", content: "prompt", timestamp: 1 },
-					},
+					writes: [
+						{
+							kind: "entry",
+							entry: {
+								id: promptEntryId,
+								parentId: null,
+								type: "message",
+								message: { role: "user", content: "prompt", timestamp: 1 },
+							},
+						},
+						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: promptEntryId },
+						{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: operation },
+						{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
+						{
+							kind: "register",
+							op: "set",
+							namespace: "lane.state",
+							key: "main",
+							value: { currentOperationId: operationId, pendingNextRun: [] },
+						},
+					],
 				},
-				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: promptEntryId },
-				{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: operation },
-				{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
-				{
-					kind: "register",
-					op: "set",
-					namespace: "lane.state",
-					key: "main",
-					value: { currentOperationId: operationId, pendingNextRun: [] },
-				},
-			],
-		}),
+				BACKGROUND_CONTEXT,
+			),
+		BACKGROUND_CONTEXT,
 	);
 	return { operationId, promptEntryId, operation, state };
 }
@@ -140,67 +153,95 @@ async function installToolBatch(
 			},
 		},
 	};
-	await session.mutate("main", (mutator) =>
-		mutator.commit({
-			writes: [
+	await session.mutate(
+		"main",
+		(mutator) =>
+			mutator.commit(
 				{
-					kind: "entry",
-					entry: {
-						id: assistantEntryId,
-						parentId: installed.promptEntryId,
-						type: "message",
-						message: assistant,
-					},
+					writes: [
+						{
+							kind: "entry",
+							entry: {
+								id: assistantEntryId,
+								parentId: installed.promptEntryId,
+								type: "message",
+								message: assistant,
+							},
+						},
+						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: assistantEntryId },
+						{ kind: "register", op: "set", namespace: "op.state", key: installed.operationId, value: state },
+					],
 				},
-				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: assistantEntryId },
-				{ kind: "register", op: "set", namespace: "op.state", key: installed.operationId, value: state },
-			],
-		}),
+				BACKGROUND_CONTEXT,
+			),
+		BACKGROUND_CONTEXT,
 	);
 	return { ...installed, assistantEntryId, resultEntryIds, assistant, state };
 }
 
 afterEach(async () => {
-	for (const repo of repos.splice(0)) await repo.close();
+	for (const repo of repos.splice(0)) await repo.close(BACKGROUND_CONTEXT);
 });
 
 describe("restoreLane base validation", () => {
 	it.each(["lane.config", "lane.state", "lane.leaf"] as const)("rejects a lane missing %s", async (namespace) => {
 		const session = await createConfiguredSession();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({ writes: [{ kind: "register", op: "delete", namespace, key: "main" }] }),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{ writes: [{ kind: "register", op: "delete", namespace, key: "main" }] },
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing ${namespace}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(`missing ${namespace}`);
 	});
 
 	it("rejects an idle lane whose leaf is missing", async () => {
 		const session = await createConfiguredSession();
 		const missingId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: missingId }],
-			}),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{
+						writes: [{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: missingId }],
+					},
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing entry ${missingId}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`missing entry ${missingId}`,
+		);
 	});
 
 	it("rejects missing pending-next-run payloads", async () => {
 		const session = await createConfiguredSession();
 		const pendingId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { currentOperationId: null, pendingNextRun: [pendingId] },
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { currentOperationId: null, pendingNextRun: [pendingId] },
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing pending entry ${pendingId}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`missing pending entry ${pendingId}`,
+		);
 	});
 
 	it("rejects invalid R2 checkpoint and generation relationships", async () => {
@@ -208,10 +249,16 @@ describe("restoreLane base validation", () => {
 		const { operationId, promptEntryId, state } = await installRun(session);
 		if (state.kind !== "run") throw new Error("expected run state");
 		const writeState = (value: OperationState) =>
-			session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
-				}),
+			session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
 		await writeState({
@@ -223,7 +270,9 @@ describe("restoreLane base validation", () => {
 				triggerEntryId: promptEntryId,
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/finish checkpoint has no latest assistant/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/finish checkpoint has no latest assistant/,
+		);
 
 		await writeState({
 			...state,
@@ -233,7 +282,9 @@ describe("restoreLane base validation", () => {
 				triggerEntryId: promptEntryId,
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/finish checkpoint has no latest assistant/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/finish checkpoint has no latest assistant/,
+		);
 
 		await writeState({
 			...state,
@@ -244,75 +295,91 @@ describe("restoreLane base validation", () => {
 				triggerEntryId: promptEntryId,
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(`entry ${promptEntryId} is not an assistant message`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`entry ${promptEntryId} is not an assistant message`,
+		);
 
 		const finalAssistantEntryId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: finalAssistantEntryId,
-							parentId: promptEntryId,
-							type: "message",
-							message: {
-								role: "assistant",
-								content: [{ type: "text", text: "not a tool result" }],
-								api: "test",
-								provider: "test",
-								model: "model",
-								usage: zeroUsage,
-								stopReason: "stop",
-								timestamp: 2,
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: finalAssistantEntryId,
+									parentId: promptEntryId,
+									type: "message",
+									message: {
+										role: "assistant",
+										content: [{ type: "text", text: "not a tool result" }],
+										api: "test",
+										provider: "test",
+										model: "model",
+										usage: zeroUsage,
+										stopReason: "stop",
+										timestamp: 2,
+									},
+								},
 							},
-						},
-					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: finalAssistantEntryId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...state,
-							latestAssistantEntryId: finalAssistantEntryId,
-							phase: {
-								kind: "checkpoint",
-								continuation: { kind: "may_finish", includeFinalAssistant: false },
-								triggerEntryId: finalAssistantEntryId,
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: finalAssistantEntryId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...state,
+									latestAssistantEntryId: finalAssistantEntryId,
+									phase: {
+										kind: "checkpoint",
+										continuation: { kind: "may_finish", includeFinalAssistant: false },
+										triggerEntryId: finalAssistantEntryId,
+									},
+								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
 			/terminated-tools checkpoint trigger is the latest assistant/,
 		);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: promptEntryId },
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...state,
-							latestAssistantEntryId: finalAssistantEntryId,
-							phase: {
-								kind: "checkpoint",
-								continuation: { kind: "may_finish", includeFinalAssistant: false },
-								triggerEntryId: promptEntryId,
+						writes: [
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: promptEntryId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...state,
+									latestAssistantEntryId: finalAssistantEntryId,
+									phase: {
+										kind: "checkpoint",
+										continuation: { kind: "may_finish", includeFinalAssistant: false },
+										triggerEntryId: promptEntryId,
+									},
+								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(`entry ${promptEntryId} is not a tool result`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`entry ${promptEntryId} is not a tool result`,
+		);
 
 		const responseEntryId = session.idGenerator.next();
 		await writeState({
@@ -341,7 +408,9 @@ describe("restoreLane base validation", () => {
 				},
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/response and usage ids collide/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/response and usage ids collide/,
+		);
 
 		await writeState({
 			...state,
@@ -369,7 +438,9 @@ describe("restoreLane base validation", () => {
 				},
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(`reserved entry ${promptEntryId} already exists`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`reserved entry ${promptEntryId} already exists`,
+		);
 	});
 
 	it("validates R3 retry waits and their settled error relationship", async () => {
@@ -419,26 +490,38 @@ describe("restoreLane base validation", () => {
 		}
 		const retryGeneration = retryState.phase.generation;
 		if (retryGeneration.status !== "retry_wait") throw new Error("expected retry wait");
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: { id: responseEntryId, parentId: promptEntryId, type: "message", message: response },
+						writes: [
+							{
+								kind: "entry",
+								entry: { id: responseEntryId, parentId: promptEntryId, type: "message", message: response },
+							},
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
+							{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: retryState },
+						],
 					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
-					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: retryState },
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { state: { phase: { generation: { status: "retry_wait" } } } },
 		});
 		const writeState = (value: OperationState) =>
-			session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
-				}),
+			session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
 		await writeState({
@@ -451,7 +534,9 @@ describe("restoreLane base validation", () => {
 				},
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/retry response is not later than its trigger/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/retry response is not later than its trigger/,
+		);
 
 		await writeState({
 			...retryState,
@@ -460,7 +545,9 @@ describe("restoreLane base validation", () => {
 				generation: { ...retryGeneration, nextAttempt: 1 },
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/retry nextAttempt is not later/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/retry nextAttempt is not later/,
+		);
 
 		await writeState({
 			...retryState,
@@ -469,7 +556,9 @@ describe("restoreLane base validation", () => {
 				generation: { ...retryGeneration, nextAttempt: 3 },
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/nextAttempt exceeds maxAttempts/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/nextAttempt exceeds maxAttempts/,
+		);
 
 		await writeState({
 			...retryState,
@@ -478,41 +567,51 @@ describe("restoreLane base validation", () => {
 				generation: { ...retryGeneration, errorMessage: "different" },
 			},
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/error does not match its response/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/error does not match its response/,
+		);
 
 		const nonRetryableId = session.idGenerator.next();
 		const nonRetryableMessage = "authentication failed";
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: nonRetryableId,
-							parentId: responseEntryId,
-							type: "message",
-							message: { ...response, errorMessage: nonRetryableMessage },
-						},
-					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: nonRetryableId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...retryState,
-							latestAssistantEntryId: nonRetryableId,
-							phase: {
-								kind: "assistant",
-								generation: { ...retryGeneration, errorMessage: nonRetryableMessage },
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: nonRetryableId,
+									parentId: responseEntryId,
+									type: "message",
+									message: { ...response, errorMessage: nonRetryableMessage },
+								},
 							},
-						},
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: nonRetryableId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...retryState,
+									latestAssistantEntryId: nonRetryableId,
+									phase: {
+										kind: "assistant",
+										generation: { ...retryGeneration, errorMessage: nonRetryableMessage },
+									},
+								},
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/latest assistant is not retryable/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/latest assistant is not retryable/,
+		);
 	});
 
 	it("validates R3 deferred source identity and handle semantics", async () => {
@@ -555,45 +654,59 @@ describe("restoreLane base validation", () => {
 			throw new Error("expected deferred run state");
 		}
 		const deferred = deferredState.phase.deferred;
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: { id: responseEntryId, parentId: promptEntryId, type: "message", message: response },
+						writes: [
+							{
+								kind: "entry",
+								entry: { id: responseEntryId, parentId: promptEntryId, type: "message", message: response },
+							},
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
+							{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: deferredState },
+						],
 					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
-					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: deferredState },
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { state: { phase: { kind: "deferred" } } },
 		});
 
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...deferredState,
-							phase: {
-								kind: "deferred",
-								deferred: {
-									...deferred,
-									configuration: { ...configuration, model: { provider: "other", modelId: "model" } },
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...deferredState,
+									phase: {
+										kind: "deferred",
+										deferred: {
+											...deferred,
+											configuration: { ...configuration, model: { provider: "other", modelId: "model" } },
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/identity does not match/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/identity does not match/,
+		);
 	});
 
 	it("rejects R3 reservation collisions and aborted latest assistants under running control", async () => {
@@ -613,168 +726,193 @@ describe("restoreLane base validation", () => {
 			retryPolicy: { maxAttempts: 2, baseDelayMs: 0 },
 			overflowRecoveryUsed: false,
 		};
-		await session.mutate("main", async (mutator) => {
-			const laneState = await mutator.getRegister("lane.state", "main");
-			if (laneState === undefined) throw new Error("missing lane state");
-			await mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			async (mutator) => {
+				const laneState = await mutator.getRegister("lane.state", "main", BACKGROUND_CONTEXT);
+				if (laneState === undefined) throw new Error("missing lane state");
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "pending.entry",
-						key: pendingId,
-						value: { type: "message", payload: { role: "user", content: "next", timestamp: 2 } },
-					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { ...laneState.value, pendingNextRun: [pendingId] },
-					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...state,
-							phase: {
-								kind: "assistant",
-								generation: {
-									status: "effect_pending",
-									context,
-									attempt: 1,
-									responseEntryId: pendingId,
-									usageId: session.idGenerator.next(),
-									intendedOutputLimit: 1,
-									contextWindow: 1,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "pending.entry",
+								key: pendingId,
+								value: { type: "message", payload: { role: "user", content: "next", timestamp: 2 } },
+							},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { ...laneState.value, pendingNextRun: [pendingId] },
+							},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...state,
+									phase: {
+										kind: "assistant",
+										generation: {
+											status: "effect_pending",
+											context,
+											attempt: 1,
+											responseEntryId: pendingId,
+											usageId: session.idGenerator.next(),
+											intendedOutputLimit: 1,
+											contextWindow: 1,
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			});
-		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(/reserved settlement id.*pending entry/);
+					BACKGROUND_CONTEXT,
+				);
+			},
+			BACKGROUND_CONTEXT,
+		);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/reserved settlement id.*pending entry/,
+		);
 
 		const abortedId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "register", op: "delete", namespace: "pending.entry", key: pendingId },
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: abortedId,
-							parentId: promptEntryId,
-							type: "message",
-							message: {
-								role: "assistant",
-								content: [],
-								api: "test",
-								provider: "test",
-								model: "model",
-								usage: zeroUsage,
-								stopReason: "aborted",
-								timestamp: 2,
+						writes: [
+							{ kind: "register", op: "delete", namespace: "pending.entry", key: pendingId },
+							{
+								kind: "entry",
+								entry: {
+									id: abortedId,
+									parentId: promptEntryId,
+									type: "message",
+									message: {
+										role: "assistant",
+										content: [],
+										api: "test",
+										provider: "test",
+										model: "model",
+										usage: zeroUsage,
+										stopReason: "aborted",
+										timestamp: 2,
+									},
+								},
 							},
-						},
-					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: abortedId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { currentOperationId: operationId, pendingNextRun: [] },
-					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: operationId,
-						value: {
-							...state,
-							latestAssistantEntryId: abortedId,
-							phase: {
-								kind: "assistant",
-								generation: { status: "ready", context, nextAttempt: 2 },
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: abortedId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { currentOperationId: operationId, pendingNextRun: [] },
 							},
-						},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: operationId,
+								value: {
+									...state,
+									latestAssistantEntryId: abortedId,
+									phase: {
+										kind: "assistant",
+										generation: { status: "ready", context, nextAttempt: 2 },
+									},
+								},
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/running operation references an aborted/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/running operation references an aborted/,
+		);
 	});
 
 	it("rejects classification-incompatible active and terminated tool provenance", async () => {
 		const invalidSession = await createConfiguredSession();
 		await installToolBatch(invalidSession, "error");
-		await expect(restoreLane(invalidSession, "main")).rejects.toThrow(/incompatible stop reason/);
+		await expect(restoreLane(invalidSession, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/incompatible stop reason/,
+		);
 
 		const lengthSession = await createConfiguredSession();
 		const installed = await installToolBatch(lengthSession, "length");
 		if (installed.state.kind !== "run") throw new Error("expected run state");
 		const [firstResultId, secondResultId] = installed.resultEntryIds;
 		if (firstResultId === undefined || secondResultId === undefined) throw new Error("expected result ids");
-		await lengthSession.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await lengthSession.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: firstResultId,
-							parentId: installed.assistantEntryId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-one",
-								toolName: "echo",
-								content: [{ type: "text", text: "one" }],
-								isError: true,
-								timestamp: 3,
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: firstResultId,
+									parentId: installed.assistantEntryId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-one",
+										toolName: "echo",
+										content: [{ type: "text", text: "one" }],
+										isError: true,
+										timestamp: 3,
+									},
+									terminate: true,
+								},
 							},
-							terminate: true,
-						},
-					},
-					{
-						kind: "entry",
-						entry: {
-							id: secondResultId,
-							parentId: firstResultId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-two",
-								toolName: "echo",
-								content: [{ type: "text", text: "two" }],
-								isError: true,
-								timestamp: 4,
+							{
+								kind: "entry",
+								entry: {
+									id: secondResultId,
+									parentId: firstResultId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-two",
+										toolName: "echo",
+										content: [{ type: "text", text: "two" }],
+										isError: true,
+										timestamp: 4,
+									},
+									terminate: true,
+								},
 							},
-							terminate: true,
-						},
-					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: secondResultId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: {
-							...installed.state,
-							phase: {
-								kind: "checkpoint",
-								continuation: { kind: "may_finish", includeFinalAssistant: false },
-								triggerEntryId: secondResultId,
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: secondResultId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: {
+									...installed.state,
+									phase: {
+										kind: "checkpoint",
+										continuation: { kind: "may_finish", includeFinalAssistant: false },
+										triggerEntryId: secondResultId,
+									},
+								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(lengthSession, "main")).rejects.toThrow(
+		await expect(restoreLane(lengthSession, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
 			/terminated-tools checkpoint assistant has an incompatible stop reason/,
 		);
 	});
@@ -791,130 +929,158 @@ describe("restoreLane base validation", () => {
 			triggerEntryId: secondResultId,
 		};
 		const checkpointState: OperationState = { ...installed.state, phase: checkpointPhase };
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: firstResultId,
-							parentId: installed.assistantEntryId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-one",
-								toolName: "echo",
-								content: [{ type: "text", text: "one" }],
-								isError: false,
-								timestamp: 3,
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: firstResultId,
+									parentId: installed.assistantEntryId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-one",
+										toolName: "echo",
+										content: [{ type: "text", text: "one" }],
+										isError: false,
+										timestamp: 3,
+									},
+									terminate: true,
+								},
 							},
-							terminate: true,
-						},
-					},
-					{
-						kind: "entry",
-						entry: {
-							id: secondResultId,
-							parentId: firstResultId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-two",
-								toolName: "echo",
-								content: [{ type: "text", text: "two" }],
-								isError: false,
-								timestamp: 4,
+							{
+								kind: "entry",
+								entry: {
+									id: secondResultId,
+									parentId: firstResultId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-two",
+										toolName: "echo",
+										content: [{ type: "text", text: "two" }],
+										isError: false,
+										timestamp: 4,
+									},
+									terminate: true,
+								},
 							},
-							terminate: true,
-						},
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: secondResultId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: checkpointState,
+							},
+						],
 					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: secondResultId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: checkpointState,
-					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { state: { phase: { continuation: { includeFinalAssistant: false } } } },
 		});
 
 		const unrelatedResultId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: unrelatedResultId,
-							parentId: installed.assistantEntryId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-two",
-								toolName: "echo",
-								content: [{ type: "text", text: "unrelated" }],
-								isError: false,
-								timestamp: 5,
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: unrelatedResultId,
+									parentId: installed.assistantEntryId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-two",
+										toolName: "echo",
+										content: [{ type: "text", text: "unrelated" }],
+										isError: false,
+										timestamp: 5,
+									},
+									terminate: true,
+								},
 							},
-							terminate: true,
-						},
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: unrelatedResultId },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: {
+									...checkpointState,
+									phase: { ...checkpointPhase, triggerEntryId: unrelatedResultId },
+								},
+							},
+						],
 					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: unrelatedResultId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: {
-							...checkpointState,
-							phase: { ...checkpointPhase, triggerEntryId: unrelatedResultId },
-						},
-					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/terminated-tools result 0 is invalid/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/terminated-tools result 0 is invalid/,
+		);
 
 		const nonTerminatingResultId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: {
-							id: nonTerminatingResultId,
-							parentId: firstResultId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-two",
-								toolName: "echo",
-								content: [{ type: "text", text: "not terminating" }],
-								isError: false,
-								timestamp: 6,
+						writes: [
+							{
+								kind: "entry",
+								entry: {
+									id: nonTerminatingResultId,
+									parentId: firstResultId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-two",
+										toolName: "echo",
+										content: [{ type: "text", text: "not terminating" }],
+										isError: false,
+										timestamp: 6,
+									},
+								},
 							},
-						},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.leaf",
+								key: "main",
+								value: nonTerminatingResultId,
+							},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: {
+									...checkpointState,
+									phase: { ...checkpointPhase, triggerEntryId: nonTerminatingResultId },
+								},
+							},
+						],
 					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: nonTerminatingResultId },
-					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: {
-							...checkpointState,
-							phase: { ...checkpointPhase, triggerEntryId: nonTerminatingResultId },
-						},
-					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/terminated-tools result 1 is invalid/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/terminated-tools result 1 is invalid/,
+		);
 	});
 
 	it("validates planned tool batches and rejects invalid indices, ids, and materialized reservations", async () => {
@@ -925,73 +1091,99 @@ describe("restoreLane base validation", () => {
 		}
 		const batch = installed.state.phase.batch;
 		const writeCalls = (calls: typeof batch.calls) =>
-			session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [
+			session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
 						{
-							kind: "register",
-							op: "set",
-							namespace: "op.state",
-							key: installed.operationId,
-							value: { ...installed.state, phase: { kind: "tools", batch: { ...batch, calls } } },
+							writes: [
+								{
+									kind: "register",
+									op: "set",
+									namespace: "op.state",
+									key: installed.operationId,
+									value: { ...installed.state, phase: { kind: "tools", batch: { ...batch, calls } } },
+								},
+							],
 						},
-					],
-				}),
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { state: { phase: { kind: "tools" } } },
 		});
 		await writeCalls([{ ...batch.calls[0]!, sourceIndex: 1 }, batch.calls[1]!]);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/source indices are not complete/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/source indices are not complete/,
+		);
 		await writeCalls([batch.calls[0]!, { ...batch.calls[1]!, resultEntryId: batch.calls[0]!.resultEntryId }]);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/tool result id.*duplicated/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/tool result id.*duplicated/,
+		);
 		await writeCalls([batch.calls[0]!, { ...batch.calls[1]!, resultEntryId: session.idGenerator.next(1) }]);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/not a follower/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(/not a follower/);
 		await writeCalls(batch.calls);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "pending.entry",
-						key: batch.calls[0]!.resultEntryId,
-						value: { type: "message", payload: { role: "user", content: "unowned", timestamp: 3 } },
-					},
-				],
-			}),
-		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/reserved settlement id.*pending entry/);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{
-						kind: "register",
-						op: "delete",
-						namespace: "pending.entry",
-						key: batch.calls[0]!.resultEntryId,
-					},
-					{
-						kind: "entry",
-						entry: {
-							id: batch.calls[0]!.resultEntryId,
-							parentId: installed.assistantEntryId,
-							type: "message",
-							message: {
-								role: "toolResult",
-								toolCallId: "call-one",
-								toolName: "echo",
-								content: [],
-								isError: true,
-								timestamp: 3,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "pending.entry",
+								key: batch.calls[0]!.resultEntryId,
+								value: { type: "message", payload: { role: "user", content: "unowned", timestamp: 3 } },
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/reserved entry.*already exists/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/reserved settlement id.*pending entry/,
+		);
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{
+						writes: [
+							{
+								kind: "register",
+								op: "delete",
+								namespace: "pending.entry",
+								key: batch.calls[0]!.resultEntryId,
+							},
+							{
+								kind: "entry",
+								entry: {
+									id: batch.calls[0]!.resultEntryId,
+									parentId: installed.assistantEntryId,
+									type: "message",
+									message: {
+										role: "toolResult",
+										toolCallId: "call-one",
+										toolName: "echo",
+										content: [],
+										isError: true,
+										timestamp: 3,
+									},
+								},
+							},
+						],
+					},
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
+		);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/reserved entry.*already exists/,
+		);
 	});
 
 	it("hydrates exact pending tool arguments and validates completed result chains", async () => {
@@ -1011,29 +1203,49 @@ describe("restoreLane base validation", () => {
 				},
 			},
 		};
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "register", op: "set", namespace: "op.state", key: installed.operationId, value: pendingState },
-				],
-			}),
-		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/missing tool arguments/);
-		const argsKey = `${installed.operationId}:${batch.turnId}:0`;
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.tool_args",
-						key: argsKey,
-						value: { value: "effective" },
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: pendingState,
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/missing tool arguments/,
+		);
+		const argsKey = `${installed.operationId}:${batch.turnId}:0`;
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.tool_args",
+								key: argsKey,
+								value: { value: "effective" },
+							},
+						],
+					},
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
+		);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { toolArguments: expect.any(Map) },
 		});
 
@@ -1060,136 +1272,203 @@ describe("restoreLane base validation", () => {
 				},
 			},
 		};
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "entry", entry: completedEntry },
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: completedEntry.id },
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: completedState,
+						writes: [
+							{ kind: "entry", entry: completedEntry },
+							{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: completedEntry.id },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: completedState,
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).resolves.toMatchObject({
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject({
 			current: { state: { phase: { batch: { calls: [{ status: "completed" }, { status: "planned" }] } } } },
 		});
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: {
-							...completedState,
-							phase: {
-								kind: "tools",
-								batch: {
-									...batch,
-									calls: [{ ...batch.calls[0]!, status: "completed", terminate: true }, batch.calls[1]!],
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: {
+									...completedState,
+									phase: {
+										kind: "tools",
+										batch: {
+											...batch,
+											calls: [{ ...batch.calls[0]!, status: "completed", terminate: true }, batch.calls[1]!],
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/terminate mismatch/);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(/terminate mismatch/);
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: completedState,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: completedState,
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: installed.operationId,
-						value: {
-							...completedState,
-							phase: {
-								kind: "tools",
-								batch: {
-									...batch,
-									calls: [batch.calls[0]!, { ...batch.calls[1]!, status: "completed", terminate: false }],
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: installed.operationId,
+								value: {
+									...completedState,
+									phase: {
+										kind: "tools",
+										batch: {
+											...batch,
+											calls: [
+												batch.calls[0]!,
+												{ ...batch.calls[1]!, status: "completed", terminate: false },
+											],
+										},
+									},
 								},
 							},
-						},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/completed tool calls do not form a prefix/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/completed tool calls do not form a prefix/,
+		);
 	});
 
 	it("rejects missing operation registers and invalid base references", async () => {
 		const session = await createConfiguredSession();
 		const { operationId, operation, state } = await installRun(session);
 		const writeOperation = (value: OperationMeta) =>
-			session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value }],
-				}),
+			session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value }],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 		const writeState = (value: OperationState) =>
-			session.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
-				}),
+			session.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [{ kind: "register", op: "set", namespace: "op.state", key: operationId, value }],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
-		await session.mutate("main", (mutator) =>
-			mutator.commit({ writes: [{ kind: "register", op: "delete", namespace: "op.meta", key: operationId }] }),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{ writes: [{ kind: "register", op: "delete", namespace: "op.meta", key: operationId }] },
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/missing op.meta/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(/missing op.meta/);
 		await writeOperation(operation);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({ writes: [{ kind: "register", op: "delete", namespace: "op.state", key: operationId }] }),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{ writes: [{ kind: "register", op: "delete", namespace: "op.state", key: operationId }] },
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
-		await expect(restoreLane(session, "main")).rejects.toThrow(/missing op.state/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(/missing op.state/);
 		await writeState(state);
 
 		await writeOperation({ ...operation, operationId: session.idGenerator.next() });
-		await expect(restoreLane(session, "main")).rejects.toThrow(/has another operation id/);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			/has another operation id/,
+		);
 
 		const missingSource = session.idGenerator.next();
 		await writeOperation({ ...operation, sourceLeafId: missingSource });
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing entry ${missingSource}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`missing entry ${missingSource}`,
+		);
 
 		const missingPrompt = session.idGenerator.next();
 		await writeOperation({ ...operation, intent: { kind: "run", promptEntryIds: [missingPrompt] } });
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing entry ${missingPrompt}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`missing entry ${missingPrompt}`,
+		);
 
 		const customEntryId = session.idGenerator.next();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "entry",
-						entry: { id: customEntryId, parentId: null, type: "custom", customType: "test" },
+						writes: [
+							{
+								kind: "entry",
+								entry: { id: customEntryId, parentId: null, type: "custom", customType: "test" },
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 		await writeOperation({ ...operation, intent: { kind: "run", promptEntryIds: [customEntryId] } });
-		await expect(restoreLane(session, "main")).rejects.toThrow(`entry ${customEntryId} is not a message`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`entry ${customEntryId} is not a message`,
+		);
 
 		const missingTarget = session.idGenerator.next();
 		await writeOperation({
@@ -1203,6 +1482,8 @@ describe("restoreLane base validation", () => {
 			summarize: false,
 			phase: { kind: "ready_to_commit" },
 		});
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing entry ${missingTarget}`);
+		await expect(restoreLane(session, "main", undefined, BACKGROUND_CONTEXT)).rejects.toThrow(
+			`missing entry ${missingTarget}`,
+		);
 	});
 });

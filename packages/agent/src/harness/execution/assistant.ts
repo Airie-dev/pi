@@ -1,15 +1,15 @@
 import type {
+	Context as AiContext,
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
-	Context,
 	Message,
 	Model,
 	SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { AgentMessage, AgentTool, ThinkingLevel } from "../../types.ts";
+import type { Context } from "../context.ts";
 import type { SettledAssistantMessage } from "../session/types.ts";
 import type { AgentHarnessStreamOptions } from "../types.ts";
 import { AbortRequested } from "./effect-gate.ts";
@@ -22,9 +22,9 @@ export interface AssistantResponseMetadata {
 
 /** Process-local lifecycle observer for one assistant stream. */
 export interface AssistantStreamObserver {
-	start(message: AssistantMessage): void | Promise<void>;
-	update(message: AssistantMessage, event: AssistantMessageEvent): void | Promise<void>;
-	end(message: SettledAssistantMessage): void | Promise<void>;
+	start(message: AssistantMessage, context: Context): void | Promise<void>;
+	update(message: AssistantMessage, event: AssistantMessageEvent, context: Context): void | Promise<void>;
+	end(message: SettledAssistantMessage, context: Context): void | Promise<void>;
 }
 
 /** Executable inputs for one already-approved assistant provider request. */
@@ -34,25 +34,30 @@ export interface HarnessAssistantStreamConfig {
 	tools?: AgentTool[];
 	thinkingLevel: ThinkingLevel;
 	streamOptions: AgentHarnessStreamOptions;
-	transformContext?: (messages: AgentMessage[], signal: AbortSignal) => Promise<AgentMessage[]>;
-	toProviderMessages: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
-	beforePayload?: (payload: unknown, model: Model<Api>) => unknown | undefined | Promise<unknown | undefined>;
+	transformContext?: (messages: AgentMessage[], context: Context) => Promise<AgentMessage[]>;
+	toProviderMessages: (messages: AgentMessage[], context: Context) => Message[] | Promise<Message[]>;
+	beforePayload?: (
+		payload: unknown,
+		model: Model<Api>,
+		context: Context,
+	) => unknown | undefined | Promise<unknown | undefined>;
 	afterResponse?: (
 		message: SettledAssistantMessage,
 		metadata: AssistantResponseMetadata,
+		context: Context,
 	) => Promise<SettledAssistantMessage>;
 	request(
-		context: Context,
+		aiContext: AiContext,
 		options: SimpleStreamOptions,
+		context: Context,
 	): AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 	observer: AssistantStreamObserver;
-	telemetryContext: TelemetryContext;
-	signal: AbortSignal;
 }
 
 function createRequestOptions(
 	config: HarnessAssistantStreamConfig,
 	captureMetadata: (metadata: AssistantResponseMetadata) => void,
+	context: Context,
 ): SimpleStreamOptions {
 	const options = config.streamOptions;
 	return {
@@ -65,9 +70,12 @@ function createRequestOptions(
 		cacheRetention: options.cacheRetention,
 		deferred: options.deferred,
 		...(config.thinkingLevel === "off" ? {} : { reasoning: config.thinkingLevel }),
-		signal: config.signal,
-		telemetryContext: config.telemetryContext,
-		onPayload: config.beforePayload,
+		signal: context.abortSignal,
+		telemetryContext: context.telemetryContext,
+		onPayload:
+			config.beforePayload === undefined
+				? undefined
+				: (payload, model) => config.beforePayload?.(payload, model, context),
 		onResponse: (response) => {
 			captureMetadata({ status: response.status, headers: response.headers });
 		},
@@ -84,14 +92,15 @@ function isUpdateEvent(
 export async function streamHarnessAssistant(
 	messages: AgentMessage[],
 	config: HarnessAssistantStreamConfig,
+	context: Context,
 ): Promise<SettledAssistantMessage> {
 	let requestMessages = messages.slice();
 	if (config.transformContext) {
-		requestMessages = await config.transformContext(requestMessages, config.signal);
+		requestMessages = await config.transformContext(requestMessages, context);
 	}
 
-	const providerMessages = await config.toProviderMessages(requestMessages);
-	const context: Context = {
+	const providerMessages = await config.toProviderMessages(requestMessages, context);
+	const aiContext: AiContext = {
 		systemPrompt: config.systemPrompt,
 		messages: providerMessages,
 		tools: config.tools,
@@ -99,35 +108,40 @@ export async function streamHarnessAssistant(
 
 	let metadata: AssistantResponseMetadata = {};
 	const stream = await config.request(
+		aiContext,
+		createRequestOptions(
+			config,
+			(nextMetadata) => {
+				metadata = nextMetadata;
+			},
+			context,
+		),
 		context,
-		createRequestOptions(config, (nextMetadata) => {
-			metadata = nextMetadata;
-		}),
 	);
 
 	let started = false;
 	for await (const event of stream) {
 		if (event.type === "start") {
 			started = true;
-			await config.observer.start({ ...event.partial });
+			await config.observer.start({ ...event.partial }, context);
 		} else if (isUpdateEvent(event)) {
-			await config.observer.update({ ...event.partial }, event);
+			await config.observer.update({ ...event.partial }, event, context);
 		}
 	}
 
 	const settled = (await stream.result()) as SettledAssistantMessage;
 	if (!started) {
-		await config.observer.start({ ...settled });
+		await config.observer.start({ ...settled }, context);
 	}
 	let finalMessage = settled;
 	if (config.afterResponse) {
 		try {
-			finalMessage = await config.afterResponse(settled, metadata);
+			finalMessage = await config.afterResponse(settled, metadata, context);
 		} catch (error) {
 			if (!(error instanceof AbortRequested)) throw error;
 			await error.cancellation;
 		}
 	}
-	await config.observer.end(finalMessage);
+	await config.observer.end(finalMessage, context);
 	return finalMessage;
 }

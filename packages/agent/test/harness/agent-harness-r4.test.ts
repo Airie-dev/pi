@@ -9,6 +9,7 @@ import {
 import { InMemoryTelemetryContext, type TelemetryContext } from "@earendil-works/pi-telemetry";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { BACKGROUND_CONTEXT, withTelemetryContext } from "../../src/harness/context.ts";
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
@@ -47,22 +48,26 @@ async function createFixture(
 	} = {},
 ): Promise<Fixture> {
 	const repo = new MemorySessionRepo();
-	const session = await repo.create({});
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
 	const faux = fauxProvider({ tokenSize: { min: 1, max: 1 } });
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const tools = options.tools ?? [];
-	const { harness } = await AgentHarness.create<ToolContext>({
-		session,
-		models,
-		model: faux.getModel(),
-		tools,
-		activeToolNames: options.activeToolNames ?? tools.map((tool) => tool.name),
-		toolContext: options.toolContext ?? { prefix: "ctx" },
-		toolExecution: options.toolExecution,
-		drive: options.drive,
-		telemetryContext: options.telemetryContext,
-	});
+	const { harness } = await AgentHarness.create<ToolContext>(
+		{
+			session,
+			models,
+			model: faux.getModel(),
+			tools,
+			activeToolNames: options.activeToolNames ?? tools.map((tool) => tool.name),
+			toolContext: options.toolContext ?? { prefix: "ctx" },
+			toolExecution: options.toolExecution,
+			drive: options.drive,
+		},
+		options.telemetryContext === undefined
+			? BACKGROUND_CONTEXT
+			: withTelemetryContext(options.telemetryContext, BACKGROUND_CONTEXT),
+	);
 	const fixture = { harness, session, repo, faux, models, tools };
 	fixtures.push(fixture);
 	return fixture;
@@ -76,20 +81,23 @@ async function reopenFixture(
 		toolContext?: ToolContext | (() => ToolContext | Promise<ToolContext>);
 	} = {},
 ) {
-	await fixture.harness.close();
+	await fixture.harness.close(BACKGROUND_CONTEXT);
 	fixtures.splice(fixtures.indexOf(fixture), 1);
-	const session = await fixture.repo.open(fixture.session.metadata);
+	const session = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
 	const models = createModels();
 	models.setProvider(fixture.faux.provider);
 	const tools = options.tools ?? fixture.tools;
-	const created = await AgentHarness.create<ToolContext>({
-		session,
-		models,
-		model: fixture.faux.getModel(),
-		tools,
-		toolContext: options.toolContext ?? { prefix: "recovered" },
-		drive: options.drive,
-	});
+	const created = await AgentHarness.create<ToolContext>(
+		{
+			session,
+			models,
+			model: fixture.faux.getModel(),
+			tools,
+			toolContext: options.toolContext ?? { prefix: "recovered" },
+			drive: options.drive,
+		},
+		BACKGROUND_CONTEXT,
+	);
 	const reopened: Fixture = {
 		harness: created.harness,
 		session,
@@ -104,7 +112,7 @@ async function reopenFixture(
 
 async function waitForAction(harness: AgentHarnessInstance<ToolContext>): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		if ((await harness.peekAction()) !== undefined) return;
+		if ((await harness.peekAction(BACKGROUND_CONTEXT)) !== undefined) return;
 		await waitForTick();
 	}
 	throw new Error("action did not park");
@@ -159,8 +167,8 @@ function textContent(content: Array<{ type: string; text?: string }>): string {
 afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const fixture of fixtures.splice(0)) {
-		await fixture.harness.close();
-		await fixture.repo.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	}
 });
 
@@ -169,8 +177,8 @@ describe("AgentHarness R4 tools", () => {
 		const fixture = await createFixture();
 		const tool = echoTool(async () => ({ content: [{ type: "text", text: "unused" }], details: {} }));
 
-		expect(() => fixture.harness.setTools([tool, { ...tool }])).toThrow(/Duplicate tool name/);
-		expect(await fixture.harness.getTools()).toEqual([]);
+		expect(() => fixture.harness.setTools([tool, { ...tool }], BACKGROUND_CONTEXT)).toThrow(/Duplicate tool name/);
+		expect(await fixture.harness.getTools(BACKGROUND_CONTEXT)).toEqual([]);
 	});
 
 	it("persists a complete plan before clearance, binds context and invocation identity, then continues", async () => {
@@ -178,11 +186,16 @@ describe("AgentHarness R4 tools", () => {
 		let contextResolutions = 0;
 		let fixture: Fixture;
 		const tool: AgentHarnessTool<ToolContext, typeof echoParameters> = {
-			...echoTool(async (_toolCallId, args, _signal, onUpdate, context, invocation) => {
+			...echoTool(async (_toolCallId, args, onUpdate, context, invocation, _callContext) => {
 				invocations.push(invocation);
 				expect(
-					(await fixture.session.getRegister("op.tool_args", `${invocation.operationId}:${invocation.turnId}:0`))
-						?.value,
+					(
+						await fixture.session.getRegister(
+							"op.tool_args",
+							`${invocation.operationId}:${invocation.turnId}:0`,
+							BACKGROUND_CONTEXT,
+						)
+					)?.value,
 				).toEqual({ value: "input-prepared-hook" });
 				onUpdate?.({ content: [{ type: "text", text: "partial" }], details: { partial: true } });
 				return {
@@ -204,7 +217,7 @@ describe("AgentHarness R4 tools", () => {
 		const events = captureEvents(fixture.harness);
 		let plannedResultId: string | undefined;
 		fixture.harness.hooks.on("before_tool", async ({ runId, args }) => {
-			const state = await fixture.session.getRegister("op.state", runId);
+			const state = await fixture.session.getRegister("op.state", runId, BACKGROUND_CONTEXT);
 			expect(state?.value).toMatchObject({
 				phase: {
 					kind: "tools",
@@ -228,7 +241,7 @@ describe("AgentHarness R4 tools", () => {
 			},
 		]);
 
-		const result = await fixture.harness.prompt("use the tool");
+		const result = await fixture.harness.prompt("use the tool", undefined, BACKGROUND_CONTEXT);
 
 		expect(result).toMatchObject({
 			ok: true,
@@ -241,7 +254,10 @@ describe("AgentHarness R4 tools", () => {
 			operationId: result.ok ? result.value.runId : "",
 		});
 		expect(invocations[0]?.turnId).toEqual(expect.any(String));
-		const branch = await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = await fixture.harness.sessionTree.findEntriesOnBranch(
+			{ order: "oldestFirst" },
+			BACKGROUND_CONTEXT,
+		);
 		const toolResult = branch.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(toolResult?.id).toBe(plannedResultId);
 		const assistant = branch.find(
@@ -249,7 +265,7 @@ describe("AgentHarness R4 tools", () => {
 				entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "toolUse",
 		);
 		expect(toolResult?.id.slice(0, 13)).toBe(assistant?.id.slice(0, 13));
-		expect(await fixture.session.listRegisters("op.tool_args")).toEqual([]);
+		expect(await fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT)).toEqual([]);
 		expect(events.filter((event) => event.type === "tool_start")).toHaveLength(1);
 		expect(events.filter((event) => event.type === "tool_update")).toHaveLength(1);
 		expect(events.filter((event) => event.type === "tool_end")).toHaveLength(1);
@@ -308,10 +324,13 @@ describe("AgentHarness R4 tools", () => {
 			},
 		]);
 
-		expect(await fixture.harness.prompt("fail clearance")).toMatchObject({ ok: true, value: { kind: "completed" } });
+		expect(await fixture.harness.prompt("fail clearance", undefined, BACKGROUND_CONTEXT)).toMatchObject({
+			ok: true,
+			value: { kind: "completed" },
+		});
 		expect(executions).toBe(0);
 		expect(events.filter((event) => event.type === "tool_start")).toHaveLength(0);
-		expect(await fixture.session.listRegisters("op.tool_args")).toEqual([]);
+		expect(await fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT)).toEqual([]);
 	});
 
 	it("applies after-tool patches and commits reported usage with the result", async () => {
@@ -344,10 +363,13 @@ describe("AgentHarness R4 tools", () => {
 			fauxAssistantMessage("done"),
 		]);
 
-		expect(await fixture.harness.prompt("patch")).toMatchObject({ ok: true, value: { kind: "completed" } });
-		const resultEntry = (await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" })).find(
-			(entry) => entry.type === "message" && entry.message.role === "toolResult",
-		);
+		expect(await fixture.harness.prompt("patch", undefined, BACKGROUND_CONTEXT)).toMatchObject({
+			ok: true,
+			value: { kind: "completed" },
+		});
+		const resultEntry = (
+			await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT)
+		).find((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(resultEntry).toMatchObject({
 			message: {
 				content: [{ text: "patched" }],
@@ -385,7 +407,12 @@ describe("AgentHarness R4 tools", () => {
 			fauxAssistantMessage("done"),
 		]);
 
-		expect(await fixture.harness.prompt("telemetry")).toMatchObject({ ok: true, value: { kind: "completed" } });
+		expect(
+			await fixture.harness.prompt("telemetry", undefined, withTelemetryContext(telemetry, BACKGROUND_CONTEXT)),
+		).toMatchObject({
+			ok: true,
+			value: { kind: "completed" },
+		});
 		const recordedSpans = telemetry.getSpans();
 		const spans = recordedSpans.filter((span) => span.name === "pi.harness.tool");
 		expect(recordedSpans.filter((span) => span.name === "pi.harness.turn")).toHaveLength(2);
@@ -435,7 +462,13 @@ describe("AgentHarness R4 tools", () => {
 			}),
 		]);
 
-		expect(await fixture.harness.prompt("error telemetry")).toMatchObject({
+		expect(
+			await fixture.harness.prompt(
+				"error telemetry",
+				undefined,
+				withTelemetryContext(telemetry, BACKGROUND_CONTEXT),
+			),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "failed" },
 		});
@@ -457,29 +490,31 @@ describe("AgentHarness R4 tools", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "preflight" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "preflight" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.peekAction();
+			const action = await fixture.harness.peekAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "assistant.settlement") break;
-			await fixture.harness.executeAction();
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
-		await fixture.harness.setTools([]);
-		await fixture.harness.executeAction();
+		await fixture.harness.setTools([], BACKGROUND_CONTEXT);
+		await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		expect(await firstDrive).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities", missing: { tools: ["echo"] } },
 		});
 		expect(executions).toBe(0);
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: { kind: "tools", batch: { calls: [{ status: "planned" }] } },
 		});
-		await fixture.harness.setTools([tool]);
-		const secondDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		await fixture.harness.setTools([tool], BACKGROUND_CONTEXT);
+		const secondDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(fixture.harness);
-		await fixture.harness.runToCompletion();
+		await fixture.harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await secondDrive).toMatchObject({ ok: true, value: { kind: "settled" } });
 		expect(executions).toBe(1);
 	});
@@ -504,12 +539,14 @@ describe("AgentHarness R4 tools", () => {
 			),
 			fauxAssistantMessage("done"),
 		]);
-		const result = fixture.harness.prompt("parallel");
+		const result = fixture.harness.prompt("parallel", undefined, BACKGROUND_CONTEXT);
 		for (let attempt = 0; attempt < 100 && starts.length < 2; attempt++) await waitForTick();
 		expect(starts).toEqual(["first", "third"]);
-		const execution = await fixture.harness.inspectExecution();
+		const execution = await fixture.harness.inspectExecution(BACKGROUND_CONTEXT);
 		if (execution.current === null) throw new Error("parallel run is not active");
-		expect((await fixture.session.getRegister("op.state", execution.current.id))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", execution.current.id, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: {
 				kind: "tools",
 				batch: { calls: [{ status: "effect_pending" }, { status: "planned" }, { status: "effect_pending" }] },
@@ -518,15 +555,15 @@ describe("AgentHarness R4 tools", () => {
 		third.resolve({ content: [{ type: "text", text: "third" }], details: {} });
 		await waitForTick();
 		expect(
-			(await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" })).filter(
+			(await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT)).filter(
 				(entry) => entry.type === "message" && entry.message.role === "toolResult",
 			),
 		).toHaveLength(0);
 		first.resolve({ content: [{ type: "text", text: "first" }], details: {} });
 		expect(await result).toMatchObject({ ok: true, value: { kind: "completed" } });
-		const resultEntries = (await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" })).filter(
-			(entry) => entry.type === "message" && entry.message.role === "toolResult",
-		);
+		const resultEntries = (
+			await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT)
+		).filter((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(
 			resultEntries.map((entry) =>
 				entry.type === "message" && entry.message.role === "toolResult" ? entry.message.toolCallId : "",
@@ -558,7 +595,7 @@ describe("AgentHarness R4 tools", () => {
 			),
 			fauxAssistantMessage("done"),
 		]);
-		const result = fixture.harness.prompt("sequential");
+		const result = fixture.harness.prompt("sequential", undefined, BACKGROUND_CONTEXT);
 		for (let attempt = 0; attempt < 100 && starts.length === 0; attempt++) await waitForTick();
 		expect(starts).toEqual(["first"]);
 		first.resolve({ content: [{ type: "text", text: "first" }], details: {} });
@@ -571,7 +608,7 @@ describe("AgentHarness R4 tools", () => {
 	it("replays an orphaned safe effect with persisted arguments and the same invocation id", async () => {
 		const invocations: AgentHarnessToolInvocation[] = [];
 		const argumentsSeen: string[] = [];
-		const tool = echoTool(async (_id, args, _signal, _update, context, invocation) => {
+		const tool = echoTool(async (_id, args, _update, context, invocation, _callContext) => {
 			invocations.push(invocation);
 			argumentsSeen.push(`${context.prefix}:${args.value}`);
 			return { content: [{ type: "text", text: args.value }], details: {} };
@@ -583,20 +620,20 @@ describe("AgentHarness R4 tools", () => {
 			}),
 			fauxAssistantMessage("after replay"),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "replay" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "replay" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.peekAction();
+			const action = await fixture.harness.peekAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
-		const pending = await fixture.session.getRegister("op.state", accepted.value.operationId);
+		const pending = await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT);
 		expect(pending?.value).toMatchObject({
 			phase: { kind: "tools", batch: { calls: [{ status: "effect_pending", replay: "safe" }] } },
 		});
-		const pendingArgs = await fixture.session.listRegisters("op.tool_args");
+		const pendingArgs = await fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT);
 		expect(pendingArgs).toHaveLength(1);
 		expect(pendingArgs[0]?.value).toEqual({ value: "persisted" });
 		expect(invocations).toHaveLength(1);
@@ -605,14 +642,16 @@ describe("AgentHarness R4 tools", () => {
 		const reopened = await reopenFixture(fixture, { tools: [tool] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const recoveryEvents = captureEvents(reopened.harness);
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
 
 		expect(invocations.map((invocation) => invocation.invocationId)).toEqual([firstInvocationId, firstInvocationId]);
 		expect(argumentsSeen).toEqual(["ctx:persisted", "recovered:persisted"]);
-		expect(await reopened.fixture.session.listRegisters("op.tool_args")).toEqual([]);
+		expect(await reopened.fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT)).toEqual([]);
 		expect(recoveryEvents.find((event) => event.type === "tool_start")).toMatchObject({ recovery: true });
 		expect(recoveryEvents.find((event) => event.type === "entry_added")).not.toHaveProperty("recovery");
 	});
@@ -644,28 +683,31 @@ describe("AgentHarness R4 tools", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "recover prefix" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "recover prefix" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		expect(executions).toBe(1);
 		const reopened = await reopenFixture(fixture, { tools: [safe] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities", missing: { tools: ["unused"] } },
 		});
 		expect(executions).toBe(2);
-		expect((await reopened.fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject(
-			{
-				phase: { kind: "tools", batch: { calls: [{ status: "completed" }, { status: "planned" }] } },
-			},
-		);
+		expect(
+			(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+				?.value,
+		).toMatchObject({
+			phase: { kind: "tools", batch: { calls: [{ status: "completed" }, { status: "planned" }] } },
+		});
 	});
 
 	it.each([
@@ -690,12 +732,12 @@ describe("AgentHarness R4 tools", () => {
 					stopReason: "toolUse",
 				}),
 			]);
-			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "boundary" });
+			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "boundary" }, BACKGROUND_CONTEXT);
 			if (!accepted.ok) throw accepted.error;
-			const drive = fixture.harness.drive({ operationId: accepted.value.operationId });
+			const drive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 			while (true) {
 				await waitForAction(fixture.harness);
-				const action = await fixture.harness.peekAction();
+				const action = await fixture.harness.peekAction(BACKGROUND_CONTEXT);
 				if (action?.kind === target) {
 					expect(JSON.parse(JSON.stringify(action))).toEqual(action);
 					expect(action.details).toMatchObject({
@@ -707,12 +749,13 @@ describe("AgentHarness R4 tools", () => {
 					});
 					break;
 				}
-				await fixture.harness.executeAction();
+				await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			}
 			const reopened = await reopenFixture(fixture, { tools: [tool] });
 			await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 			expect(
-				(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId))?.value,
+				(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+					?.value,
 			).toMatchObject({
 				phase: { kind: "tools", batch: { calls: [{ status: expectedStatus }] } },
 			});
@@ -732,48 +775,60 @@ describe("AgentHarness R4 tools", () => {
 				stopReason: "toolUse",
 			}),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "cancel race" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "cancel race" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const drive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const drive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.intent") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.intent") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
-		await fixture.session.mutate("main", async (mutator) => {
-			const stored = await mutator.getRegister("op.state", accepted.value.operationId);
-			if (stored?.value.kind !== "run") throw new Error("run state is missing");
-			await mutator.commit({
-				writes: [
+		await fixture.session.mutate(
+			"main",
+			async (mutator) => {
+				const stored = await mutator.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT);
+				if (stored?.value.kind !== "run") throw new Error("run state is missing");
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "op.state",
-						key: accepted.value.operationId,
-						value: {
-							...stored.value,
-							control: {
-								status: "cancel_requested",
-								requestedAt: Date.now(),
-								drainedSteer: [],
-								drainedFollowUp: [],
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "op.state",
+								key: accepted.value.operationId,
+								value: {
+									...stored.value,
+									control: {
+										status: "cancel_requested",
+										requestedAt: Date.now(),
+										drainedSteer: [],
+										drainedFollowUp: [],
+									},
+								},
 							},
-						},
+						],
 					},
-				],
-			});
-		});
-		await fixture.harness.executeAction();
+					BACKGROUND_CONTEXT,
+				);
+			},
+			BACKGROUND_CONTEXT,
+		);
+		await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "tool.settlement" });
-		await fixture.harness.executeAction();
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "tool.settlement" });
+		await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		await expect(drive).rejects.toThrow(/drive\(cancel_requested\).*later AgentHarness runtime slice/);
 		expect(executions).toBe(0);
-		const branch = await fixture.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = await fixture.harness.sessionTree.findEntriesOnBranch(
+			{ order: "oldestFirst" },
+			BACKGROUND_CONTEXT,
+		);
 		expect(branch.find((entry) => entry.type === "message" && entry.message.role === "toolResult")).toMatchObject({
 			message: { toolCallId: "call-cancelled", isError: true },
 		});
-		expect((await fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			control: { status: "cancel_requested" },
 			phase: { kind: "checkpoint", continuation: { kind: "need_assistant" } },
 		});
@@ -794,24 +849,29 @@ describe("AgentHarness R4 tools", () => {
 				stopReason: "toolUse",
 			}),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "unsafe" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "unsafe" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		expect(executions).toBe(1);
 		const reopened = await reopenFixture(fixture, { tools: [] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities", missing: { tools: ["echo"] } },
 		});
 		expect(executions).toBe(1);
-		const branch = await reopened.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = await reopened.harness.sessionTree.findEntriesOnBranch(
+			{ order: "oldestFirst" },
+			BACKGROUND_CONTEXT,
+		);
 		const interrupted = branch.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(interrupted).toMatchObject({
 			type: "message",
@@ -821,7 +881,7 @@ describe("AgentHarness R4 tools", () => {
 				content: [{ text: expect.stringContaining("not safe") }],
 			},
 		});
-		expect(await reopened.fixture.session.listRegisters("op.tool_args")).toEqual([]);
+		expect(await reopened.fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT)).toEqual([]);
 	});
 
 	it("interrupts a stored-safe effect when the current declaration downgrades replay", async () => {
@@ -837,27 +897,29 @@ describe("AgentHarness R4 tools", () => {
 			}),
 			fauxAssistantMessage("after interruption"),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "downgrade" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "downgrade" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		expect(executions).toBe(1);
 		const downgraded = { ...safe, replay: "never" as const };
 		const reopened = await reopenFixture(fixture, { tools: [downgraded] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
 		expect(executions).toBe(1);
-		const results = (await reopened.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" })).filter(
-			(entry) => entry.type === "message" && entry.message.role === "toolResult",
-		);
+		const results = (
+			await reopened.harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT)
+		).filter((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(results[0]).toMatchObject({
 			message: { isError: true, content: [{ text: expect.stringContaining("not safe") }] },
 		});
@@ -875,10 +937,10 @@ describe("AgentHarness R4 tools", () => {
 				stopReason: "toolUse",
 			}),
 		]);
-		const prompt = fixture.harness.prompt("hang");
+		const prompt = fixture.harness.prompt("hang", undefined, BACKGROUND_CONTEXT);
 		await started.promise;
 
-		await expect(fixture.harness.close()).resolves.toBeUndefined();
+		await expect(fixture.harness.close(BACKGROUND_CONTEXT)).resolves.toBeUndefined();
 		await expect(prompt).rejects.toMatchObject({ name: "HarnessClosed" });
 	});
 
@@ -891,16 +953,16 @@ describe("AgentHarness R4 tools", () => {
 				stopReason: "toolUse",
 			}),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "close span" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "close span" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const drive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const drive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.execute") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.execute") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 
-		await fixture.harness.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 		expect(telemetry.getSpans().filter((span) => span.name === "pi.harness.tool")).toEqual([]);
 	});
@@ -918,7 +980,7 @@ describe("AgentHarness R4 tools", () => {
 		const fixture = await createFixture({ tools: [first, second] });
 		fixture.harness.events.on("tool_start", (event) => {
 			if (event.toolName !== "first") return;
-			queueMicrotask(() => queueMicrotask(() => void fixture.harness.close()));
+			queueMicrotask(() => queueMicrotask(() => void fixture.harness.close(BACKGROUND_CONTEXT)));
 		});
 		fixture.faux.setResponses([
 			fauxAssistantMessage(
@@ -930,8 +992,10 @@ describe("AgentHarness R4 tools", () => {
 			),
 		]);
 
-		await expect(fixture.harness.prompt("close parallel start")).rejects.toMatchObject({ name: "HarnessClosed" });
-		await expect(fixture.harness.close()).resolves.toBeUndefined();
+		await expect(fixture.harness.prompt("close parallel start", undefined, BACKGROUND_CONTEXT)).rejects.toMatchObject(
+			{ name: "HarnessClosed" },
+		);
+		await expect(fixture.harness.close(BACKGROUND_CONTEXT)).resolves.toBeUndefined();
 		expect(executions).toBe(0);
 	});
 
@@ -945,37 +1009,41 @@ describe("AgentHarness R4 tools", () => {
 			}),
 			fauxAssistantMessage("done"),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "restore planned" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "restore planned" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "hook.before_tool") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "hook.before_tool") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		const reopened = await reopenFixture(fixture, { tools: [tool], drive: "manual" });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 		reopened.harness.hooks.on("before_resume", () => undefined, { id: "planned-deadline" });
 		const now = vi.spyOn(Date, "now").mockReturnValue(100);
-		const deadlineDrive = reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 });
-		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({ kind: "runtime.dispatch" });
-		await reopened.harness.executeAction();
-		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({ kind: "hook.before_resume" });
-		now.mockReturnValue(200);
-		await reopened.harness.executeAction();
-		expect(await deadlineDrive).toMatchObject({ ok: true, value: { kind: "yielded" } });
-		expect((await reopened.fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject(
-			{
-				phase: { kind: "tools", batch: { calls: [{ status: "planned" }] } },
-			},
+		const deadlineDrive = reopened.harness.drive(
+			{ operationId: accepted.value.operationId, deadline: 150 },
+			BACKGROUND_CONTEXT,
 		);
-
-		const completedDrive = reopened.harness.drive({ operationId: accepted.value.operationId });
 		await waitForAction(reopened.harness);
-		await reopened.harness.runToCompletion();
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "runtime.dispatch" });
+		await reopened.harness.executeAction(BACKGROUND_CONTEXT);
+		await waitForAction(reopened.harness);
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "hook.before_resume" });
+		now.mockReturnValue(200);
+		await reopened.harness.executeAction(BACKGROUND_CONTEXT);
+		expect(await deadlineDrive).toMatchObject({ ok: true, value: { kind: "yielded" } });
+		expect(
+			(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+				?.value,
+		).toMatchObject({
+			phase: { kind: "tools", batch: { calls: [{ status: "planned" }] } },
+		});
+
+		const completedDrive = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
+		await waitForAction(reopened.harness);
+		await reopened.harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await completedDrive).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
@@ -1005,12 +1073,12 @@ describe("AgentHarness R4 tools", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "recover prefix" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "recover prefix" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			const action = await fixture.harness.peekAction();
+			const action = await fixture.harness.peekAction(BACKGROUND_CONTEXT);
 			if (
 				action?.kind === "tool.intent" &&
 				action.details !== null &&
@@ -1020,7 +1088,7 @@ describe("AgentHarness R4 tools", () => {
 			) {
 				break;
 			}
-			await fixture.harness.executeAction();
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		let contextResolutions = 0;
 		const reopened = await reopenFixture(fixture, {
@@ -1032,17 +1100,23 @@ describe("AgentHarness R4 tools", () => {
 		});
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		await expect(reopened.harness.drive({ operationId: accepted.value.operationId })).rejects.toMatchObject({
+		await expect(
+			reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).rejects.toMatchObject({
 			name: "HarnessFault",
 		});
 		expect(contextResolutions).toBe(1);
-		const state = await reopened.fixture.session.getRegister("op.state", accepted.value.operationId);
+		const state = await reopened.fixture.session.getRegister(
+			"op.state",
+			accepted.value.operationId,
+			BACKGROUND_CONTEXT,
+		);
 		expect(state?.value).toMatchObject({
 			phase: { kind: "tools", batch: { calls: [{ status: "completed" }, { status: "planned" }] } },
 		});
-		const results = (await reopened.fixture.session.findEntriesOnBranch({ order: "oldestFirst" })).filter(
-			(entry) => entry.type === "message" && entry.message.role === "toolResult",
-		);
+		const results = (
+			await reopened.fixture.session.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT)
+		).filter((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(results).toHaveLength(1);
 		expect(results[0]).toMatchObject({ message: { toolCallId: "call-identity-free", isError: true } });
 	});
@@ -1063,13 +1137,13 @@ describe("AgentHarness R4 tools", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "missing first" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "missing first" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		let contextResolutions = 0;
 		const reopened = await reopenFixture(fixture, {
@@ -1081,7 +1155,9 @@ describe("AgentHarness R4 tools", () => {
 		});
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities", missing: { tools: ["echo"] } },
 		});
@@ -1102,24 +1178,27 @@ describe("AgentHarness R4 tools", () => {
 			),
 			fauxAssistantMessage("done"),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "planned deadline" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "planned deadline" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "hook.before_tool") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "hook.before_tool") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		const reopened = await reopenFixture(fixture, { tools: [tool], drive: "manual" });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 		const now = vi.spyOn(Date, "now").mockReturnValue(100);
-		const resumed = reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 });
+		const resumed = reopened.harness.drive(
+			{ operationId: accepted.value.operationId, deadline: 150 },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(reopened.harness);
-			const action = await reopened.harness.peekAction();
+			const action = await reopened.harness.peekAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "tool.execute") now.mockReturnValue(200);
-			await reopened.harness.executeAction();
+			await reopened.harness.executeAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "tool.settlement") break;
 		}
 		expect(await resumed).toMatchObject({ ok: true, value: { kind: "yielded" } });
@@ -1132,9 +1211,9 @@ describe("AgentHarness R4 tools", () => {
 		expect(firstPassStarts).toEqual(firstPassEnds);
 		events.splice(0);
 
-		const finished = reopened.harness.drive({ operationId: accepted.value.operationId });
+		const finished = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await waitForAction(reopened.harness);
-		await reopened.harness.runToCompletion();
+		await reopened.harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await finished).toMatchObject({ ok: true, value: { kind: "settled" } });
 		const secondPassStarts = events.flatMap((event) =>
 			event.type === "turn_start" && event.recovery ? [event.turnId] : [],
@@ -1160,32 +1239,38 @@ describe("AgentHarness R4 tools", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "deadline recovery" });
+		const accepted = await fixture.harness.accept(
+			{ kind: "prompt", prompt: "deadline recovery" },
+			BACKGROUND_CONTEXT,
+		);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		const reopened = await reopenFixture(fixture, { tools: [tool], drive: "manual" });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		const events = captureEvents(reopened.harness);
 		const now = vi.spyOn(Date, "now").mockReturnValue(100);
-		const drive = reopened.harness.drive({ operationId: accepted.value.operationId, deadline: 150 });
+		const drive = reopened.harness.drive(
+			{ operationId: accepted.value.operationId, deadline: 150 },
+			BACKGROUND_CONTEXT,
+		);
 		while (true) {
 			await waitForAction(reopened.harness);
-			const action = await reopened.harness.peekAction();
+			const action = await reopened.harness.peekAction(BACKGROUND_CONTEXT);
 			if (action?.kind === "tool.execute") {
 				now.mockReturnValue(200);
-				await reopened.harness.executeAction();
+				await reopened.harness.executeAction(BACKGROUND_CONTEXT);
 				break;
 			}
-			await reopened.harness.executeAction();
+			await reopened.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		await waitForAction(reopened.harness);
-		expect(await reopened.harness.peekAction()).toMatchObject({ kind: "tool.settlement" });
-		await reopened.harness.executeAction();
+		expect(await reopened.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "tool.settlement" });
+		await reopened.harness.executeAction(BACKGROUND_CONTEXT);
 		expect(await drive).toMatchObject({ ok: true, value: { kind: "yielded" } });
 		expect(events.filter((event) => event.type === "turn_start" && event.recovery)).toHaveLength(1);
 		expect(events.filter((event) => event.type === "turn_end" && event.recovery)).toHaveLength(1);
@@ -1209,13 +1294,16 @@ describe("AgentHarness R4 tools", () => {
 				{ stopReason: "toolUse" },
 			),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "sequential recovery" });
+		const accepted = await fixture.harness.accept(
+			{ kind: "prompt", prompt: "sequential recovery" },
+			BACKGROUND_CONTEXT,
+		);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
 		const firstStarted = deferred<void>();
 		const firstResult = deferred<{ content: [{ type: "text"; text: string }]; details: Record<string, never> }>();
@@ -1237,7 +1325,7 @@ describe("AgentHarness R4 tools", () => {
 		};
 		const reopened = await reopenFixture(fixture, { tools: [currentFirst, currentSecond] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
-		const drive = reopened.harness.drive({ operationId: accepted.value.operationId });
+		const drive = reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		await firstStarted.promise;
 		expect(secondExecutions).toBe(0);
 
@@ -1257,27 +1345,33 @@ describe("AgentHarness R4 tools", () => {
 				stopReason: "toolUse",
 			}),
 		]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "safe" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "safe" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		while (true) {
 			await waitForAction(fixture.harness);
-			if ((await fixture.harness.peekAction())?.kind === "tool.settlement") break;
-			await fixture.harness.executeAction();
+			if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === "tool.settlement") break;
+			await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 		}
-		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId))?.value;
-		const argsBefore = await fixture.session.listRegisters("op.tool_args");
+		const before = (await fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+			?.value;
+		const argsBefore = await fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT);
 		const reopened = await reopenFixture(fixture, { tools: [] });
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "waiting", reason: "missing_identities", missing: { tools: ["echo"] } },
 		});
-		expect((await reopened.fixture.session.getRegister("op.state", accepted.value.operationId))?.value).toEqual(
-			before,
+		expect(
+			(await reopened.fixture.session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))
+				?.value,
+		).toEqual(before);
+		expect(await reopened.fixture.session.listRegisters("op.tool_args", undefined, BACKGROUND_CONTEXT)).toEqual(
+			argsBefore,
 		);
-		expect(await reopened.fixture.session.listRegisters("op.tool_args")).toEqual(argsBefore);
 	});
 
 	it("finishes without another assistant request when every result terminates", async () => {
@@ -1293,14 +1387,14 @@ describe("AgentHarness R4 tools", () => {
 			}),
 		]);
 
-		const result = await fixture.harness.prompt("finish through tool");
+		const result = await fixture.harness.prompt("finish through tool", undefined, BACKGROUND_CONTEXT);
 
 		expect(result).toMatchObject({ ok: true, value: { kind: "completed" } });
 		if (!result.ok) throw result.error;
 		expect(result.value).not.toHaveProperty("finalEntryId");
 		expect(result.value).not.toHaveProperty("finalMessage");
 		expect(fixture.faux.state.callCount).toBe(1);
-		const lastResult = await fixture.session.getRegister("lane.lastResult", "main");
+		const lastResult = await fixture.session.getRegister("lane.lastResult", "main", BACKGROUND_CONTEXT);
 		expect(lastResult).toMatchObject({ value: { outcome: "completed", runCompletion: "terminated_tools" } });
 		expect(lastResult?.value).not.toHaveProperty("finalAssistantEntryId");
 	});
@@ -1319,7 +1413,7 @@ describe("AgentHarness R4 tools", () => {
 			}),
 		]);
 
-		const result = await fixture.harness.prompt("block and finish");
+		const result = await fixture.harness.prompt("block and finish", undefined, BACKGROUND_CONTEXT);
 		expect(result).toMatchObject({ ok: true, value: { kind: "completed" } });
 		if (!result.ok) throw result.error;
 		expect(result.value).not.toHaveProperty("finalMessage");
@@ -1356,7 +1450,7 @@ describe("AgentHarness R4 tools", () => {
 			},
 		]);
 
-		expect(await fixture.harness.prompt("truncated tools")).toMatchObject({
+		expect(await fixture.harness.prompt("truncated tools", undefined, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: true,
 			value: { kind: "completed", finalMessage: { content: [{ text: "reissued" }] } },
 		});

@@ -13,6 +13,7 @@ import { createUnixServer, getUnixSocketPath } from "@earendil-works/pi-server/u
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { BACKGROUND_CONTEXT } from "./context.ts";
 import { CoordinatorConnection, type CoordinatorStartupLease, ensureCoordinator } from "./coordinator.ts";
 import { consumeInternalProcessRole, spawnInternalProcess, terminateInternalProcess } from "./process.ts";
 import { SessionWorkerManager } from "./session-worker-manager.ts";
@@ -332,16 +333,18 @@ async function startServerBackend(
 	const host: PiServerHost<JsonlSessionMetadata> = {
 		sessions: {
 			list: async () => {
-				const sessions = new Map((await repo.list()).map((metadata) => [metadata.path, metadata]));
+				const sessions = new Map(
+					(await repo.list(undefined, BACKGROUND_CONTEXT)).map((metadata) => [metadata.path, metadata]),
+				);
 				for (const metadata of workers.trackedSessions) sessions.set(metadata.path, metadata);
 				return [...sessions.values()];
 			},
 			create: async (createOptions) => {
-				const session = await repo.create(createOptions);
+				const session = await repo.create(createOptions, BACKGROUND_CONTEXT);
 				try {
 					return session.metadata;
 				} finally {
-					await session.close();
+					await session.close(BACKGROUND_CONTEXT);
 				}
 			},
 		},
@@ -349,7 +352,10 @@ async function startServerBackend(
 	};
 	const socketPath = options.path;
 	const closeCatalog = async (): Promise<void> => {
-		const cleanup = await Promise.allSettled([repo.close(), executionEnv.cleanup()]);
+		const cleanup = await Promise.allSettled([
+			repo.close(BACKGROUND_CONTEXT),
+			executionEnv.cleanup(BACKGROUND_CONTEXT),
+		]);
 		const errors = cleanup.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 		if (errors.length === 1) throw errors[0];
 		if (errors.length > 1) throw new AggregateError(errors, "Experimental session catalog cleanup failed");

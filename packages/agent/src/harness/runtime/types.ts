@@ -1,5 +1,4 @@
 import type { DeferredHandle, Message, Models, RetryPolicy, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { AgentMessage, QueueMode } from "../../types.ts";
 import type {
 	AgentHarnessOptions,
@@ -12,6 +11,7 @@ import type {
 	SuspendedOperation,
 } from "../agent-harness.ts";
 import type { CompactionSettings } from "../compaction/compaction.ts";
+import type { Context } from "../context.ts";
 import type { HarnessEventBus } from "../events.ts";
 import type { BreakpointBarrier } from "../execution/breakpoint.ts";
 import type { OperationEffectGate } from "../execution/effect-gate.ts";
@@ -152,20 +152,19 @@ export interface RuntimeProcedureContext<TContext extends object | undefined> {
 	readonly models: Models;
 	readonly hooks: HookRegistry;
 	readonly events: HarnessEventBus;
-	readonly telemetryContext: TelemetryContext;
 	readonly toolContext: AgentHarnessToolContextSource<TContext> | undefined;
 	readonly systemPromptSource: AgentHarnessOptions<TContext>["systemPrompt"];
-	readonly toProviderMessages: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	readonly toProviderMessages: (messages: AgentMessage[], context: Context) => Message[] | Promise<Message[]>;
 	readonly entryProjectors: Readonly<Record<string, EntryProjector>>;
 	readonly attachedOperationIds: Set<string>;
 	readonly resumedOperationIds: Set<string>;
 	readonly resumeEventOperationIds: Set<string>;
 	readonly restoredSuspensions: Map<string, SuspendedOperation>;
-	readSettings<Result>(read: (settings: RuntimeSettings<TContext>) => Result): Promise<Result>;
-	snapshotSettings(): Promise<RuntimeSettings<TContext>>;
+	readSettings<Result>(read: (settings: RuntimeSettings<TContext>) => Result, context: Context): Promise<Result>;
+	snapshotSettings(context: Context): Promise<RuntimeSettings<TContext>>;
 	assertOpen(): void;
 	isOpen(): boolean;
-	fault(cause: unknown): HarnessFault | HarnessClosed;
+	fault(cause: unknown, context: Context): HarnessFault | HarnessClosed;
 }
 
 export interface OperationTaskContext<TContext extends object | undefined> extends RuntimeProcedureContext<TContext> {

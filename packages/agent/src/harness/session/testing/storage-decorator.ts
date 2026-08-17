@@ -1,3 +1,4 @@
+import type { Context } from "../../context.ts";
 import type {
 	CommitResult,
 	Entry,
@@ -21,49 +22,51 @@ export class StorageDecorator implements Storage {
 		this.delegate = delegate;
 	}
 
-	commit(transaction: Transaction): Promise<CommitResult> {
-		return this.delegate.commit(transaction);
+	commit(transaction: Transaction, context: Context): Promise<CommitResult> {
+		return this.delegate.commit(transaction, context);
 	}
 
-	getEntries(ids: string[]): Promise<Map<string, Entry>> {
-		return this.delegate.getEntries(ids);
+	getEntries(ids: string[], context: Context): Promise<Map<string, Entry>> {
+		return this.delegate.getEntries(ids, context);
 	}
 
 	getRegister<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
 		key: string,
+		context: Context,
 	): Promise<Register<TNamespace> | undefined> {
-		return this.delegate.getRegister(namespace, key);
+		return this.delegate.getRegister(namespace, key, context);
 	}
 
 	listRegisters<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
-		keyPrefix?: string,
+		keyPrefix: string | undefined,
+		context: Context,
 	): Promise<Register<TNamespace>[]> {
-		return this.delegate.listRegisters(namespace, keyPrefix);
+		return this.delegate.listRegisters(namespace, keyPrefix, context);
 	}
 
-	scanBranch(query: StorageBranchScan): Promise<Entry[]> {
-		return this.delegate.scanBranch(query);
+	scanBranch(query: StorageBranchScan, context: Context): Promise<Entry[]> {
+		return this.delegate.scanBranch(query, context);
 	}
 
-	scanBranchStructure(query: StorageBranchScan): Promise<EntryStructure[]> {
-		return this.delegate.scanBranchStructure(query);
+	scanBranchStructure(query: StorageBranchScan, context: Context): Promise<EntryStructure[]> {
+		return this.delegate.scanBranchStructure(query, context);
 	}
 
-	scanEntries(query: EntryScan): Promise<Entry[]> {
-		return this.delegate.scanEntries(query);
+	scanEntries(query: EntryScan, context: Context): Promise<Entry[]> {
+		return this.delegate.scanEntries(query, context);
 	}
 
-	scanUsage(query: UsageScan): Promise<UsageRow[]> {
-		return this.delegate.scanUsage(query);
+	scanUsage(query: UsageScan, context: Context): Promise<UsageRow[]> {
+		return this.delegate.scanUsage(query, context);
 	}
 
-	getStats(): Promise<SessionStats> {
-		return this.delegate.getStats();
+	getStats(context: Context): Promise<SessionStats> {
+		return this.delegate.getStats(context);
 	}
 
-	close(): Promise<void> {
-		return this.delegate.close();
+	close(context: Context): Promise<void> {
+		return this.delegate.close(context);
 	}
 }

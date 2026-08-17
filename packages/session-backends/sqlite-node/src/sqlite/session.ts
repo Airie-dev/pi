@@ -1,6 +1,7 @@
 import type {
 	AgentMessage,
 	BranchScan,
+	Context,
 	Entry,
 	EntryQuery,
 	JsonValue,
@@ -54,121 +55,133 @@ export class SqliteOpenSession implements Session<SqliteSessionMetadata> {
 		this.renewalTimer.unref?.();
 	}
 
-	mutate<T>(lane: string, mutation: (mutator: SessionMutator) => T | Promise<T>): Promise<T> {
-		return this.admit(() => this.session.mutate(lane, mutation));
+	mutate<T>(
+		lane: string,
+		mutation: (mutator: SessionMutator, context: Context) => T | Promise<T>,
+		context: Context,
+	): Promise<T> {
+		return this.admit(() => this.session.mutate(lane, mutation, context));
 	}
 
-	getEntries(ids: string[]): Promise<Map<string, Entry>> {
-		return this.admit(() => this.session.getEntries(ids));
+	getEntries(ids: string[], context: Context): Promise<Map<string, Entry>> {
+		return this.admit(() => this.session.getEntries(ids, context));
 	}
 
 	getRegister<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
 		key: string,
+		context: Context,
 	): Promise<Register<TNamespace> | undefined> {
-		return this.admit(() => this.session.getRegister(namespace, key));
+		return this.admit(() => this.session.getRegister(namespace, key, context));
 	}
 
 	listRegisters<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
-		keyPrefix?: string,
+		keyPrefix: string | undefined,
+		context: Context,
 	): Promise<Register<TNamespace>[]> {
-		return this.admit(() => this.session.listRegisters(namespace, keyPrefix));
+		return this.admit(() => this.session.listRegisters(namespace, keyPrefix, context));
 	}
 
 	view(lane: string): SessionTree {
 		const view = this.session.view(lane);
 		return {
-			getLeafId: () => this.admit(() => view.getLeafId()),
-			getEntry: (id) => this.admit(() => view.getEntry(id)),
-			getStats: () => this.admit(() => view.getStats()),
-			getName: () => this.admit(() => view.getName()),
-			setName: (name) => this.admit(() => view.setName(name)),
-			getLabel: (targetId) => this.admit(() => view.getLabel(targetId)),
-			setLabel: (targetId, label) => this.admit(() => view.setLabel(targetId, label)),
-			getCustomFact: (key) => this.admit(() => view.getCustomFact(key)),
-			setCustomFact: (key, value) => this.admit(() => view.setCustomFact(key, value)),
-			findEntries: (query) => this.admit(() => view.findEntries(query)),
-			findEntry: (query) => this.admit(() => view.findEntry(query)),
-			findEntriesOnBranch: (query) => this.admit(() => view.findEntriesOnBranch(query)),
-			findEntryOnBranch: (query) => this.admit(() => view.findEntryOnBranch(query)),
-			appendMessage: (message) => this.admit(() => view.appendMessage(message)),
-			appendCustomEntry: (customType, data) => this.admit(() => view.appendCustomEntry(customType, data)),
+			getLeafId: (context) => this.admit(() => view.getLeafId(context)),
+			getEntry: (id, context) => this.admit(() => view.getEntry(id, context)),
+			getStats: (context) => this.admit(() => view.getStats(context)),
+			getName: (context) => this.admit(() => view.getName(context)),
+			setName: (name, context) => this.admit(() => view.setName(name, context)),
+			getLabel: (targetId, context) => this.admit(() => view.getLabel(targetId, context)),
+			setLabel: (targetId, label, context) => this.admit(() => view.setLabel(targetId, label, context)),
+			getCustomFact: (key, context) => this.admit(() => view.getCustomFact(key, context)),
+			setCustomFact: (key, value, context) => this.admit(() => view.setCustomFact(key, value, context)),
+			findEntries: (query, context) => this.admit(() => view.findEntries(query, context)),
+			findEntry: (query, context) => this.admit(() => view.findEntry(query, context)),
+			findEntriesOnBranch: (query, context) => this.admit(() => view.findEntriesOnBranch(query, context)),
+			findEntryOnBranch: (query, context) => this.admit(() => view.findEntryOnBranch(query, context)),
+			appendMessage: (message, context) => this.admit(() => view.appendMessage(message, context)),
+			appendCustomEntry: (customType, data, context) =>
+				this.admit(() => view.appendCustomEntry(customType, data, context)),
 		};
 	}
 
-	createLane(name: string, at: string | null, configuration: LaneConfiguration): Promise<SessionTree> {
+	createLane(
+		name: string,
+		at: string | null,
+		configuration: LaneConfiguration,
+		context: Context,
+	): Promise<SessionTree> {
 		return this.admit(async () => {
-			await this.session.createLane(name, at, configuration);
+			await this.session.createLane(name, at, configuration, context);
 			return this.view(name);
 		});
 	}
 
-	getLeafId(): Promise<string | null> {
-		return this.admit(() => this.session.getLeafId());
+	getLeafId(context: Context): Promise<string | null> {
+		return this.admit(() => this.session.getLeafId(context));
 	}
 
-	getEntry(id: string): Promise<Entry | undefined> {
-		return this.admit(() => this.session.getEntry(id));
+	getEntry(id: string, context: Context): Promise<Entry | undefined> {
+		return this.admit(() => this.session.getEntry(id, context));
 	}
 
-	getStats(): Promise<SessionStats> {
-		return this.admit(() => this.session.getStats());
+	getStats(context: Context): Promise<SessionStats> {
+		return this.admit(() => this.session.getStats(context));
 	}
 
-	getName(): Promise<string | undefined> {
-		return this.admit(() => this.session.getName());
+	getName(context: Context): Promise<string | undefined> {
+		return this.admit(() => this.session.getName(context));
 	}
 
-	setName(name: string | undefined): Promise<void> {
-		return this.admit(() => this.session.setName(name));
+	setName(name: string | undefined, context: Context): Promise<void> {
+		return this.admit(() => this.session.setName(name, context));
 	}
 
-	getLabel(targetId: string): Promise<string | undefined> {
-		return this.admit(() => this.session.getLabel(targetId));
+	getLabel(targetId: string, context: Context): Promise<string | undefined> {
+		return this.admit(() => this.session.getLabel(targetId, context));
 	}
 
-	setLabel(targetId: string, label: string | undefined): Promise<void> {
-		return this.admit(() => this.session.setLabel(targetId, label));
+	setLabel(targetId: string, label: string | undefined, context: Context): Promise<void> {
+		return this.admit(() => this.session.setLabel(targetId, label, context));
 	}
 
-	getCustomFact(key: string): Promise<JsonValue | undefined> {
-		return this.admit(() => this.session.getCustomFact(key));
+	getCustomFact(key: string, context: Context): Promise<JsonValue | undefined> {
+		return this.admit(() => this.session.getCustomFact(key, context));
 	}
 
-	setCustomFact(key: string, value: JsonValue | undefined): Promise<void> {
-		return this.admit(() => this.session.setCustomFact(key, value));
+	setCustomFact(key: string, value: JsonValue | undefined, context: Context): Promise<void> {
+		return this.admit(() => this.session.setCustomFact(key, value, context));
 	}
 
-	findEntries(query?: EntryQuery): Promise<Entry[]> {
-		return this.admit(() => this.session.findEntries(query));
+	findEntries(query: EntryQuery | undefined, context: Context): Promise<Entry[]> {
+		return this.admit(() => this.session.findEntries(query, context));
 	}
 
-	findEntry(query?: EntryQuery): Promise<Entry | undefined> {
-		return this.admit(() => this.session.findEntry(query));
+	findEntry(query: EntryQuery | undefined, context: Context): Promise<Entry | undefined> {
+		return this.admit(() => this.session.findEntry(query, context));
 	}
 
-	findEntriesOnBranch(query?: BranchScan): Promise<Entry[]> {
-		return this.admit(() => this.session.findEntriesOnBranch(query));
+	findEntriesOnBranch(query: BranchScan | undefined, context: Context): Promise<Entry[]> {
+		return this.admit(() => this.session.findEntriesOnBranch(query, context));
 	}
 
-	findEntryOnBranch(query?: BranchScan): Promise<Entry | undefined> {
-		return this.admit(() => this.session.findEntryOnBranch(query));
+	findEntryOnBranch(query: BranchScan | undefined, context: Context): Promise<Entry | undefined> {
+		return this.admit(() => this.session.findEntryOnBranch(query, context));
 	}
 
-	appendMessage(message: AgentMessage): Promise<string> {
-		return this.admit(() => this.session.appendMessage(message));
+	appendMessage(message: AgentMessage, context: Context): Promise<string> {
+		return this.admit(() => this.session.appendMessage(message, context));
 	}
 
-	appendCustomEntry(customType: string, data?: JsonValue): Promise<string> {
-		return this.admit(() => this.session.appendCustomEntry(customType, data));
+	appendCustomEntry(customType: string, data: JsonValue | undefined, context: Context): Promise<string> {
+		return this.admit(() => this.session.appendCustomEntry(customType, data, context));
 	}
 
-	close(): Promise<void> {
+	close(context: Context): Promise<void> {
 		if (this.closePromise !== undefined) return this.closePromise;
 		this.state = "closing";
 		this.closePromise = Promise.allSettled([...this.admitted])
-			.then(() => this.session.close())
+			.then(() => this.session.close(context))
 			.finally(() => {
 				clearInterval(this.renewalTimer);
 				try {

@@ -1,3 +1,5 @@
+import { type Context, withAbortSignal } from "../context.ts";
+
 /** Expected internal control flow when cancellation wins effect admission. */
 export class AbortRequested extends Error {
 	readonly cancellation: Promise<void>;
@@ -16,8 +18,8 @@ type EffectGateState =
 
 /** Process-local admission gate for one operation's external work. */
 export interface EffectGate {
-	/** The operation-owned cooperative signal. */
-	readonly signal: AbortSignal;
+	/** Invocation context carrying the operation-owned cooperative signal. */
+	readonly context: Context;
 	/** Synchronously throws when ordinary work may no longer start. */
 	assertOpen(): void;
 	/** Close ordinary starts before the durable cancellation mutation begins. */
@@ -30,11 +32,12 @@ export interface EffectGate {
 
 /** Default {@link EffectGate} implementation used by drive passes. */
 export class OperationEffectGate implements EffectGate {
+	readonly context: Context;
 	private readonly controller = new AbortController();
 	private state: EffectGateState = { status: "open" };
 
-	get signal(): AbortSignal {
-		return this.controller.signal;
+	constructor(context: Context) {
+		this.context = withAbortSignal(this.controller.signal, context);
 	}
 
 	assertOpen(): void {

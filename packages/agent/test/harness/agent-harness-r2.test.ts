@@ -6,6 +6,7 @@ import {
 	type MutableModels,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
@@ -27,17 +28,20 @@ const fixtures: Fixture[] = [];
 
 async function createFixture(options: { drive?: "automatic" | "manual" } = {}): Promise<Fixture> {
 	const repo = new MemorySessionRepo();
-	const session = await repo.create({});
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
-	const { harness } = await AgentHarness.create({
-		session,
-		models,
-		model: faux.getModel(),
-		activeToolNames: [],
-		drive: options.drive,
-	});
+	const { harness } = await AgentHarness.create(
+		{
+			session,
+			models,
+			model: faux.getModel(),
+			activeToolNames: [],
+			drive: options.drive,
+		},
+		BACKGROUND_CONTEXT,
+	);
 	const fixture = { harness, session, repo, faux, models };
 	fixtures.push(fixture);
 	return fixture;
@@ -66,7 +70,7 @@ function captureLifecycle(harness: AgentHarnessInstance): HarnessEvent[] {
 
 async function waitForAction(harness: AgentHarnessInstance): Promise<void> {
 	for (let attempt = 0; attempt < 100; attempt++) {
-		if ((await harness.peekAction()) !== undefined) return;
+		if ((await harness.peekAction(BACKGROUND_CONTEXT)) !== undefined) return;
 		await waitForTick();
 	}
 	throw new Error("action did not park");
@@ -82,8 +86,8 @@ function deferred(): { promise: Promise<void>; resolve(): void } {
 
 afterEach(async () => {
 	for (const fixture of fixtures.splice(0)) {
-		await fixture.harness.close();
-		await fixture.repo.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	}
 });
 
@@ -94,14 +98,19 @@ describe("AgentHarness R2 minimal run", () => {
 		const events = captureLifecycle(harness);
 		const operationId = session.idGenerator.next();
 
-		const admission = await harness.accept({ kind: "prompt", operationId, prompt: "question" });
+		const admission = await harness.accept({ kind: "prompt", operationId, prompt: "question" }, BACKGROUND_CONTEXT);
 		expect(admission).toMatchObject({ ok: true, value: { operationId, kind: "run" } });
 		expect(faux.state.callCount).toBe(0);
-		expect((await harness.inspectExecution()).current).toMatchObject({ id: operationId, status: "suspended" });
-		expect((await session.getRegister("op.meta", operationId))?.value.operationId).toBe(operationId);
+		expect((await harness.inspectExecution(BACKGROUND_CONTEXT)).current).toMatchObject({
+			id: operationId,
+			status: "suspended",
+		});
+		expect((await session.getRegister("op.meta", operationId, BACKGROUND_CONTEXT))?.value.operationId).toBe(
+			operationId,
+		);
 		expect(events.map((event) => event.type)).toEqual(["run_start", "message_start", "message_end", "entry_added"]);
 
-		const driven = await harness.drive({ operationId });
+		const driven = await harness.drive({ operationId }, BACKGROUND_CONTEXT);
 		expect(driven).toMatchObject({
 			ok: true,
 			value: {
@@ -116,10 +125,12 @@ describe("AgentHarness R2 minimal run", () => {
 			},
 		});
 		expect(faux.state.callCount).toBe(1);
-		expect(await session.getRegister("op.meta", operationId)).toBeUndefined();
-		expect(await session.getRegister("op.state", operationId)).toBeUndefined();
-		expect(await session.getRegister("lane.state", "main")).toMatchObject({ value: { currentOperationId: null } });
-		expect(await session.getRegister("lane.lastResult", "main")).toMatchObject({
+		expect(await session.getRegister("op.meta", operationId, BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getRegister("op.state", operationId, BACKGROUND_CONTEXT)).toBeUndefined();
+		expect(await session.getRegister("lane.state", "main", BACKGROUND_CONTEXT)).toMatchObject({
+			value: { currentOperationId: null },
+		});
+		expect(await session.getRegister("lane.lastResult", "main", BACKGROUND_CONTEXT)).toMatchObject({
 			value: { operationId, kind: "run", outcome: "completed", runCompletion: "assistant" },
 		});
 
@@ -131,8 +142,8 @@ describe("AgentHarness R2 minimal run", () => {
 
 	it("applies context, request-option, and response hooks around the captured request", async () => {
 		const { harness, faux } = await createFixture();
-		await harness.setThinkingLevel("high");
-		await harness.setStreamOptions({ headers: { base: "yes" } });
+		await harness.setThinkingLevel("high", BACKGROUND_CONTEXT);
+		await harness.setStreamOptions({ headers: { base: "yes" } }, BACKGROUND_CONTEXT);
 		harness.hooks.on("transform_context", ({ messages }) => ({
 			messages: [...messages, { role: "user", content: "context hook", timestamp: 2 }],
 		}));
@@ -147,7 +158,7 @@ describe("AgentHarness R2 minimal run", () => {
 				return fauxAssistantMessage("provider");
 			},
 		]);
-		const result = await harness.prompt("go");
+		const result = await harness.prompt("go", undefined, BACKGROUND_CONTEXT);
 		expect(result).toMatchObject({
 			ok: true,
 			value: { finalMessage: { content: [{ type: "text", text: "post-hook" }] } },
@@ -157,7 +168,7 @@ describe("AgentHarness R2 minimal run", () => {
 	it("implements prompt as acceptance followed by the same drive path", async () => {
 		const { harness, faux } = await createFixture();
 		faux.setResponses([fauxAssistantMessage("done")]);
-		const result = await harness.prompt("go");
+		const result = await harness.prompt("go", undefined, BACKGROUND_CONTEXT);
 		expect(result).toMatchObject({
 			ok: true,
 			value: { kind: "completed", finalMessage: { role: "assistant", stopReason: "stop" } },
@@ -167,45 +178,67 @@ describe("AgentHarness R2 minimal run", () => {
 	it("rejects caller-supplied pending assistants without opening an operation", async () => {
 		const { harness } = await createFixture();
 		const pending = fauxAssistantMessage("draft", { stopReason: "pending" });
-		expect(await harness.accept({ kind: "prompt", prompt: pending })).toMatchObject({
+		expect(await harness.accept({ kind: "prompt", prompt: pending }, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: false,
 			error: { _tag: "InvalidMessage", reason: "pending_assistant" },
 		});
-		expect((await harness.inspectExecution()).current).toBeNull();
+		expect((await harness.inspectExecution(BACKGROUND_CONTEXT)).current).toBeNull();
 	});
 
 	it("expands run resources and rejects unknown or empty prompts without opening an operation", async () => {
 		const { harness } = await createFixture();
-		await harness.setResources({
-			skills: [{ name: "review", description: "Review", content: "Check it", filePath: "/skills/review/SKILL.md" }],
-			promptTemplates: [{ name: "hello", content: "Hello $1" }],
-		});
-		const skill = await harness.accept({ kind: "skill", name: "review", additionalInstructions: "carefully" });
+		await harness.setResources(
+			{
+				skills: [
+					{ name: "review", description: "Review", content: "Check it", filePath: "/skills/review/SKILL.md" },
+				],
+				promptTemplates: [{ name: "hello", content: "Hello $1" }],
+			},
+			BACKGROUND_CONTEXT,
+		);
+		const skill = await harness.accept(
+			{ kind: "skill", name: "review", additionalInstructions: "carefully" },
+			BACKGROUND_CONTEXT,
+		);
 		expect(skill.ok).toBe(true);
 		if (skill.ok) {
-			const meta = await harness.sessionTree.getEntry((await harness.getLeafId())!);
+			const meta = await harness.sessionTree.getEntry(
+				(await harness.getLeafId(BACKGROUND_CONTEXT))!,
+				BACKGROUND_CONTEXT,
+			);
 			expect(meta).toMatchObject({ type: "message", message: { content: expect.stringContaining("carefully") } });
-			await harness.close();
+			await harness.close(BACKGROUND_CONTEXT);
 		}
 
 		const second = await createFixture();
-		await second.harness.setResources({ promptTemplates: [{ name: "hello", content: "Hello $1" }] });
-		const template = await second.harness.accept({ kind: "prompt_template", name: "hello", args: ["Ada"] });
+		await second.harness.setResources(
+			{ promptTemplates: [{ name: "hello", content: "Hello $1" }] },
+			BACKGROUND_CONTEXT,
+		);
+		const template = await second.harness.accept(
+			{ kind: "prompt_template", name: "hello", args: ["Ada"] },
+			BACKGROUND_CONTEXT,
+		);
 		expect(template.ok).toBe(true);
-		expect(await second.harness.sessionTree.getEntry((await second.harness.getLeafId())!)).toMatchObject({
+		expect(
+			await second.harness.sessionTree.getEntry(
+				(await second.harness.getLeafId(BACKGROUND_CONTEXT))!,
+				BACKGROUND_CONTEXT,
+			),
+		).toMatchObject({
 			message: { content: "Hello Ada" },
 		});
 
 		const third = await createFixture();
-		expect(await third.harness.accept({ kind: "skill", name: "missing" })).toMatchObject({
+		expect(await third.harness.accept({ kind: "skill", name: "missing" }, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: false,
 			error: { _tag: "UnknownSkill" },
 		});
-		expect(await third.harness.accept({ kind: "prompt", prompt: "" })).toMatchObject({
+		expect(await third.harness.accept({ kind: "prompt", prompt: "" }, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: false,
 			error: { _tag: "InvalidMessage" },
 		});
-		expect((await third.harness.inspectExecution()).current).toBeNull();
+		expect((await third.harness.inspectExecution(BACKGROUND_CONTEXT)).current).toBeNull();
 	});
 
 	it("persists before_run injections, system override, and per-handler resume data", async () => {
@@ -219,9 +252,9 @@ describe("AgentHarness R2 minimal run", () => {
 			}),
 			{ id: "extension" },
 		);
-		const accepted = await harness.accept({ kind: "prompt", prompt: "caller" });
+		const accepted = await harness.accept({ kind: "prompt", prompt: "caller" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const operation = await session.getRegister("op.meta", accepted.value.operationId);
+		const operation = await session.getRegister("op.meta", accepted.value.operationId, BACKGROUND_CONTEXT);
 		expect(operation?.value.intent).toMatchObject({
 			kind: "run",
 			systemPromptOverride: "override",
@@ -229,27 +262,27 @@ describe("AgentHarness R2 minimal run", () => {
 		});
 		if (operation?.value.intent.kind !== "run") throw new Error("missing run operation");
 		expect(operation.value.intent.promptEntryIds).toHaveLength(1);
-		const branch = await harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = await harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
 		expect(branch).toHaveLength(2);
 		expect(branch[1]).toMatchObject({ message: { content: "hook" } });
 	});
 
 	it("rejects unresolved model and active-tool identities before writing an operation", async () => {
 		const modelFixture = await createFixture();
-		await modelFixture.harness.setModel({ ...modelFixture.faux.getModel(), id: "missing-model" });
-		expect(await modelFixture.harness.accept({ kind: "prompt", prompt: "hello" })).toMatchObject({
+		await modelFixture.harness.setModel({ ...modelFixture.faux.getModel(), id: "missing-model" }, BACKGROUND_CONTEXT);
+		expect(await modelFixture.harness.accept({ kind: "prompt", prompt: "hello" }, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: false,
 			error: { _tag: "MissingIdentities", model: expect.stringContaining("missing-model"), tools: [] },
 		});
-		expect((await modelFixture.harness.inspectExecution()).current).toBeNull();
+		expect((await modelFixture.harness.inspectExecution(BACKGROUND_CONTEXT)).current).toBeNull();
 
 		const toolFixture = await createFixture();
-		await toolFixture.harness.setActiveTools(["missing-tool"]);
-		expect(await toolFixture.harness.accept({ kind: "prompt", prompt: "hello" })).toMatchObject({
+		await toolFixture.harness.setActiveTools(["missing-tool"], BACKGROUND_CONTEXT);
+		expect(await toolFixture.harness.accept({ kind: "prompt", prompt: "hello" }, BACKGROUND_CONTEXT)).toMatchObject({
 			ok: false,
 			error: { _tag: "MissingIdentities", tools: ["missing-tool"] },
 		});
-		expect((await toolFixture.harness.inspectExecution()).current).toBeNull();
+		expect((await toolFixture.harness.inspectExecution(BACKGROUND_CONTEXT)).current).toBeNull();
 	});
 
 	it("holds a stable admission reservation across before_run and lets a matching drive wait", async () => {
@@ -267,16 +300,18 @@ describe("AgentHarness R2 minimal run", () => {
 			{ id: "test" },
 		);
 
-		const acceptance = harness.accept({ kind: "prompt", operationId, prompt: "hello" });
+		const acceptance = harness.accept({ kind: "prompt", operationId, prompt: "hello" }, BACKGROUND_CONTEXT);
 		await waitForTick();
-		const competing = await harness.accept({ kind: "prompt", prompt: "other" });
+		const competing = await harness.accept({ kind: "prompt", prompt: "other" }, BACKGROUND_CONTEXT);
 		expect(competing).toMatchObject({ ok: false, error: { _tag: "LaneBusy", operationId } });
-		const drive = harness.drive({ operationId });
+		const drive = harness.drive({ operationId }, BACKGROUND_CONTEXT);
 		expect(faux.state.callCount).toBe(0);
 		gate.resolve();
 		expect(await acceptance).toMatchObject({ ok: true, value: { operationId } });
 		expect(await drive).toMatchObject({ ok: true, value: { kind: "settled", operationId } });
-		expect((await session.getRegister("lane.lastResult", "main"))?.value.operationId).toBe(operationId);
+		expect((await session.getRegister("lane.lastResult", "main", BACKGROUND_CONTEXT))?.value.operationId).toBe(
+			operationId,
+		);
 	});
 
 	it("makes leaf-moving tree writes wait for a pre-acceptance reservation", async () => {
@@ -290,20 +325,25 @@ describe("AgentHarness R2 minimal run", () => {
 			},
 			{ id: "wait" },
 		);
-		const acceptance = harness.accept({ kind: "prompt", prompt: "accepted" });
+		const acceptance = harness.accept({ kind: "prompt", prompt: "accepted" }, BACKGROUND_CONTEXT);
 		await waitForTick();
-		const append = harness.sessionTree.appendMessage({ role: "user", content: "later", timestamp: 3 });
+		const append = harness.sessionTree.appendMessage(
+			{ role: "user", content: "later", timestamp: 3 },
+			BACKGROUND_CONTEXT,
+		);
 		await waitForTick();
-		expect((await session.getRegister("lane.leaf", "main"))?.value).toBeNull();
+		expect((await session.getRegister("lane.leaf", "main", BACKGROUND_CONTEXT))?.value).toBeNull();
 		gate.resolve();
 		const accepted = await acceptance;
 		if (!accepted.ok) throw accepted.error;
 		const appendedId = await append;
-		expect((await session.getRegister("pending.entry", appendedId))?.value).toMatchObject({
+		expect((await session.getRegister("pending.entry", appendedId, BACKGROUND_CONTEXT))?.value).toMatchObject({
 			type: "message",
 			payload: { content: "later" },
 		});
-		expect((await session.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		expect(
+			(await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			inbox: { writes: [appendedId] },
 		});
 	});
@@ -311,60 +351,67 @@ describe("AgentHarness R2 minimal run", () => {
 	it("captures and places pending next-run payloads before the caller prompt", async () => {
 		const { harness, session } = await createFixture();
 		const pendingId = session.idGenerator.next();
-		await session.mutate("main", async (mutator) => {
-			const laneState = await mutator.getRegister("lane.state", "main");
-			if (laneState === undefined) throw new Error("missing lane state");
-			await mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			async (mutator) => {
+				const laneState = await mutator.getRegister("lane.state", "main", BACKGROUND_CONTEXT);
+				if (laneState === undefined) throw new Error("missing lane state");
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "pending.entry",
-						key: pendingId,
-						value: { type: "message", payload: { role: "user", content: "queued", timestamp: 1 } },
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "pending.entry",
+								key: pendingId,
+								value: { type: "message", payload: { role: "user", content: "queued", timestamp: 1 } },
+							},
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { ...laneState.value, pendingNextRun: [pendingId] },
+							},
+						],
 					},
-					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { ...laneState.value, pendingNextRun: [pendingId] },
-					},
-				],
-			});
-		});
+					BACKGROUND_CONTEXT,
+				);
+			},
+			BACKGROUND_CONTEXT,
+		);
 
-		const accepted = await harness.accept({ kind: "prompt", prompt: "caller" });
+		const accepted = await harness.accept({ kind: "prompt", prompt: "caller" }, BACKGROUND_CONTEXT);
 		expect(accepted.ok).toBe(true);
-		const branch = await harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = await harness.sessionTree.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT);
 		expect(
 			branch.map((entry) =>
 				entry.type === "message" && entry.message.role === "user" ? entry.message.content : "custom",
 			),
 		).toEqual(["queued", [{ type: "text", text: "caller" }]]);
-		expect(await session.getRegister("pending.entry", pendingId)).toBeUndefined();
-		expect((await session.getRegister("lane.state", "main"))?.value.pendingNextRun).toEqual([]);
+		expect(await session.getRegister("pending.entry", pendingId, BACKGROUND_CONTEXT)).toBeUndefined();
+		expect((await session.getRegister("lane.state", "main", BACKGROUND_CONTEXT))?.value.pendingNextRun).toEqual([]);
 	});
 
 	it("publishes stable manual breakpoints for the same durable run", async () => {
 		const { harness, faux, session } = await createFixture({ drive: "manual" });
 		faux.setResponses([fauxAssistantMessage("manual")]);
-		const accepted = await harness.accept({ kind: "prompt", prompt: "step" });
+		const accepted = await harness.accept({ kind: "prompt", prompt: "step" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const drive = harness.drive({ operationId: accepted.value.operationId });
+		const drive = harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		const actions: string[] = [];
 		while (true) {
 			await waitForAction(harness);
-			const parked = await harness.peekAction();
+			const parked = await harness.peekAction(BACKGROUND_CONTEXT);
 			if (parked?.kind === "run.finish") {
-				const state = await session.getRegister("op.state", accepted.value.operationId);
-				const leaf = await session.getRegister("lane.leaf", "main");
+				const state = await session.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT);
+				const leaf = await session.getRegister("lane.leaf", "main", BACKGROUND_CONTEXT);
 				expect(state?.value).toMatchObject({
 					latestAssistantEntryId: leaf?.value,
 					phase: { kind: "checkpoint", triggerEntryId: leaf?.value },
 				});
 			}
-			const action = await harness.executeAction();
+			const action = await harness.executeAction(BACKGROUND_CONTEXT);
 			if (action !== undefined) actions.push(action.kind);
 			if (action?.kind === "run.finish") break;
 		}
@@ -382,18 +429,18 @@ describe("AgentHarness R2 minimal run", () => {
 	it("re-resolves the durable model identity when the provider request starts", async () => {
 		const { harness, faux, models } = await createFixture({ drive: "manual" });
 		faux.setResponses([fauxAssistantMessage("must not be requested")]);
-		const accepted = await harness.accept({ kind: "prompt", prompt: "race" });
+		const accepted = await harness.accept({ kind: "prompt", prompt: "race" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const drive = harness.drive({ operationId: accepted.value.operationId });
+		const drive = harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		for (const expected of ["runtime.dispatch", "run.generation_ready", "assistant.intent"] as const) {
 			await waitForAction(harness);
-			expect((await harness.executeAction())?.kind).toBe(expected);
+			expect((await harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe(expected);
 		}
 		await waitForAction(harness);
-		expect(await harness.peekAction()).toMatchObject({ kind: "assistant.request" });
+		expect(await harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.request" });
 		models.deleteProvider(faux.provider.id);
-		await harness.executeAction();
-		await harness.runToCompletion();
+		await harness.executeAction(BACKGROUND_CONTEXT);
+		await harness.runToCompletion(BACKGROUND_CONTEXT);
 		expect(await drive).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "failed", error: { code: "assistant_error" } } },
@@ -404,25 +451,27 @@ describe("AgentHarness R2 minimal run", () => {
 	it("closes at the provider boundary without starting the request or advancing the intent", async () => {
 		const fixture = await createFixture({ drive: "manual" });
 		fixture.faux.setResponses([fauxAssistantMessage("must not start")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "close" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "close" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const drive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const drive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		for (const expected of ["runtime.dispatch", "run.generation_ready", "assistant.intent"] as const) {
 			await waitForAction(fixture.harness);
-			expect((await fixture.harness.executeAction())?.kind).toBe(expected);
+			expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe(expected);
 		}
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.request" });
-		await fixture.harness.close();
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.request" });
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 		expect(fixture.faux.state.callCount).toBe(0);
 		fixtures.splice(fixtures.indexOf(fixture), 1);
-		const reopened = await fixture.repo.open(fixture.session.metadata);
-		expect((await reopened.getRegister("op.state", accepted.value.operationId))?.value).toMatchObject({
+		const reopened = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+		expect(
+			(await reopened.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value,
+		).toMatchObject({
 			phase: { kind: "assistant", generation: { status: "effect_pending" } },
 		});
-		await reopened.close();
-		await fixture.repo.close();
+		await reopened.close(BACKGROUND_CONTEXT);
+		await fixture.repo.close(BACKGROUND_CONTEXT);
 	});
 
 	it.each([
@@ -433,55 +482,58 @@ describe("AgentHarness R2 minimal run", () => {
 		async ({ target, phase, generationStatus }) => {
 			const fixture = await createFixture({ drive: "manual" });
 			fixture.faux.setResponses([fauxAssistantMessage("boundary")]);
-			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "boundary" });
+			const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "boundary" }, BACKGROUND_CONTEXT);
 			if (!accepted.ok) throw accepted.error;
-			const drive = fixture.harness.drive({ operationId: accepted.value.operationId });
+			const drive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 			while (true) {
 				await waitForAction(fixture.harness);
-				if ((await fixture.harness.peekAction())?.kind === target) break;
-				await fixture.harness.executeAction();
+				if ((await fixture.harness.peekAction(BACKGROUND_CONTEXT))?.kind === target) break;
+				await fixture.harness.executeAction(BACKGROUND_CONTEXT);
 			}
-			await fixture.harness.close();
+			await fixture.harness.close(BACKGROUND_CONTEXT);
 			await expect(drive).rejects.toMatchObject({ name: "HarnessClosed" });
 			fixtures.splice(fixtures.indexOf(fixture), 1);
-			const reopened = await fixture.repo.open(fixture.session.metadata);
-			const state = (await reopened.getRegister("op.state", accepted.value.operationId))?.value;
+			const reopened = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
+			const state = (await reopened.getRegister("op.state", accepted.value.operationId, BACKGROUND_CONTEXT))?.value;
 			expect(state).toMatchObject({
 				phase: {
 					kind: phase,
 					...(generationStatus === undefined ? {} : { generation: { status: generationStatus } }),
 				},
 			});
-			await reopened.close();
-			await fixture.repo.close();
+			await reopened.close(BACKGROUND_CONTEXT);
+			await fixture.repo.close(BACKGROUND_CONTEXT);
 		},
 	);
 
 	it("reopens a durable generation-ready state and performs the request", async () => {
 		const fixture = await createFixture({ drive: "manual" });
 		fixture.faux.setResponses([fauxAssistantMessage("ready after reopen")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "ready" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "ready" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
-		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId });
+		const firstDrive = fixture.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		for (const expected of ["runtime.dispatch", "run.generation_ready"] as const) {
 			await waitForAction(fixture.harness);
-			expect((await fixture.harness.executeAction())?.kind).toBe(expected);
+			expect((await fixture.harness.executeAction(BACKGROUND_CONTEXT))?.kind).toBe(expected);
 		}
 		await waitForAction(fixture.harness);
-		expect(await fixture.harness.peekAction()).toMatchObject({ kind: "assistant.intent" });
-		await fixture.harness.close();
+		expect(await fixture.harness.peekAction(BACKGROUND_CONTEXT)).toMatchObject({ kind: "assistant.intent" });
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		await expect(firstDrive).rejects.toMatchObject({ name: "HarnessClosed" });
 		fixtures.splice(fixtures.indexOf(fixture), 1);
 
-		const reopenedSession = await fixture.repo.open(fixture.session.metadata);
+		const reopenedSession = await fixture.repo.open(fixture.session.metadata, BACKGROUND_CONTEXT);
 		const models = createModels();
 		models.setProvider(fixture.faux.provider);
-		const created = await AgentHarness.create({
-			session: reopenedSession,
-			models,
-			model: fixture.faux.getModel(),
-			activeToolNames: [],
-		});
+		const created = await AgentHarness.create(
+			{
+				session: reopenedSession,
+				models,
+				model: fixture.faux.getModel(),
+				activeToolNames: [],
+			},
+			BACKGROUND_CONTEXT,
+		);
 		const reopened: Fixture = {
 			harness: created.harness,
 			session: reopenedSession,
@@ -490,7 +542,9 @@ describe("AgentHarness R2 minimal run", () => {
 			models,
 		};
 		fixtures.push(reopened);
-		expect(await reopened.harness.drive({ operationId: accepted.value.operationId })).toMatchObject({
+		expect(
+			await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT),
+		).toMatchObject({
 			ok: true,
 			value: { kind: "settled", outcome: { kind: "completed" } },
 		});
@@ -500,12 +554,12 @@ describe("AgentHarness R2 minimal run", () => {
 	it("settles adapter-reported errors durably as failed runs", async () => {
 		const { harness, faux, session } = await createFixture();
 		faux.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage: "adapter failed" })]);
-		const result = await harness.prompt("fail");
+		const result = await harness.prompt("fail", undefined, BACKGROUND_CONTEXT);
 		expect(result).toMatchObject({
 			ok: true,
 			value: { kind: "failed", error: { code: "assistant_error", message: "adapter failed" } },
 		});
-		expect(await session.getRegister("lane.lastResult", "main")).toMatchObject({
+		expect(await session.getRegister("lane.lastResult", "main", BACKGROUND_CONTEXT)).toMatchObject({
 			value: { outcome: "failed", error: { message: "adapter failed" } },
 		});
 	});
@@ -513,21 +567,24 @@ describe("AgentHarness R2 minimal run", () => {
 	it("reopens an accepted checkpoint without activating it and resumes on matching drive", async () => {
 		const fixture = await createFixture();
 		fixture.faux.setResponses([fauxAssistantMessage("resumed")]);
-		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "persist" });
+		const accepted = await fixture.harness.accept({ kind: "prompt", prompt: "persist" }, BACKGROUND_CONTEXT);
 		if (!accepted.ok) throw accepted.error;
 		const metadata = fixture.session.metadata;
-		await fixture.harness.close();
+		await fixture.harness.close(BACKGROUND_CONTEXT);
 		fixtures.splice(fixtures.indexOf(fixture), 1);
 
-		const reopenedSession = await fixture.repo.open(metadata);
+		const reopenedSession = await fixture.repo.open(metadata, BACKGROUND_CONTEXT);
 		const models = createModels();
 		models.setProvider(fixture.faux.provider);
-		const created = await AgentHarness.create({
-			session: reopenedSession,
-			models,
-			model: fixture.faux.getModel(),
-			activeToolNames: [],
-		});
+		const created = await AgentHarness.create(
+			{
+				session: reopenedSession,
+				models,
+				model: fixture.faux.getModel(),
+				activeToolNames: [],
+			},
+			BACKGROUND_CONTEXT,
+		);
 		const reopened: Fixture = {
 			harness: created.harness,
 			session: reopenedSession,
@@ -542,7 +599,7 @@ describe("AgentHarness R2 minimal run", () => {
 		reopened.harness.events.on("run_resume", (event) => {
 			resumeEvents.push(event);
 		});
-		const driven = await reopened.harness.drive({ operationId: accepted.value.operationId });
+		const driven = await reopened.harness.drive({ operationId: accepted.value.operationId }, BACKGROUND_CONTEXT);
 		expect(driven).toMatchObject({ ok: true, value: { kind: "settled" } });
 		expect(resumeEvents).toMatchObject([{ type: "run_resume", recovery: true }]);
 	});

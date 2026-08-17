@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type Entry, type JsonlSessionMetadata, JsonlSessionRepo } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
+import { BACKGROUND_CONTEXT } from "../src/experimental/context.ts";
 
 export async function createExperimentalSessions(
 	sessionsRoot: string,
@@ -13,14 +14,14 @@ export async function createExperimentalSessions(
 	const metadata: JsonlSessionMetadata[] = [];
 	try {
 		for (const id of ids) {
-			const session = await repo.create({ id, cwd });
+			const session = await repo.create({ id, cwd }, BACKGROUND_CONTEXT);
 			metadata.push(session.metadata);
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 		}
 		return metadata;
 	} finally {
-		await repo.close();
-		await fileSystem.cleanup();
+		await repo.close(BACKGROUND_CONTEXT);
+		await fileSystem.cleanup(BACKGROUND_CONTEXT);
 	}
 }
 
@@ -43,17 +44,17 @@ export async function readExperimentalSessionState(
 	const repo = new JsonlSessionRepo({ fileSystem, sessionsRoot });
 	let session: Awaited<ReturnType<JsonlSessionRepo["open"]>> | undefined;
 	try {
-		const matches = (await repo.list()).filter((metadata) => metadata.id === sessionId);
+		const matches = (await repo.list(undefined, BACKGROUND_CONTEXT)).filter((metadata) => metadata.id === sessionId);
 		if (matches.length !== 1) throw new Error(`Expected one Session ${sessionId}, found ${matches.length}`);
-		session = await repo.open(matches[0]!);
+		session = await repo.open(matches[0]!, BACKGROUND_CONTEXT);
 		const [branch, configuration] = await Promise.all([
-			session.findEntriesOnBranch({ order: "oldestFirst" }),
-			session.getRegister("lane.config", "main"),
+			session.findEntriesOnBranch({ order: "oldestFirst" }, BACKGROUND_CONTEXT),
+			session.getRegister("lane.config", "main", BACKGROUND_CONTEXT),
 		]);
 		return { branch, model: configuration?.value.model, activeTools: configuration?.value.activeToolNames ?? [] };
 	} finally {
-		await session?.close();
-		await repo.close();
-		await fileSystem.cleanup();
+		await session?.close(BACKGROUND_CONTEXT);
+		await repo.close(BACKGROUND_CONTEXT);
+		await fileSystem.cleanup(BACKGROUND_CONTEXT);
 	}
 }

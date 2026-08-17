@@ -31,6 +31,7 @@ import { Check } from "typebox/value";
 import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
+import { BACKGROUND_CONTEXT } from "./context.ts";
 import {
 	toHarnessPromptArguments,
 	toWireLaneEvent,
@@ -469,18 +470,18 @@ async function closeResources(resources: {
 }): Promise<void> {
 	const errors: unknown[] = [];
 	try {
-		if (resources.harness) await resources.harness.close();
-		else await resources.session?.close();
+		if (resources.harness) await resources.harness.close(BACKGROUND_CONTEXT);
+		else await resources.session?.close(BACKGROUND_CONTEXT);
 	} catch (error) {
 		errors.push(error);
 	}
 	try {
-		await resources.repo.close();
+		await resources.repo.close(BACKGROUND_CONTEXT);
 	} catch (error) {
 		errors.push(error);
 	}
 	try {
-		await resources.executionEnv.cleanup();
+		await resources.executionEnv.cleanup(BACKGROUND_CONTEXT);
 	} catch (error) {
 		errors.push(error);
 	}
@@ -517,7 +518,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	let session: Session<JsonlSessionMetadata> | undefined;
 	let harness: AgentHarnessInstance | undefined;
 	try {
-		session = await repo.open(metadata);
+		session = await repo.open(metadata, BACKGROUND_CONTEXT);
 		harness = await createHarness(session, options, executionEnv);
 	} catch (error) {
 		try {
@@ -597,11 +598,13 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		prompt: async (_scope: WorkerOperationScope, prompt) => {
 			const args = toHarnessPromptArguments(prompt);
 			const result =
-				typeof args[0] === "string" ? await harness.prompt(args[0], args[1]) : await harness.prompt(args[0]);
+				typeof args[0] === "string"
+					? await harness.prompt(args[0], args[1], BACKGROUND_CONTEXT)
+					: await harness.prompt(args[0], BACKGROUND_CONTEXT);
 			return toWireRunResult(result);
 		},
 		watch: async (scope: WorkerOperationScope, ..._args: never[]) => {
-			const handle = await harness.watch();
+			const handle = await harness.watch(BACKGROUND_CONTEXT);
 			const watchId = randomUUID();
 			laneWatches.set(watchId, { scope, handle });
 			return { watchId, snapshot: toWireLaneSnapshot(handle.snapshot) };
@@ -790,42 +793,48 @@ async function createCodingAgentHarness(
 	const tools = [createReadTool(), createWriteTool(), createBashTool()];
 	const activeToolNames = tools.map((tool) => tool.name);
 	const harness = (
-		await AgentHarness.create({
-			session,
-			models: modelRuntime,
-			model: resolved.model,
-			thinkingLevel: resolved.thinkingLevel,
-			tools,
-			activeToolNames,
-			toolContext: { env: executionEnv },
-			resources: {},
-		})
+		await AgentHarness.create(
+			{
+				session,
+				models: modelRuntime,
+				model: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
+				tools,
+				activeToolNames,
+				toolContext: { env: executionEnv },
+				resources: {},
+			},
+			BACKGROUND_CONTEXT,
+		)
 	).harness;
 	try {
-		const currentActiveToolNames = await harness.getActiveTools();
+		const currentActiveToolNames = await harness.getActiveTools(BACKGROUND_CONTEXT);
 		if (
 			currentActiveToolNames.length !== activeToolNames.length ||
 			currentActiveToolNames.some((name, index) => name !== activeToolNames[index])
 		) {
-			await harness.setActiveTools(activeToolNames);
+			await harness.setActiveTools(activeToolNames, BACKGROUND_CONTEXT);
 		}
 		if (options.model !== undefined) {
-			const currentModel = await harness.getModel();
+			const currentModel = await harness.getModel(BACKGROUND_CONTEXT);
 			if (
 				!currentModel ||
 				currentModel.provider !== resolved.model.provider ||
 				currentModel.id !== resolved.model.id
 			) {
-				await harness.setModel(resolved.model);
+				await harness.setModel(resolved.model, BACKGROUND_CONTEXT);
 			}
-			if (resolved.thinkingLevel !== undefined && (await harness.getThinkingLevel()) !== resolved.thinkingLevel) {
-				await harness.setThinkingLevel(resolved.thinkingLevel);
+			if (
+				resolved.thinkingLevel !== undefined &&
+				(await harness.getThinkingLevel(BACKGROUND_CONTEXT)) !== resolved.thinkingLevel
+			) {
+				await harness.setThinkingLevel(resolved.thinkingLevel, BACKGROUND_CONTEXT);
 			}
 		}
 		return harness;
 	} catch (error) {
 		try {
-			await harness.close();
+			await harness.close(BACKGROUND_CONTEXT);
 		} catch (cleanupError) {
 			throw new AggregateError([error, cleanupError], "Session worker model selection and cleanup failed");
 		}

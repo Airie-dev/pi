@@ -1,5 +1,6 @@
 import type {
 	CommitResult,
+	Context,
 	Entry,
 	EntryScan,
 	EntryStructure,
@@ -56,7 +57,7 @@ export class SqliteStorage implements Storage {
 		this.usageWriter = new UsageLedgerRowWriter(db);
 	}
 
-	commit(transaction: Transaction): Promise<CommitResult> {
+	commit(transaction: Transaction, _context: Context): Promise<CommitResult> {
 		if (this.state !== "open") throw new Error("SqliteStorage is closed");
 		const result = this.commitQueue.then(() => this.applyCommit(transaction));
 		this.commitQueue = result.then(
@@ -66,7 +67,7 @@ export class SqliteStorage implements Storage {
 		return result;
 	}
 
-	getEntries(ids: string[]): Promise<Map<string, Entry>> {
+	getEntries(ids: string[], _context: Context): Promise<Map<string, Entry>> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		const rowsById = new Map(readEntryRows(this.db, ids).map((row) => [row.id, row]));
 		const entries = new Map<string, Entry>();
@@ -80,6 +81,7 @@ export class SqliteStorage implements Storage {
 	getRegister<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
 		key: string,
+		_context: Context,
 	): Promise<Register<TNamespace> | undefined> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(readRegisterRow(this.db, namespace, key));
@@ -87,38 +89,40 @@ export class SqliteStorage implements Storage {
 
 	listRegisters<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
-		keyPrefix?: string,
+		keyPrefix: string | undefined,
+		_context: Context,
 	): Promise<Register<TNamespace>[]> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(listRegisterRows(this.db, namespace, keyPrefix));
 	}
 
-	scanBranch(query: StorageBranchScan): Promise<Entry[]> {
+	scanBranch(query: StorageBranchScan, _context: Context): Promise<Entry[]> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(scanBranchEntries(this.db, query));
 	}
 
-	scanBranchStructure(query: StorageBranchScan): Promise<EntryStructure[]> {
+	scanBranchStructure(query: StorageBranchScan, _context: Context): Promise<EntryStructure[]> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(scanBranchEntryStructures(this.db, query));
 	}
 
-	scanEntries(query: EntryScan): Promise<Entry[]> {
+	scanEntries(query: EntryScan, _context: Context): Promise<Entry[]> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(scanEntryRows(this.db, query).map(decodeEntryRow));
 	}
 
-	scanUsage(query: UsageScan): Promise<UsageRow[]> {
+	scanUsage(query: UsageScan, _context: Context): Promise<UsageRow[]> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(scanUsageLedgerRows(this.db, query).map(decodeUsageLedgerRow));
 	}
 
-	getStats(): Promise<SessionStats> {
+	getStats(_context: Context): Promise<SessionStats> {
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		return Promise.resolve(readSessionStats(this.db));
 	}
 
-	snapshot(options: ForkOptions = {}): Promise<SqliteStorageSnapshot> {
+	snapshot(options: ForkOptions | undefined, _context: Context): Promise<SqliteStorageSnapshot> {
+		options ??= {};
 		if (this.state !== "open") return Promise.reject(new Error("SqliteStorage is closed"));
 		const result = this.commitQueue.then(() => this.readSnapshot(options));
 		this.commitQueue = result.then(
@@ -180,7 +184,7 @@ export class SqliteStorage implements Storage {
 		});
 	}
 
-	close(): Promise<void> {
+	close(_context: Context): Promise<void> {
 		if (this.closePromise !== undefined) return this.closePromise;
 		this.state = "closing";
 		this.closePromise = this.commitQueue.then(() => {

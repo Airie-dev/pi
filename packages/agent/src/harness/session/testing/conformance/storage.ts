@@ -1,5 +1,6 @@
 import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert/strict";
 import type { Usage } from "@earendil-works/pi-ai";
+import { BACKGROUND_CONTEXT } from "../../../context.ts";
 import type {
 	CompactionEntry,
 	CustomEntry,
@@ -113,32 +114,35 @@ function sortRegisters(registers: Register[]): Register[] {
 export function createStorageConformance(factory: () => Promise<StorageFixture>): readonly ConformanceCase[] {
 	return [
 		createCase(factory, "transactions", "commits mixed writes atomically in write order", async ({ storage }) => {
-			const result = await storage.commit({
-				writes: [
-					{ kind: "entry", entry: userEntry("entry") },
-					{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "session" },
-					{
-						kind: "usage",
-						row: { id: "usage", usage: usage(2, 3), adjustment: false, entryId: "entry" },
-					},
-				],
-			});
+			const result = await storage.commit(
+				{
+					writes: [
+						{ kind: "entry", entry: userEntry("entry") },
+						{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "session" },
+						{
+							kind: "usage",
+							row: { id: "usage", usage: usage(2, 3), adjustment: false, entryId: "entry" },
+						},
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
 			strictEqual(result.seqs.length, 3);
 			strictEqual(result.firstSeq, result.seqs[0]);
 			assertStrictlyIncreasing(result.seqs);
 			ok(Number.isSafeInteger(result.timestamp) && result.timestamp >= 0);
 			deepStrictEqual(
-				await storage.getEntries(["entry"]),
+				await storage.getEntries(["entry"], BACKGROUND_CONTEXT),
 				new Map([["entry", { ...userEntry("entry"), seq: result.seqs[0], timestamp: result.timestamp }]]),
 			);
-			deepStrictEqual(await storage.getRegister("fact.name", ""), {
+			deepStrictEqual(await storage.getRegister("fact.name", "", BACKGROUND_CONTEXT), {
 				namespace: "fact.name",
 				key: "",
 				value: "session",
 				seq: result.seqs[1],
 			});
-			deepStrictEqual(await storage.scanUsage({ order: "asc" }), [
+			deepStrictEqual(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT), [
 				{ id: "usage", seq: result.seqs[2], usage: usage(2, 3), adjustment: false, entryId: "entry" },
 			]);
 		}),
@@ -148,31 +152,37 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"transactions",
 			"rolls back every store when a mixed transaction fails",
 			async ({ storage }) => {
-				await storage.commit({
-					writes: [
-						{ kind: "entry", entry: userEntry("root") },
-						{ kind: "usage", row: { id: "taken", usage: usage(1, 1), adjustment: false } },
-					],
-				});
-				const entriesBefore = await storage.scanEntries({ order: "asc" });
-				const usageBefore = await storage.scanUsage({ order: "asc" });
-				const statsBefore = await storage.getStats();
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: userEntry("root") },
+							{ kind: "usage", row: { id: "taken", usage: usage(1, 1), adjustment: false } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				const entriesBefore = await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+				const usageBefore = await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT);
+				const statsBefore = await storage.getStats(BACKGROUND_CONTEXT);
 
 				await rejects(
-					storage.commit({
-						writes: [
-							{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "transient" },
-							{ kind: "entry", entry: customEntry("transient-entry", "root") },
-							{ kind: "usage", row: { id: "transient-usage", usage: usage(5, 8), adjustment: true } },
-							{ kind: "entry", entry: customEntry("taken", "root") },
-						],
-					}),
+					storage.commit(
+						{
+							writes: [
+								{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "transient" },
+								{ kind: "entry", entry: customEntry("transient-entry", "root") },
+								{ kind: "usage", row: { id: "transient-usage", usage: usage(5, 8), adjustment: true } },
+								{ kind: "entry", entry: customEntry("taken", "root") },
+							],
+						},
+						BACKGROUND_CONTEXT,
+					),
 				);
 
-				deepStrictEqual(await storage.scanEntries({ order: "asc" }), entriesBefore);
-				deepStrictEqual(await storage.scanUsage({ order: "asc" }), usageBefore);
-				deepStrictEqual(await storage.getStats(), statsBefore);
-				strictEqual(await storage.getRegister("fact.name", ""), undefined);
+				deepStrictEqual(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), entriesBefore);
+				deepStrictEqual(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT), usageBefore);
+				deepStrictEqual(await storage.getStats(BACKGROUND_CONTEXT), statsBefore);
+				strictEqual(await storage.getRegister("fact.name", "", BACKGROUND_CONTEXT), undefined);
 			},
 		),
 
@@ -181,47 +191,73 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"transactions",
 			"preserves overwritten and deleted registers when a transaction fails",
 			async ({ storage }) => {
-				await storage.commit({
-					writes: [
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "overwritten", value: "original" },
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "deleted", value: { kept: true } },
-						{ kind: "entry", entry: userEntry("taken") },
-					],
-				});
-				const overwrittenBefore = await storage.getRegister("fact.custom", "overwritten");
-				const deletedBefore = await storage.getRegister("fact.custom", "deleted");
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "overwritten", value: "original" },
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "deleted", value: { kept: true } },
+							{ kind: "entry", entry: userEntry("taken") },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				const overwrittenBefore = await storage.getRegister("fact.custom", "overwritten", BACKGROUND_CONTEXT);
+				const deletedBefore = await storage.getRegister("fact.custom", "deleted", BACKGROUND_CONTEXT);
 
 				await rejects(
-					storage.commit({
-						writes: [
-							{ kind: "register", op: "set", namespace: "fact.custom", key: "overwritten", value: "transient" },
-							{ kind: "register", op: "delete", namespace: "fact.custom", key: "deleted" },
-							{ kind: "entry", entry: customEntry("transient", "taken") },
-							{ kind: "entry", entry: customEntry("taken", null) },
-						],
-					}),
+					storage.commit(
+						{
+							writes: [
+								{
+									kind: "register",
+									op: "set",
+									namespace: "fact.custom",
+									key: "overwritten",
+									value: "transient",
+								},
+								{ kind: "register", op: "delete", namespace: "fact.custom", key: "deleted" },
+								{ kind: "entry", entry: customEntry("transient", "taken") },
+								{ kind: "entry", entry: customEntry("taken", null) },
+							],
+						},
+						BACKGROUND_CONTEXT,
+					),
 				);
 
-				deepStrictEqual(await storage.getRegister("fact.custom", "overwritten"), overwrittenBefore);
-				deepStrictEqual(await storage.getRegister("fact.custom", "deleted"), deletedBefore);
-				strictEqual((await storage.getEntries(["transient"])).has("transient"), false);
+				deepStrictEqual(
+					await storage.getRegister("fact.custom", "overwritten", BACKGROUND_CONTEXT),
+					overwrittenBefore,
+				);
+				deepStrictEqual(await storage.getRegister("fact.custom", "deleted", BACKGROUND_CONTEXT), deletedBefore);
+				strictEqual((await storage.getEntries(["transient"], BACKGROUND_CONTEXT)).has("transient"), false);
 			},
 		),
 
 		createCase(factory, "transactions", "enforces one shared entry and usage id namespace", async ({ storage }) => {
-			await storage.commit({
-				writes: [
-					{ kind: "entry", entry: userEntry("existing-entry") },
-					{ kind: "usage", row: { id: "existing-usage", usage: usage(1, 1), adjustment: false } },
-				],
-			});
+			await storage.commit(
+				{
+					writes: [
+						{ kind: "entry", entry: userEntry("existing-entry") },
+						{ kind: "usage", row: { id: "existing-usage", usage: usage(1, 1), adjustment: false } },
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
 			await rejects(
-				storage.commit({
-					writes: [{ kind: "usage", row: { id: "existing-entry", usage: usage(2, 2), adjustment: false } }],
-				}),
+				storage.commit(
+					{
+						writes: [{ kind: "usage", row: { id: "existing-entry", usage: usage(2, 2), adjustment: false } }],
+					},
+					BACKGROUND_CONTEXT,
+				),
 			);
-			await rejects(storage.commit({ writes: [{ kind: "entry", entry: customEntry("existing-usage", null) }] }));
+			await rejects(
+				storage.commit(
+					{ writes: [{ kind: "entry", entry: customEntry("existing-usage", null) }] },
+					BACKGROUND_CONTEXT,
+				),
+			);
 
 			for (const [id, writes] of [
 				[
@@ -245,12 +281,12 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 					],
 				],
 			] satisfies Array<[string, Transaction["writes"]]>) {
-				await rejects(storage.commit({ writes }), `Expected duplicate id ${id} to reject`);
+				await rejects(storage.commit({ writes }, BACKGROUND_CONTEXT), `Expected duplicate id ${id} to reject`);
 			}
 
-			deepStrictEqual(ids(await storage.scanEntries({ order: "asc" })), ["existing-entry"]);
+			deepStrictEqual(ids(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)), ["existing-entry"]);
 			deepStrictEqual(
-				(await storage.scanUsage({ order: "asc" })).map((row) => row.id),
+				(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT)).map((row) => row.id),
 				["existing-usage"],
 			);
 		}),
@@ -260,82 +296,112 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"transactions",
 			"resolves parents only from prior entries and earlier writes",
 			async ({ storage }) => {
-				await storage.commit({ writes: [{ kind: "entry", entry: userEntry("root") }] });
-				await storage.commit({
-					writes: [
-						{ kind: "entry", entry: customEntry("child", "root") },
-						{ kind: "entry", entry: customEntry("grandchild", "child") },
-					],
-				});
-				deepStrictEqual(ids(await storage.scanBranch({ start: "grandchild", order: "oldestFirst" })), [
-					"root",
-					"child",
-					"grandchild",
-				]);
+				await storage.commit({ writes: [{ kind: "entry", entry: userEntry("root") }] }, BACKGROUND_CONTEXT);
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: customEntry("child", "root") },
+							{ kind: "entry", entry: customEntry("grandchild", "child") },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				deepStrictEqual(
+					ids(await storage.scanBranch({ start: "grandchild", order: "oldestFirst" }, BACKGROUND_CONTEXT)),
+					["root", "child", "grandchild"],
+				);
 
 				await rejects(
-					storage.commit({
-						writes: [
-							{ kind: "entry", entry: customEntry("before-parent", "later-parent") },
-							{ kind: "entry", entry: customEntry("later-parent", "root") },
-							{ kind: "register", op: "set", namespace: "fact.label", key: "before-parent", value: "transient" },
-						],
-					}),
+					storage.commit(
+						{
+							writes: [
+								{ kind: "entry", entry: customEntry("before-parent", "later-parent") },
+								{ kind: "entry", entry: customEntry("later-parent", "root") },
+								{
+									kind: "register",
+									op: "set",
+									namespace: "fact.label",
+									key: "before-parent",
+									value: "transient",
+								},
+							],
+						},
+						BACKGROUND_CONTEXT,
+					),
 				);
-				await rejects(storage.commit({ writes: [{ kind: "entry", entry: customEntry("orphan", "missing") }] }));
-				await storage.commit({
-					writes: [{ kind: "usage", row: { id: "usage-is-not-parent", usage: usage(1, 1), adjustment: false } }],
-				});
 				await rejects(
-					storage.commit({
-						writes: [{ kind: "entry", entry: customEntry("usage-child", "usage-is-not-parent") }],
-					}),
+					storage.commit(
+						{ writes: [{ kind: "entry", entry: customEntry("orphan", "missing") }] },
+						BACKGROUND_CONTEXT,
+					),
+				);
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "usage", row: { id: "usage-is-not-parent", usage: usage(1, 1), adjustment: false } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				await rejects(
+					storage.commit(
+						{
+							writes: [{ kind: "entry", entry: customEntry("usage-child", "usage-is-not-parent") }],
+						},
+						BACKGROUND_CONTEXT,
+					),
 				);
 
 				deepStrictEqual(
-					await storage.getEntries(["before-parent", "later-parent", "orphan", "usage-child"]),
+					await storage.getEntries(["before-parent", "later-parent", "orphan", "usage-child"], BACKGROUND_CONTEXT),
 					new Map(),
 				);
-				strictEqual(await storage.getRegister("fact.label", "before-parent"), undefined);
+				strictEqual(await storage.getRegister("fact.label", "before-parent", BACKGROUND_CONTEXT), undefined);
 			},
 		),
 
 		createCase(factory, "transactions", "places pending content under its reserved entry id", async ({ storage }) => {
 			const entry = userEntry("reserved", null, "queued");
-			await storage.commit({
-				writes: [
-					{
-						kind: "register",
-						op: "set",
-						namespace: "pending.entry",
-						key: entry.id,
-						value: { type: "message", payload: entry.message },
-					},
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
-				],
-			});
+			await storage.commit(
+				{
+					writes: [
+						{
+							kind: "register",
+							op: "set",
+							namespace: "pending.entry",
+							key: entry.id,
+							value: { type: "message", payload: entry.message },
+						},
+						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
-			strictEqual((await storage.getEntries([entry.id])).has(entry.id), false);
-			deepStrictEqual((await storage.getRegister("pending.entry", entry.id))?.value, {
+			strictEqual((await storage.getEntries([entry.id], BACKGROUND_CONTEXT)).has(entry.id), false);
+			deepStrictEqual((await storage.getRegister("pending.entry", entry.id, BACKGROUND_CONTEXT))?.value, {
 				type: "message",
 				payload: entry.message,
 			});
-			strictEqual((await storage.getRegister("lane.leaf", "main"))?.value, null);
+			strictEqual((await storage.getRegister("lane.leaf", "main", BACKGROUND_CONTEXT))?.value, null);
 
-			const placement = await storage.commit({
-				writes: [
-					{ kind: "entry", entry },
-					{ kind: "register", op: "delete", namespace: "pending.entry", key: entry.id },
-					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: entry.id },
-				],
-			});
+			const placement = await storage.commit(
+				{
+					writes: [
+						{ kind: "entry", entry },
+						{ kind: "register", op: "delete", namespace: "pending.entry", key: entry.id },
+						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: entry.id },
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
 			deepStrictEqual(
-				await storage.getEntries([entry.id]),
+				await storage.getEntries([entry.id], BACKGROUND_CONTEXT),
 				new Map([[entry.id, { ...entry, seq: placement.seqs[0], timestamp: placement.timestamp }]]),
 			);
-			strictEqual(await storage.getRegister("pending.entry", entry.id), undefined);
-			deepStrictEqual(await storage.getRegister("lane.leaf", "main"), {
+			strictEqual(await storage.getRegister("pending.entry", entry.id, BACKGROUND_CONTEXT), undefined);
+			deepStrictEqual(await storage.getRegister("lane.leaf", "main", BACKGROUND_CONTEXT), {
 				namespace: "lane.leaf",
 				key: "main",
 				value: entry.id,
@@ -348,34 +414,40 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"registers",
 			"sets, replaces, deletes, and recreates registers without tombstones",
 			async ({ storage }) => {
-				const first = await storage.commit({
-					writes: [
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/b", value: 1 },
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: 2 },
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "other", value: 3 },
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: null },
-					],
-				});
-				deepStrictEqual(await storage.getRegister("fact.custom", "prefix/a"), {
+				const first = await storage.commit(
+					{
+						writes: [
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/b", value: 1 },
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: 2 },
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "other", value: 3 },
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: null },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				deepStrictEqual(await storage.getRegister("fact.custom", "prefix/a", BACKGROUND_CONTEXT), {
 					namespace: "fact.custom",
 					key: "prefix/a",
 					value: null,
 					seq: first.seqs[3],
 				});
 
-				const second = await storage.commit({
-					writes: [
-						{ kind: "register", op: "delete", namespace: "fact.custom", key: "prefix/a" },
-						{ kind: "register", op: "delete", namespace: "fact.custom", key: "absent" },
-						{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: "recreated" },
-					],
-				});
+				const second = await storage.commit(
+					{
+						writes: [
+							{ kind: "register", op: "delete", namespace: "fact.custom", key: "prefix/a" },
+							{ kind: "register", op: "delete", namespace: "fact.custom", key: "absent" },
+							{ kind: "register", op: "set", namespace: "fact.custom", key: "prefix/a", value: "recreated" },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
 
-				deepStrictEqual(sortRegisters(await storage.listRegisters("fact.custom", "prefix/")), [
+				deepStrictEqual(sortRegisters(await storage.listRegisters("fact.custom", "prefix/", BACKGROUND_CONTEXT)), [
 					{ namespace: "fact.custom", key: "prefix/a", value: "recreated", seq: second.seqs[2] },
 					{ namespace: "fact.custom", key: "prefix/b", value: 1, seq: first.seqs[0] },
 				]);
-				strictEqual(await storage.getRegister("fact.custom", "absent"), undefined);
+				strictEqual(await storage.getRegister("fact.custom", "absent", BACKGROUND_CONTEXT), undefined);
 			},
 		),
 
@@ -384,27 +456,33 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"registers",
 			"does not change historical stores during register-only commits",
 			async ({ storage }) => {
-				await storage.commit({
-					writes: [
-						{ kind: "entry", entry: userEntry("root") },
-						{ kind: "usage", row: { id: "historical-usage", usage: usage(2, 3), adjustment: false } },
-					],
-				});
-				const entriesBefore = await storage.scanEntries({ order: "asc" });
-				const usageBefore = await storage.scanUsage({ order: "asc" });
-				const statsBefore = await storage.getStats();
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: userEntry("root") },
+							{ kind: "usage", row: { id: "historical-usage", usage: usage(2, 3), adjustment: false } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				const entriesBefore = await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT);
+				const usageBefore = await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT);
+				const statsBefore = await storage.getStats(BACKGROUND_CONTEXT);
 
-				const result = await storage.commit({
-					writes: [
-						{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "first" },
-						{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "second" },
-					],
-				});
+				const result = await storage.commit(
+					{
+						writes: [
+							{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "first" },
+							{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "second" },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
 
-				deepStrictEqual(await storage.scanEntries({ order: "asc" }), entriesBefore);
-				deepStrictEqual(await storage.scanUsage({ order: "asc" }), usageBefore);
-				deepStrictEqual(await storage.getStats(), statsBefore);
-				deepStrictEqual(await storage.getRegister("fact.name", ""), {
+				deepStrictEqual(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT), entriesBefore);
+				deepStrictEqual(await storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT), usageBefore);
+				deepStrictEqual(await storage.getStats(BACKGROUND_CONTEXT), statsBefore);
+				deepStrictEqual(await storage.getRegister("fact.name", "", BACKGROUND_CONTEXT), {
 					namespace: "fact.name",
 					key: "",
 					value: "second",
@@ -414,21 +492,24 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 		),
 
 		createCase(factory, "entry queries", "stores custom entries with and without data", async ({ storage }) => {
-			const result = await storage.commit({
-				writes: [
-					{
-						kind: "entry",
-						entry: { id: "without-data", parentId: null, type: "custom", customType: "marker" },
-					},
-					{
-						kind: "entry",
-						entry: customEntry("with-data", "without-data", "note", { nested: [1, 2] }),
-					},
-				],
-			});
+			const result = await storage.commit(
+				{
+					writes: [
+						{
+							kind: "entry",
+							entry: { id: "without-data", parentId: null, type: "custom", customType: "marker" },
+						},
+						{
+							kind: "entry",
+							entry: customEntry("with-data", "without-data", "note", { nested: [1, 2] }),
+						},
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
 			deepStrictEqual(
-				await storage.getEntries(["without-data", "with-data"]),
+				await storage.getEntries(["without-data", "with-data"], BACKGROUND_CONTEXT),
 				new Map([
 					[
 						"without-data",
@@ -458,30 +539,42 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"entry queries",
 			"scans global entries with explicit ranges, filters, orders, and limits",
 			async ({ storage }) => {
-				const result = await storage.commit({
-					writes: [
-						{ kind: "entry", entry: userEntry("root") },
-						{ kind: "entry", entry: customEntry("note-1", "root", "note") },
-						{ kind: "entry", entry: customEntry("other", "note-1", "other") },
-						{ kind: "entry", entry: customEntry("note-2", "other", "note") },
-						{ kind: "entry", entry: userEntry("tail", "note-2") },
-					],
-				});
+				const result = await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: userEntry("root") },
+							{ kind: "entry", entry: customEntry("note-1", "root", "note") },
+							{ kind: "entry", entry: customEntry("other", "note-1", "other") },
+							{ kind: "entry", entry: customEntry("note-2", "other", "note") },
+							{ kind: "entry", entry: userEntry("tail", "note-2") },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
 
 				deepStrictEqual(
 					ids(
-						await storage.scanEntries({
-							type: "custom",
-							customType: "note",
-							fromSeq: result.seqs[1],
-							toSeq: result.seqs[3],
-							order: "desc",
-						}),
+						await storage.scanEntries(
+							{
+								type: "custom",
+								customType: "note",
+								fromSeq: result.seqs[1],
+								toSeq: result.seqs[3],
+								order: "desc",
+							},
+							BACKGROUND_CONTEXT,
+						),
 					),
 					["note-2", "note-1"],
 				);
-				deepStrictEqual(ids(await storage.scanEntries({ order: "asc", limit: 2 })), ["root", "note-1"]);
-				deepStrictEqual(ids(await storage.scanEntries({ order: "desc", limit: 2 })), ["tail", "note-2"]);
+				deepStrictEqual(ids(await storage.scanEntries({ order: "asc", limit: 2 }, BACKGROUND_CONTEXT)), [
+					"root",
+					"note-1",
+				]);
+				deepStrictEqual(ids(await storage.scanEntries({ order: "desc", limit: 2 }, BACKGROUND_CONTEXT)), [
+					"tail",
+					"note-2",
+				]);
 			},
 		),
 
@@ -490,85 +583,113 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"branch queries",
 			"applies stops before filters and cursors before limits",
 			async ({ storage }) => {
-				const result = await storage.commit({
-					writes: [
-						{ kind: "entry", entry: userEntry("root") },
-						{ kind: "entry", entry: customEntry("marker", "root", "marker") },
-						{ kind: "entry", entry: userEntry("middle", "marker") },
-						{ kind: "entry", entry: compactionEntry("compact", "middle") },
-						{ kind: "entry", entry: customEntry("note", "compact", "note") },
-						{ kind: "entry", entry: userEntry("leaf", "note") },
-					],
-				});
+				const result = await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: userEntry("root") },
+							{ kind: "entry", entry: customEntry("marker", "root", "marker") },
+							{ kind: "entry", entry: userEntry("middle", "marker") },
+							{ kind: "entry", entry: compactionEntry("compact", "middle") },
+							{ kind: "entry", entry: customEntry("note", "compact", "note") },
+							{ kind: "entry", entry: userEntry("leaf", "note") },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
 
 				deepStrictEqual(
-					ids(await storage.scanBranch({ start: "leaf", stopAtType: "compaction", type: "message" })),
+					ids(
+						await storage.scanBranch(
+							{ start: "leaf", stopAtType: "compaction", type: "message" },
+							BACKGROUND_CONTEXT,
+						),
+					),
 					["leaf"],
 				);
 				deepStrictEqual(
 					ids(
-						await storage.scanBranch({
-							start: "leaf",
-							order: "oldestFirst",
-							stopAtId: "middle",
-							type: "custom",
-						}),
+						await storage.scanBranch(
+							{
+								start: "leaf",
+								order: "oldestFirst",
+								stopAtId: "middle",
+								type: "custom",
+							},
+							BACKGROUND_CONTEXT,
+						),
 					),
 					["marker"],
 				);
 				deepStrictEqual(
 					ids(
-						await storage.scanBranch({
-							start: "leaf",
-							order: "newestFirst",
-							cursor: { seq: result.seqs[4] },
-							limit: 2,
-						}),
+						await storage.scanBranch(
+							{
+								start: "leaf",
+								order: "newestFirst",
+								cursor: { seq: result.seqs[4] },
+								limit: 2,
+							},
+							BACKGROUND_CONTEXT,
+						),
 					),
 					["compact", "middle"],
 				);
 				deepStrictEqual(
 					ids(
-						await storage.scanBranch({
-							start: "leaf",
-							order: "oldestFirst",
-							cursor: { seq: result.seqs[1] },
-							limit: 2,
-						}),
+						await storage.scanBranch(
+							{
+								start: "leaf",
+								order: "oldestFirst",
+								cursor: { seq: result.seqs[1] },
+								limit: 2,
+							},
+							BACKGROUND_CONTEXT,
+						),
 					),
 					["middle", "compact"],
 				);
-				deepStrictEqual(ids(await storage.scanBranch({ start: "leaf", stopAtId: "leaf", type: "custom" })), []);
-				deepStrictEqual(ids(await storage.scanBranch({ start: "leaf", customType: "note" })), ["note"]);
-				await rejects(storage.scanBranch({ start: "missing" }));
+				deepStrictEqual(
+					ids(await storage.scanBranch({ start: "leaf", stopAtId: "leaf", type: "custom" }, BACKGROUND_CONTEXT)),
+					[],
+				);
+				deepStrictEqual(ids(await storage.scanBranch({ start: "leaf", customType: "note" }, BACKGROUND_CONTEXT)), [
+					"note",
+				]);
+				await rejects(storage.scanBranch({ start: "missing" }, BACKGROUND_CONTEXT));
 			},
 		),
 
 		createCase(factory, "branch queries", "returns branch structure without payload fields", async ({ storage }) => {
-			const result = await storage.commit({
-				writes: [
-					{ kind: "entry", entry: userEntry("root") },
-					{ kind: "entry", entry: customEntry("child", "root", "note") },
-				],
-			});
+			const result = await storage.commit(
+				{
+					writes: [
+						{ kind: "entry", entry: userEntry("root") },
+						{ kind: "entry", entry: customEntry("child", "root", "note") },
+					],
+				},
+				BACKGROUND_CONTEXT,
+			);
 
-			deepStrictEqual(await storage.scanBranchStructure({ start: "child", order: "oldestFirst" }), [
-				{
-					id: "root",
-					parentId: null,
-					seq: result.seqs[0],
-					timestamp: result.timestamp,
-					type: "message",
-				},
-				{
-					id: "child",
-					parentId: "root",
-					seq: result.seqs[1],
-					timestamp: result.timestamp,
-					type: "custom",
-					customType: "note",
-				},
-			]);
+			deepStrictEqual(
+				await storage.scanBranchStructure({ start: "child", order: "oldestFirst" }, BACKGROUND_CONTEXT),
+				[
+					{
+						id: "root",
+						parentId: null,
+						seq: result.seqs[0],
+						timestamp: result.timestamp,
+						type: "message",
+					},
+					{
+						id: "child",
+						parentId: "root",
+						seq: result.seqs[1],
+						timestamp: result.timestamp,
+						type: "custom",
+						customType: "note",
+					},
+				],
+			);
 		}),
 
 		createCase(
@@ -576,27 +697,33 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"usage and stats",
 			"scans the usage ledger with explicit ranges, orders, and limits",
 			async ({ storage }) => {
-				const result = await storage.commit({
-					writes: [
-						{ kind: "usage", row: { id: "usage-1", usage: usage(1, 1), adjustment: false } },
-						{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "sequence gap" },
-						{ kind: "usage", row: { id: "usage-2", usage: usage(2, 2), adjustment: false } },
-						{ kind: "usage", row: { id: "usage-3", usage: usage(3, 3), adjustment: true } },
-					],
-				});
+				const result = await storage.commit(
+					{
+						writes: [
+							{ kind: "usage", row: { id: "usage-1", usage: usage(1, 1), adjustment: false } },
+							{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "sequence gap" },
+							{ kind: "usage", row: { id: "usage-2", usage: usage(2, 2), adjustment: false } },
+							{ kind: "usage", row: { id: "usage-3", usage: usage(3, 3), adjustment: true } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
 
 				deepStrictEqual(
-					(await storage.scanUsage({ fromSeq: result.seqs[1], toSeq: result.seqs[2], order: "asc" })).map(
-						(row) => row.id,
-					),
+					(
+						await storage.scanUsage(
+							{ fromSeq: result.seqs[1], toSeq: result.seqs[2], order: "asc" },
+							BACKGROUND_CONTEXT,
+						)
+					).map((row) => row.id),
 					["usage-2"],
 				);
 				deepStrictEqual(
-					(await storage.scanUsage({ order: "desc", limit: 2 })).map((row) => row.id),
+					(await storage.scanUsage({ order: "desc", limit: 2 }, BACKGROUND_CONTEXT)).map((row) => row.id),
 					["usage-3", "usage-2"],
 				);
 				deepStrictEqual(
-					(await storage.scanUsage({ order: "asc", limit: 2 })).map((row) => row.id),
+					(await storage.scanUsage({ order: "asc", limit: 2 }, BACKGROUND_CONTEXT)).map((row) => row.id),
 					["usage-1", "usage-2"],
 				);
 			},
@@ -607,26 +734,32 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"usage and stats",
 			"keeps stats equal to message count and ledger totals",
 			async ({ storage }) => {
-				deepStrictEqual(await storage.getStats(), { messageCount: 0, usage: zeroUsage() });
+				deepStrictEqual(await storage.getStats(BACKGROUND_CONTEXT), { messageCount: 0, usage: zeroUsage() });
 
 				const firstUsage = usage(2, 3, { cacheWrite1h: 4, reasoning: 1 });
-				await storage.commit({
-					writes: [
-						{ kind: "entry", entry: userEntry("message") },
-						{ kind: "usage", row: { id: "usage-1", usage: firstUsage, adjustment: false } },
-					],
-				});
-				deepStrictEqual(await storage.getStats(), { messageCount: 1, usage: firstUsage });
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: userEntry("message") },
+							{ kind: "usage", row: { id: "usage-1", usage: firstUsage, adjustment: false } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				deepStrictEqual(await storage.getStats(BACKGROUND_CONTEXT), { messageCount: 1, usage: firstUsage });
 
 				const secondUsage = usage(5, 7, { cacheWrite1h: 6, reasoning: 2 });
-				await storage.commit({
-					writes: [
-						{ kind: "entry", entry: customEntry("custom", "message") },
-						{ kind: "entry", entry: compactionEntry("compaction", "custom") },
-						{ kind: "usage", row: { id: "usage-2", usage: secondUsage, adjustment: true } },
-					],
-				});
-				deepStrictEqual(await storage.getStats(), {
+				await storage.commit(
+					{
+						writes: [
+							{ kind: "entry", entry: customEntry("custom", "message") },
+							{ kind: "entry", entry: compactionEntry("compaction", "custom") },
+							{ kind: "usage", row: { id: "usage-2", usage: secondUsage, adjustment: true } },
+						],
+					},
+					BACKGROUND_CONTEXT,
+				);
+				deepStrictEqual(await storage.getStats(BACKGROUND_CONTEXT), {
 					messageCount: 1,
 					usage: {
 						input: 7,
@@ -653,12 +786,18 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"serialization",
 			"serializes back-to-back commits in admission order",
 			async ({ storage }) => {
-				const first = storage.commit({ writes: [{ kind: "entry", entry: userEntry("first") }] });
-				const second = storage.commit({ writes: [{ kind: "entry", entry: userEntry("second", "first") }] });
+				const first = storage.commit(
+					{ writes: [{ kind: "entry", entry: userEntry("first") }] },
+					BACKGROUND_CONTEXT,
+				);
+				const second = storage.commit(
+					{ writes: [{ kind: "entry", entry: userEntry("second", "first") }] },
+					BACKGROUND_CONTEXT,
+				);
 				const [firstResult, secondResult] = await Promise.all([first, second]);
 
 				ok(firstResult.seqs[0]! < secondResult.seqs[0]!);
-				deepStrictEqual(ids(await storage.scanEntries({ order: "asc" })), ["first", "second"]);
+				deepStrictEqual(ids(await storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT)), ["first", "second"]);
 			},
 		),
 
@@ -667,24 +806,27 @@ export function createStorageConformance(factory: () => Promise<StorageFixture>)
 			"lifecycle",
 			"seals admission, drains admitted commits, and closes idempotently",
 			async ({ storage }) => {
-				const admitted = storage.commit({ writes: [{ kind: "entry", entry: userEntry("admitted") }] });
-				const firstClose = storage.close();
-				const secondClose = storage.close();
+				const admitted = storage.commit(
+					{ writes: [{ kind: "entry", entry: userEntry("admitted") }] },
+					BACKGROUND_CONTEXT,
+				);
+				const firstClose = storage.close(BACKGROUND_CONTEXT);
+				const secondClose = storage.close(BACKGROUND_CONTEXT);
 
-				await rejects(storage.getStats());
-				await rejects(storage.commit({ writes: [] }));
+				await rejects(storage.getStats(BACKGROUND_CONTEXT));
+				await rejects(storage.commit({ writes: [] }, BACKGROUND_CONTEXT));
 				strictEqual((await admitted).seqs.length, 1);
 				await Promise.all([firstClose, secondClose]);
 
 				const rejectedReads = [
-					storage.getEntries([]),
-					storage.getRegister("fact.name", ""),
-					storage.listRegisters("fact.name"),
-					storage.scanBranch({ start: "admitted" }),
-					storage.scanBranchStructure({ start: "admitted" }),
-					storage.scanEntries({ order: "asc" }),
-					storage.scanUsage({ order: "asc" }),
-					storage.getStats(),
+					storage.getEntries([], BACKGROUND_CONTEXT),
+					storage.getRegister("fact.name", "", BACKGROUND_CONTEXT),
+					storage.listRegisters("fact.name", undefined, BACKGROUND_CONTEXT),
+					storage.scanBranch({ start: "admitted" }, BACKGROUND_CONTEXT),
+					storage.scanBranchStructure({ start: "admitted" }, BACKGROUND_CONTEXT),
+					storage.scanEntries({ order: "asc" }, BACKGROUND_CONTEXT),
+					storage.scanUsage({ order: "asc" }, BACKGROUND_CONTEXT),
+					storage.getStats(BACKGROUND_CONTEXT),
 				];
 				for (const read of rejectedReads) await rejects(read);
 			},

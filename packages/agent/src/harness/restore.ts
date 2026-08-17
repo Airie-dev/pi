@@ -1,4 +1,5 @@
 import { isRetryableAssistantError } from "@earendil-works/pi-ai";
+import type { Context } from "./context.ts";
 import { SessionInvariantError } from "./session/session.ts";
 import type {
 	Entry,
@@ -37,13 +38,15 @@ interface RestoreOptions {
 export async function restoreLane(
 	reader: SessionReader,
 	lane: string,
-	options: RestoreOptions = {},
+	options: RestoreOptions | undefined,
+	context: Context,
 ): Promise<RestoredLane> {
+	options ??= {};
 	const [configuration, laneState, leaf, lastResult] = await Promise.all([
-		reader.getRegister("lane.config", lane),
-		reader.getRegister("lane.state", lane),
-		reader.getRegister("lane.leaf", lane),
-		options.includeLastResult ? reader.getRegister("lane.lastResult", lane) : Promise.resolve(undefined),
+		reader.getRegister("lane.config", lane, context),
+		reader.getRegister("lane.state", lane, context),
+		reader.getRegister("lane.leaf", lane, context),
+		options.includeLastResult ? reader.getRegister("lane.lastResult", lane, context) : Promise.resolve(undefined),
 	]);
 	if (configuration === undefined) invariant(lane, "is missing lane.config");
 	if (laneState === undefined) invariant(lane, "is missing lane.state");
@@ -53,7 +56,10 @@ export async function restoreLane(
 	const [operation, operationState] =
 		operationId === null
 			? [undefined, undefined]
-			: await Promise.all([reader.getRegister("op.meta", operationId), reader.getRegister("op.state", operationId)]);
+			: await Promise.all([
+					reader.getRegister("op.meta", operationId, context),
+					reader.getRegister("op.state", operationId, context),
+				]);
 	if (operationId !== null && operation === undefined) {
 		invariant(lane, `names operation ${operationId}, which is missing op.meta`);
 	}
@@ -103,24 +109,24 @@ export async function restoreLane(
 	}
 	const entryIds = [...new Set([...expectations.keys(), ...forbiddenEntries, ...pendingExpectations.keys()])];
 	const [entries, pendingRegisters, reservedPendingRegisters, toolArgumentRegisters] = await Promise.all([
-		reader.getEntries(entryIds),
+		reader.getEntries(entryIds, context),
 		Promise.all(
 			[...pendingExpectations].map(async ([id, expected]) => ({
 				id,
 				expected,
-				register: await reader.getRegister("pending.entry", id),
+				register: await reader.getRegister("pending.entry", id, context),
 			})),
 		),
 		Promise.all(
 			[...forbiddenEntries].map(async (id) => ({
 				id,
-				register: await reader.getRegister("pending.entry", id),
+				register: await reader.getRegister("pending.entry", id, context),
 			})),
 		),
 		Promise.all(
 			[...toolArgumentKeys].map(async (key) => ({
 				key,
-				register: await reader.getRegister("op.tool_args", key),
+				register: await reader.getRegister("op.tool_args", key, context),
 			})),
 		),
 	]);
@@ -136,7 +142,7 @@ export async function restoreLane(
 		}
 	}
 	if (operationState?.value.kind === "run") {
-		await hydrateTerminatedToolChain(reader, operationState.value, entries, lane);
+		await hydrateTerminatedToolChain(reader, operationState.value, entries, lane, context);
 	}
 	const toolArguments = new Map<string, Record<string, JsonValue>>();
 	for (const item of toolArgumentRegisters) {
@@ -293,6 +299,7 @@ async function hydrateTerminatedToolChain(
 	state: RunState,
 	entries: Map<string, Entry>,
 	lane: string,
+	context: Context,
 ): Promise<void> {
 	const phase = state.phase;
 	if (
@@ -339,7 +346,7 @@ async function hydrateTerminatedToolChain(
 		if (result.parentId === null) invariant(lane, "terminated-tools result chain reaches the root");
 		let parent = entries.get(result.parentId);
 		if (parent === undefined) {
-			parent = (await reader.getEntries([result.parentId])).get(result.parentId);
+			parent = (await reader.getEntries([result.parentId], context)).get(result.parentId);
 			if (parent !== undefined) entries.set(parent.id, parent);
 		}
 		if (parent === undefined) invariant(lane, `terminated-tools result parent ${result.parentId} is missing`);

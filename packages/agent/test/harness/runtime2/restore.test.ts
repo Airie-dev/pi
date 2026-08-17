@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_COMPACTION_SETTINGS } from "../../../src/harness/compaction/compaction.ts";
+import { BACKGROUND_CONTEXT } from "../../../src/harness/context.ts";
 import { restoreLane, restoreSession } from "../../../src/harness/runtime2/restore.ts";
 import { MemorySessionRepo } from "../../../src/harness/session/memory.ts";
 import type { LaneConfiguration, OperationMeta, RunState, Session } from "../../../src/harness/session/types.ts";
@@ -14,11 +15,17 @@ const configuration: LaneConfiguration = {
 async function createSession(): Promise<Session> {
 	const repo = new MemorySessionRepo();
 	repos.push(repo);
-	const session = await repo.create({});
-	await session.mutate("main", (mutator) =>
-		mutator.commit({
-			writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration }],
-		}),
+	const session = await repo.create({}, BACKGROUND_CONTEXT);
+	await session.mutate(
+		"main",
+		(mutator) =>
+			mutator.commit(
+				{
+					writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration }],
+				},
+				BACKGROUND_CONTEXT,
+			),
+		BACKGROUND_CONTEXT,
 	);
 	return session;
 }
@@ -44,7 +51,7 @@ function runState(triggerEntryId: string): RunState {
 }
 
 afterEach(async () => {
-	for (const repo of repos.splice(0)) await repo.close();
+	for (const repo of repos.splice(0)) await repo.close(BACKGROUND_CONTEXT);
 });
 
 describe("runtime2 lane restore", () => {
@@ -57,21 +64,27 @@ describe("runtime2 lane restore", () => {
 			oldLeafId: null,
 			leafId: null,
 		};
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.lastResult",
-						key: "main",
-						value: result,
+						writes: [
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.lastResult",
+								key: "main",
+								value: result,
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
-		const state = await restoreLane(session, "main");
+		const state = await restoreLane(session, "main", BACKGROUND_CONTEXT);
 
 		expect(state).toEqual({
 			leafId: null,
@@ -94,34 +107,46 @@ describe("runtime2 lane restore", () => {
 			intent: { kind: "run", promptEntryIds: [] },
 		};
 		const state = runState(missingTriggerId);
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: meta },
-					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { currentOperationId: operationId, pendingNextRun: [] },
+						writes: [
+							{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: meta },
+							{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { currentOperationId: operationId, pendingNextRun: [] },
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
-		const restored = await restoreLane(session, "main");
+		const restored = await restoreLane(session, "main", BACKGROUND_CONTEXT);
 
 		expect(restored.operation).toEqual({ meta, state });
 	});
 
 	it.each(["lane.leaf", "lane.config", "lane.state"] as const)("requires %s", async (namespace) => {
 		const session = await createSession();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({ writes: [{ kind: "register", op: "delete", namespace, key: "main" }] }),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{ writes: [{ kind: "register", op: "delete", namespace, key: "main" }] },
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing ${namespace}`);
+		await expect(restoreLane(session, "main", BACKGROUND_CONTEXT)).rejects.toThrow(`missing ${namespace}`);
 	});
 
 	it.each(["op.meta", "op.state"] as const)("requires %s for the current operation", async (namespace) => {
@@ -135,43 +160,49 @@ describe("runtime2 lane restore", () => {
 			intent: { kind: "run", promptEntryIds: [] },
 		};
 		const state = runState(session.idGenerator.next());
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [
-					...(namespace === "op.meta"
-						? []
-						: [
-								{
-									kind: "register" as const,
-									op: "set" as const,
-									namespace: "op.meta" as const,
-									key: operationId,
-									value: meta,
-								},
-							]),
-					...(namespace === "op.state"
-						? []
-						: [
-								{
-									kind: "register" as const,
-									op: "set" as const,
-									namespace: "op.state" as const,
-									key: operationId,
-									value: state,
-								},
-							]),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "main",
-						value: { currentOperationId: operationId, pendingNextRun: [] },
+						writes: [
+							...(namespace === "op.meta"
+								? []
+								: [
+										{
+											kind: "register" as const,
+											op: "set" as const,
+											namespace: "op.meta" as const,
+											key: operationId,
+											value: meta,
+										},
+									]),
+							...(namespace === "op.state"
+								? []
+								: [
+										{
+											kind: "register" as const,
+											op: "set" as const,
+											namespace: "op.state" as const,
+											key: operationId,
+											value: state,
+										},
+									]),
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "main",
+								value: { currentOperationId: operationId, pendingNextRun: [] },
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
-		await expect(restoreLane(session, "main")).rejects.toThrow(`missing ${namespace}`);
+		await expect(restoreLane(session, "main", BACKGROUND_CONTEXT)).rejects.toThrow(`missing ${namespace}`);
 	});
 
 	it("restores every configured lane exactly once without writing", async () => {
@@ -181,7 +212,7 @@ describe("runtime2 lane restore", () => {
 			thinkingLevel: "high",
 			activeToolNames: ["read"],
 		};
-		await session.createLane("worker", null, workerConfiguration);
+		await session.createLane("worker", null, workerConfiguration, BACKGROUND_CONTEXT);
 		const operationId = session.idGenerator.next();
 		const meta: OperationMeta = {
 			operationId,
@@ -191,29 +222,35 @@ describe("runtime2 lane restore", () => {
 			intent: { kind: "run", promptEntryIds: [] },
 		};
 		const state = runState(session.idGenerator.next());
-		await session.mutate("worker", (mutator) =>
-			mutator.commit({
-				writes: [
-					{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: meta },
-					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
+		await session.mutate(
+			"worker",
+			(mutator) =>
+				mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: "worker",
-						value: { currentOperationId: operationId, pendingNextRun: [] },
+						writes: [
+							{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: meta },
+							{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: state },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: "worker",
+								value: { currentOperationId: operationId, pendingNextRun: [] },
+							},
+						],
 					},
-				],
-			}),
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 		const before = {
-			leaves: await session.listRegisters("lane.leaf"),
-			configurations: await session.listRegisters("lane.config"),
-			states: await session.listRegisters("lane.state"),
+			leaves: await session.listRegisters("lane.leaf", undefined, BACKGROUND_CONTEXT),
+			configurations: await session.listRegisters("lane.config", undefined, BACKGROUND_CONTEXT),
+			states: await session.listRegisters("lane.state", undefined, BACKGROUND_CONTEXT),
 		};
 		const mutate = vi.spyOn(session, "mutate");
 
-		const lanes = await restoreSession(session);
+		const lanes = await restoreSession(session, BACKGROUND_CONTEXT);
 
 		expect([...lanes.keys()].sort()).toEqual(["main", "worker"]);
 		expect(lanes.get("main")?.configuration).toEqual(configuration);
@@ -223,20 +260,26 @@ describe("runtime2 lane restore", () => {
 		});
 		expect(mutate.mock.calls.map(([lane]) => lane).sort()).toEqual(["main", "worker"]);
 		expect({
-			leaves: await session.listRegisters("lane.leaf"),
-			configurations: await session.listRegisters("lane.config"),
-			states: await session.listRegisters("lane.state"),
+			leaves: await session.listRegisters("lane.leaf", undefined, BACKGROUND_CONTEXT),
+			configurations: await session.listRegisters("lane.config", undefined, BACKGROUND_CONTEXT),
+			states: await session.listRegisters("lane.state", undefined, BACKGROUND_CONTEXT),
 		}).toEqual(before);
 	});
 
 	it("requires main in the trusted lane inventory", async () => {
 		const session = await createSession();
-		await session.mutate("main", (mutator) =>
-			mutator.commit({
-				writes: [{ kind: "register", op: "delete", namespace: "lane.leaf", key: "main" }],
-			}),
+		await session.mutate(
+			"main",
+			(mutator) =>
+				mutator.commit(
+					{
+						writes: [{ kind: "register", op: "delete", namespace: "lane.leaf", key: "main" }],
+					},
+					BACKGROUND_CONTEXT,
+				),
+			BACKGROUND_CONTEXT,
 		);
 
-		await expect(restoreSession(session)).rejects.toThrow("Session is missing main lane");
+		await expect(restoreSession(session, BACKGROUND_CONTEXT)).rejects.toThrow("Session is missing main lane");
 	});
 });

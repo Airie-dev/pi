@@ -1,5 +1,5 @@
 import type { Session, SessionMetadata } from "@earendil-works/pi-agent-core";
-import { MemorySessionRepo } from "@earendil-works/pi-agent-core";
+import { BACKGROUND_CONTEXT, MemorySessionRepo } from "@earendil-works/pi-agent-core";
 import type { LaneEvent, LaneSnapshot, PromptArguments, RunResult } from "@earendil-works/pi-protocol";
 import type { HostedHarnessHandle, HostedHarnessWatch, PiServerHost } from "../types.ts";
 
@@ -162,13 +162,13 @@ export class TestHarness {
 			this.failClose = undefined;
 			throw error;
 		}
-		await this.session.close();
+		await this.session.close(BACKGROUND_CONTEXT);
 		this.closed.resolve(undefined);
 		this.#termination.resolve(undefined);
 	}
 
 	async terminate(error: Error): Promise<void> {
-		await this.session.close();
+		await this.session.close(BACKGROUND_CONTEXT);
 		this.#termination.resolve(error);
 	}
 
@@ -204,14 +204,14 @@ export class TestServerHost implements PiServerHost {
 				delay.entered.resolve(undefined);
 				await delay.release.promise;
 			}
-			return this.repo.list();
+			return this.repo.list(undefined, BACKGROUND_CONTEXT);
 		},
 		create: async ({ id }) => {
-			const session = await this.repo.create({ id });
+			const session = await this.repo.create({ id }, BACKGROUND_CONTEXT);
 			try {
 				return session.metadata;
 			} finally {
-				await session.close();
+				await session.close(BACKGROUND_CONTEXT);
 			}
 		},
 	};
@@ -226,7 +226,7 @@ export class TestServerHost implements PiServerHost {
 			gate.entered.resolve(undefined);
 			await gate.release.promise;
 		}
-		const session = await this.repo.open(metadata);
+		const session = await this.repo.open(metadata, BACKGROUND_CONTEXT);
 		try {
 			if (this.nextCreateHarnessError) {
 				const error = this.nextCreateHarnessError;
@@ -243,15 +243,15 @@ export class TestServerHost implements PiServerHost {
 			this.harnesses.set(metadata.id, harnesses);
 			return harness;
 		} catch (error) {
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 			throw error;
 		}
 	}
 
 	async seed(id = "session-1", parentSessionId?: string): Promise<SessionMetadata> {
-		const session = await this.repo.create({ id, parentSessionId });
+		const session = await this.repo.create({ id, parentSessionId }, BACKGROUND_CONTEXT);
 		const metadata = session.metadata;
-		await session.close();
+		await session.close(BACKGROUND_CONTEXT);
 		return metadata;
 	}
 

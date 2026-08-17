@@ -1,5 +1,4 @@
 import type { Models, RetryPolicy } from "@earendil-works/pi-ai";
-import { NOOP_TELEMETRY_CONTEXT } from "@earendil-works/pi-telemetry";
 import type { QueueMode } from "../../types.ts";
 import type {
 	AgentHarness,
@@ -22,6 +21,7 @@ import {
 	validateRetryPolicy,
 	validateToolNames,
 } from "../config.ts";
+import type { Context } from "../context.ts";
 import { HarnessEventBus } from "../events.ts";
 import { HookRegistry } from "../hooks.ts";
 import { convertToLlm } from "../messages.ts";
@@ -63,8 +63,8 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 			options.session,
 			options.models,
 			main,
-			(cause) => this.fault(cause),
-			(event) => this.events.emit(event),
+			(cause, context) => this.fault(cause, context),
+			(event, context) => this.events.emit(event, context),
 			suspensionsByLane.get("main"),
 		);
 		this.seed = seed;
@@ -80,20 +80,22 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 			drive: options.drive ?? "automatic",
 			toolContext: options.toolContext,
 			systemPrompt: options.systemPrompt,
-			toProviderMessages: options.toProviderMessages ?? convertToLlm,
+			toProviderMessages: options.toProviderMessages ?? ((messages) => convertToLlm(messages)),
 			entryProjectors: options.entryProjectors ?? {},
-			telemetryContext: options.telemetryContext ?? NOOP_TELEMETRY_CONTEXT,
 		};
 		this.events = new HarnessEventBus();
-		this.hooks = new HookRegistry((error, hook, lane) =>
-			this.events.emit({
-				type: "handler_error",
-				kind: "hook",
-				hook,
-				error: error.message,
-				...(error.stack === undefined ? {} : { stack: error.stack }),
-				lane,
-			}),
+		this.hooks = new HookRegistry((error, hook, lane, context) =>
+			this.events.emit(
+				{
+					type: "handler_error",
+					kind: "hook",
+					hook,
+					error: error.message,
+					...(error.stack === undefined ? {} : { stack: error.stack }),
+					lane,
+				},
+				context,
+			),
 		);
 		this.lanesByName.set("main", this);
 		for (const [name, state] of restored) {
@@ -101,14 +103,16 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 		}
 	}
 
-	async lane(name: string): Promise<AgentLane | undefined> {
+	async lane(name: string, _context: Context): Promise<AgentLane | undefined> {
 		this.assertOpen();
 		return this.lanesByName.get(name);
 	}
 
-	async lanes(): Promise<LaneInfo[]> {
+	async lanes(context: Context): Promise<LaneInfo[]> {
 		this.assertOpen();
-		const executions = await Promise.all([...this.lanesByName.values()].map((lane) => lane.inspectExecution()));
+		const executions = await Promise.all(
+			[...this.lanesByName.values()].map((lane) => lane.inspectExecution(context)),
+		);
 		return executions.map((execution) => ({
 			name: execution.lane,
 			leafId: execution.leafId,
@@ -123,7 +127,7 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 		}));
 	}
 
-	async createLane(name: string, at: string | null): Promise<CreateLaneResult> {
+	async createLane(name: string, at: string | null, context: Context): Promise<CreateLaneResult> {
 		// Public Result errors are expected caller/lifecycle outcomes. Harness faults reject every API call because the
 		// owned state can no longer advance safely; they are intentionally not members of CreateLaneResult.
 		if (this.faultError !== undefined) throw this.faultError;
@@ -135,11 +139,11 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 			operation: null,
 		};
 		try {
-			await this.session.createLane(name, at, this.seed);
+			await this.session.createLane(name, at, this.seed, context);
 			const lane = this.buildLane(name, state);
 			if (this.closedError !== undefined) lane.seal(this.closedError);
 			this.lanesByName.set(name, lane);
-			await this.events.emit({ type: "lane_created", lane: name, at });
+			await this.events.emit({ type: "lane_created", lane: name, at }, context);
 			return Result.ok(lane);
 		} catch (error) {
 			// Session has no Result layer, so its expected validation failures are thrown. Translate only those failures
@@ -153,70 +157,70 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 			if (error instanceof SessionUnknownTargetError) {
 				return Result.err(new UnknownTarget({ targetId: error.targetId, message: error.message }));
 			}
-			throw this.fault(error);
+			throw this.fault(error, context);
 		}
 	}
 
-	getTools(): Promise<AgentHarnessTool<TContext>[]> {
-		return this.getConfig("tools");
+	getTools(context: Context): Promise<AgentHarnessTool<TContext>[]> {
+		return this.getConfig("tools", context);
 	}
 
-	setTools(tools: AgentHarnessTool<TContext>[]): Promise<void> {
+	setTools(tools: AgentHarnessTool<TContext>[], context: Context): Promise<void> {
 		validateToolNames(tools);
-		return this.setConfig("tools", tools, "tools");
+		return this.setConfig("tools", tools, "tools", context);
 	}
 
-	getResources(): Promise<Resources> {
-		return this.getConfig("resources");
+	getResources(context: Context): Promise<Resources> {
+		return this.getConfig("resources", context);
 	}
 
-	setResources(resources: Resources): Promise<void> {
-		return this.setConfig("resources", resources, "resources");
+	setResources(resources: Resources, context: Context): Promise<void> {
+		return this.setConfig("resources", resources, "resources", context);
 	}
 
-	getStreamOptions(): Promise<AgentHarnessStreamOptions> {
-		return this.getConfig("streamOptions");
+	getStreamOptions(context: Context): Promise<AgentHarnessStreamOptions> {
+		return this.getConfig("streamOptions", context);
 	}
 
-	setStreamOptions(options: AgentHarnessStreamOptions): Promise<void> {
-		return this.setConfig("streamOptions", options, "streamOptions");
+	setStreamOptions(options: AgentHarnessStreamOptions, context: Context): Promise<void> {
+		return this.setConfig("streamOptions", options, "streamOptions", context);
 	}
 
-	getRetryPolicy(): Promise<RetryPolicy> {
-		return this.getConfig("retryPolicy");
+	getRetryPolicy(context: Context): Promise<RetryPolicy> {
+		return this.getConfig("retryPolicy", context);
 	}
 
-	setRetryPolicy(policy: RetryPolicy): Promise<void> {
+	setRetryPolicy(policy: RetryPolicy, context: Context): Promise<void> {
 		validateRetryPolicy(policy);
-		return this.setConfig("retryPolicy", policy, "retryPolicy");
+		return this.setConfig("retryPolicy", policy, "retryPolicy", context);
 	}
 
-	getCompactionSettings(): Promise<CompactionSettings> {
-		return this.getConfig("compaction");
+	getCompactionSettings(context: Context): Promise<CompactionSettings> {
+		return this.getConfig("compaction", context);
 	}
 
-	setCompactionSettings(compaction: CompactionSettings): Promise<void> {
+	setCompactionSettings(compaction: CompactionSettings, context: Context): Promise<void> {
 		validateCompactionSettings(compaction);
-		return this.setConfig("compaction", compaction, "compactionSettings");
+		return this.setConfig("compaction", compaction, "compactionSettings", context);
 	}
 
-	getSteeringMode(): Promise<QueueMode> {
-		return this.getConfig("steeringMode");
+	getSteeringMode(context: Context): Promise<QueueMode> {
+		return this.getConfig("steeringMode", context);
 	}
 
-	setSteeringMode(steeringMode: QueueMode): Promise<void> {
-		return this.setConfig("steeringMode", steeringMode, "steeringMode");
+	setSteeringMode(steeringMode: QueueMode, context: Context): Promise<void> {
+		return this.setConfig("steeringMode", steeringMode, "steeringMode", context);
 	}
 
-	getFollowUpMode(): Promise<QueueMode> {
-		return this.getConfig("followUpMode");
+	getFollowUpMode(context: Context): Promise<QueueMode> {
+		return this.getConfig("followUpMode", context);
 	}
 
-	setFollowUpMode(followUpMode: QueueMode): Promise<void> {
-		return this.setConfig("followUpMode", followUpMode, "followUpMode");
+	setFollowUpMode(followUpMode: QueueMode, context: Context): Promise<void> {
+		return this.setConfig("followUpMode", followUpMode, "followUpMode", context);
 	}
 
-	async watchSession(): Promise<never> {
+	async watchSession(_context: Context): Promise<never> {
 		throw new SliceNotImplemented("watchSession");
 	}
 
@@ -226,13 +230,16 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 			this.session,
 			this.models,
 			state,
-			(cause) => this.fault(cause),
-			(event) => this.events.emit(event),
+			(cause, context) => this.fault(cause, context),
+			(event, context) => this.events.emit(event, context),
 			suspension,
 		);
 	}
 
-	private async getConfig<TKey extends keyof Config<TContext>>(key: TKey): Promise<Config<TContext>[TKey]> {
+	private async getConfig<TKey extends keyof Config<TContext>>(
+		key: TKey,
+		_context: Context,
+	): Promise<Config<TContext>[TKey]> {
 		this.assertOpen();
 		return this.config[key];
 	}
@@ -241,13 +248,14 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 		key: TKey,
 		value: Config<TContext>[TKey],
 		property: GlobalConfigProperty,
+		context: Context,
 	): Promise<void> {
 		this.assertOpen();
 		this.config = { ...this.config, [key]: value };
-		await this.events.emit({ type: "config_update", property });
+		await this.events.emit({ type: "config_update", property }, context);
 	}
 
-	fault(cause: unknown): Error {
+	fault(cause: unknown, context: Context): Error {
 		if (this.faultError !== undefined) return this.faultError;
 		if (this.closedError !== undefined) return this.closedError;
 		const normalized = cause instanceof Error ? cause : new Error(String(cause));
@@ -255,12 +263,12 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 		this.faultError = fault;
 		for (const lane of this.lanesByName.values()) lane.seal(fault);
 		this.hooks.close(fault);
-		void this.events.emit({ type: "fault", code: "harness_fault", message: fault.message });
+		void this.events.emit({ type: "fault", code: "harness_fault", message: fault.message }, context);
 		this.events.close(fault);
 		return fault;
 	}
 
-	close(): Promise<void> {
+	close(context: Context): Promise<void> {
 		if (this.closePromise !== undefined) return this.closePromise;
 		/*
 		 * Close is a process-local admission boundary, not an abort. Public lane work checks Lane.assertOpen() at
@@ -285,7 +293,7 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 		for (const lane of this.lanesByName.values()) lane.seal(error);
 		this.hooks.close(error);
 		this.events.close(error);
-		this.closePromise = this.session.close();
+		this.closePromise = this.session.close(context);
 		return this.closePromise;
 	}
 }
@@ -293,6 +301,7 @@ export class Harness<TContext extends object | undefined> extends Lane implement
 /** Attach runtime2 without starting provider, tool, hook, or timer effects. */
 export async function createAgentHarness<TContext extends object | undefined = object | undefined>(
 	options: AgentHarnessOptions<TContext>,
+	context: Context,
 ): Promise<{ harness: AgentHarness<TContext>; suspended: SuspendedOperation[] }> {
 	const tools = options.tools ?? [];
 	validateToolNames(tools);
@@ -304,12 +313,12 @@ export async function createAgentHarness<TContext extends object | undefined = o
 		activeToolNames: options.activeToolNames ?? tools.map((tool) => tool.name),
 	};
 	try {
-		await seedMain(options.session, seed);
-		const restored = await restoreSession(options.session);
+		await seedMain(options.session, seed, context);
+		const restored = await restoreSession(options.session, context);
 		const suspended: SuspendedOperation[] = [];
 		for (const [lane, state] of restored) {
 			if (state.operation !== null) {
-				suspended.push(await describeSuspension(options.session, options.models, tools, lane, state));
+				suspended.push(await describeSuspension(options.session, options.models, tools, lane, state, context));
 			}
 		}
 		const suspensionsByLane = new Map(suspended.map((descriptor) => [descriptor.lane, descriptor]));
@@ -325,6 +334,7 @@ async function describeSuspension(
 	tools: readonly { name: string }[],
 	lane: string,
 	state: LaneState,
+	context: Context,
 ): Promise<SuspendedOperation> {
 	const operation = state.operation;
 	if (operation === null) throw new SessionInvariantError(`Lane ${JSON.stringify(lane)} is not suspended`);
@@ -333,9 +343,10 @@ async function describeSuspension(
 		operation.state.kind === "run" && operation.state.phase.kind === "deferred"
 			? operation.state.phase.deferred.sourceEntryId
 			: undefined;
-	const entries = await session.getEntries([
-		...new Set([...promptIds, ...(deferredSourceId === undefined ? [] : [deferredSourceId])]),
-	]);
+	const entries = await session.getEntries(
+		[...new Set([...promptIds, ...(deferredSourceId === undefined ? [] : [deferredSourceId])])],
+		context,
+	);
 	const prompt = promptIds.map((id) => {
 		const entry = entries.get(id);
 		if (entry?.type !== "message") throw new SessionInvariantError(`Prompt entry ${id} is missing`);
@@ -374,23 +385,28 @@ async function describeSuspension(
 	return { ...base, reason: "crash" };
 }
 
-async function seedMain(session: Session, seed: LaneConfiguration): Promise<void> {
-	await session.mutate("main", async (mutator) => {
-		const [leaf, state, configuration, lastResult] = await Promise.all([
-			mutator.getRegister("lane.leaf", "main"),
-			mutator.getRegister("lane.state", "main"),
-			mutator.getRegister("lane.config", "main"),
-			mutator.getRegister("lane.lastResult", "main"),
-		]);
-		if (leaf === undefined || state === undefined) {
-			throw new SessionInvariantError("Session main lane has incomplete durable state");
-		}
-		if (configuration !== undefined) return;
-		if (state.value.currentOperationId !== null || lastResult !== undefined) {
-			throw new SessionInvariantError("Configured or active main lane is missing lane.config");
-		}
-		await mutator.commit({
-			writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: seed }],
-		});
-	});
+async function seedMain(session: Session, seed: LaneConfiguration, context: Context): Promise<void> {
+	await session.mutate(
+		"main",
+		async (mutator) => {
+			const [leaf, state, configuration, lastResult] = await Promise.all([
+				mutator.getRegister("lane.leaf", "main", context),
+				mutator.getRegister("lane.state", "main", context),
+				mutator.getRegister("lane.config", "main", context),
+				mutator.getRegister("lane.lastResult", "main", context),
+			]);
+			if (leaf === undefined || state === undefined) {
+				throw new SessionInvariantError("Session main lane has incomplete durable state");
+			}
+			if (configuration !== undefined) return;
+			if (state.value.currentOperationId !== null || lastResult !== undefined) {
+				throw new SessionInvariantError("Configured or active main lane is missing lane.config");
+			}
+			await mutator.commit(
+				{ writes: [{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: seed }] },
+				context,
+			);
+		},
+		context,
+	);
 }

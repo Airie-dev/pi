@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "../../../src/harness/context.ts";
 // Minimal real-provider AgentHarness example.
 // Run from packages/agent: node test/harness/scratch/r2.ts
 // Requires ANTHROPIC_API_KEY.
@@ -18,14 +19,17 @@ console.log(`auth:  ${auth ? `configured via ${auth.source}` : "not configured"}
 if (!auth) process.exit(1);
 
 const repo = new MemorySessionRepo();
-const session = await repo.create({});
-const { harness } = await AgentHarness.create({
-	session,
-	models,
-	model,
-	activeToolNames: [],
-	systemPrompt: "You are terse.",
-});
+const session = await repo.create({}, BACKGROUND_CONTEXT);
+const { harness } = await AgentHarness.create(
+	{
+		session,
+		models,
+		model,
+		activeToolNames: [],
+		systemPrompt: "You are terse.",
+	},
+	BACKGROUND_CONTEXT,
+);
 
 harness.events.on("message_update", ({ event }) => {
 	if (event.type === "text_delta") process.stdout.write(event.delta);
@@ -33,7 +37,7 @@ harness.events.on("message_update", ({ event }) => {
 
 try {
 	process.stdout.write("assistant: ");
-	const result = await harness.prompt("Spit out one sentence");
+	const result = await harness.prompt("Spit out one sentence", undefined, BACKGROUND_CONTEXT);
 	process.stdout.write("\n");
 
 	if (!result.ok) throw result.error;
@@ -43,6 +47,6 @@ try {
 		console.log(`cost:   $${result.value.finalMessage.usage.cost.total.toFixed(6)}`);
 	}
 } finally {
-	await harness.close();
-	await repo.close();
+	await harness.close(BACKGROUND_CONTEXT);
+	await repo.close(BACKGROUND_CONTEXT);
 }

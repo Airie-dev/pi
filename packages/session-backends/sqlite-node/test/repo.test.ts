@@ -1,6 +1,7 @@
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { SqliteDatabase } from "../src/index.ts";
 import { createNodeSqliteFactory, SqliteSessionRepo, sql } from "../src/index.ts";
@@ -32,7 +33,7 @@ describe("SqliteSessionRepo", () => {
 				now: () => 1_700_000_000_000,
 			});
 
-			const session = await repo.create({ id: "session" });
+			const session = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
 			const metadata = session.metadata;
 			expect(metadata).toMatchObject({
 				id: "session",
@@ -65,7 +66,7 @@ describe("SqliteSessionRepo", () => {
 					},
 				]);
 			});
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 		});
 	});
 
@@ -76,14 +77,14 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1,
 			});
-			const session = await repo.create({ id: "session" });
+			const session = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
 			const { metadata } = session;
 
-			await expect(repo.create({ id: "session" })).rejects.toThrow();
+			await expect(repo.create({ id: "session" }, BACKGROUND_CONTEXT)).rejects.toThrow();
 			await withDb(metadata.path, (db) => {
 				expect(sql`SELECT COUNT(*) AS count FROM session`.get<{ count: number }>(db)).toEqual({ count: 1 });
 			});
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 		});
 	});
 
@@ -94,18 +95,20 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1,
 			});
-			const session = await repo.create({ id: "session" });
+			const session = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
 			const { metadata } = session;
 			let leaseBeforeList: unknown[] = [];
 			await withDb(metadata.path, (db) => {
 				leaseBeforeList = sql`SELECT owner_id, fence FROM writer_lease`.all(db);
 			});
 
-			await expect(repo.list()).resolves.toMatchObject([{ id: "session", path: metadata.path }]);
+			await expect(repo.list(undefined, BACKGROUND_CONTEXT)).resolves.toMatchObject([
+				{ id: "session", path: metadata.path },
+			]);
 			await withDb(metadata.path, (db) => {
 				expect(sql`SELECT owner_id, fence FROM writer_lease`.all(db)).toEqual(leaseBeforeList);
 			});
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 		});
 	});
 
@@ -116,14 +119,14 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1,
 			});
-			const session = await repo.create({ id: "session" });
-			await session.close();
+			const session = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
+			await session.close(BACKGROUND_CONTEXT);
 			await writeFile(join(directory, "corrupt.sqlite"), "not a sqlite database");
 			await withDb(session.metadata.path, (db) => {
 				sql`UPDATE session SET storage_version = ${999}`.run(db);
 			});
 
-			expect(await repo.list()).toEqual([]);
+			expect(await repo.list(undefined, BACKGROUND_CONTEXT)).toEqual([]);
 		});
 	});
 
@@ -137,7 +140,7 @@ describe("SqliteSessionRepo", () => {
 			const path = join(directory, "session.sqlite");
 			await writeFile(path, "not a sqlite database");
 
-			await expect(repo.create({ id: "session" })).rejects.toThrow();
+			await expect(repo.create({ id: "session" }, BACKGROUND_CONTEXT)).rejects.toThrow();
 			await expect(access(path)).resolves.toBeUndefined();
 		});
 	});
@@ -149,22 +152,24 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1,
 			});
-			const session = await repo.create({ id: "session" });
+			const session = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
 			const { metadata } = session;
-			await session.close();
+			await session.close(BACKGROUND_CONTEXT);
 
 			await withDb(metadata.path, (db) => {
 				sql`INSERT INTO writer_lease (owner_id, fence, expires_at_ms) VALUES (${"external"}, ${1}, ${1_000})`.run(
 					db,
 				);
 			});
-			await expect(repo.delete(metadata)).rejects.toThrow("already claimed");
+			await expect(repo.delete(metadata, BACKGROUND_CONTEXT)).rejects.toThrow("already claimed");
 			await withDb(metadata.path, (db) => {
 				sql`DELETE FROM writer_lease`.run(db);
 			});
 
-			await expect(repo.delete({ ...metadata, path: join(directory, "missing.sqlite") })).rejects.toThrow();
-			await repo.delete(metadata);
+			await expect(
+				repo.delete({ ...metadata, path: join(directory, "missing.sqlite") }, BACKGROUND_CONTEXT),
+			).rejects.toThrow();
+			await repo.delete(metadata, BACKGROUND_CONTEXT);
 			await expect(access(metadata.path)).rejects.toThrow();
 		});
 	});
@@ -176,20 +181,20 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1,
 			});
-			const created = await repo.create({ id: "session" });
+			const created = await repo.create({ id: "session" }, BACKGROUND_CONTEXT);
 			const { metadata } = created;
-			await created.close();
+			await created.close(BACKGROUND_CONTEXT);
 
-			const opened = await repo.open(metadata);
+			const opened = await repo.open(metadata, BACKGROUND_CONTEXT);
 			expect(opened.metadata).toMatchObject({ id: "session", path: metadata.path });
-			await opened.close();
+			await opened.close(BACKGROUND_CONTEXT);
 
 			await withDb(metadata.path, (db) => {
 				sql`INSERT INTO writer_lease (owner_id, fence, expires_at_ms) VALUES (${"external"}, ${1}, ${1_000})`.run(
 					db,
 				);
 			});
-			await expect(repo.open(metadata)).rejects.toThrow("already claimed");
+			await expect(repo.open(metadata, BACKGROUND_CONTEXT)).rejects.toThrow("already claimed");
 		});
 	});
 
@@ -200,31 +205,48 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1_700_000_000_000,
 			});
-			const source = await repo.create({ id: "source" });
-			const firstCommit = source.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [
-						{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "root" } },
-						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "root" },
-					],
-				}),
+			const source = await repo.create({ id: "source" }, BACKGROUND_CONTEXT);
+			const firstCommit = source.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [
+								{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "root" } },
+								{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "root" },
+							],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
-			const forkPromise = repo.fork(source.metadata, { id: "fork" });
-			const secondCommit = source.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [
-						{ kind: "entry", entry: { id: "child", parentId: "root", type: "custom", customType: "child" } },
-						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "child" },
-					],
-				}),
+			const forkPromise = repo.fork(source.metadata, { id: "fork" }, BACKGROUND_CONTEXT);
+			const secondCommit = source.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
+						{
+							writes: [
+								{
+									kind: "entry",
+									entry: { id: "child", parentId: "root", type: "custom", customType: "child" },
+								},
+								{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "child" },
+							],
+						},
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
 			const [, fork] = await Promise.all([firstCommit, forkPromise]);
 			await secondCommit;
 
-			expect(await fork.getLeafId()).toBe("root");
-			expect((await fork.findEntries({ order: "asc" })).map((entry) => entry.id)).toEqual(["root"]);
-			await Promise.all([source.close(), fork.close()]);
+			expect(await fork.getLeafId(BACKGROUND_CONTEXT)).toBe("root");
+			expect((await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([
+				"root",
+			]);
+			await Promise.all([source.close(BACKGROUND_CONTEXT), fork.close(BACKGROUND_CONTEXT)]);
 		});
 	});
 
@@ -235,55 +257,73 @@ describe("SqliteSessionRepo", () => {
 				databaseFactory: createNodeSqliteFactory(),
 				now: () => 1_700_000_000_000,
 			});
-			const source = await repo.create({ id: "source" });
-			await source.mutate("main", (mutator) =>
-				mutator.commit({
-					writes: [
-						{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "root" } },
+			const source = await repo.create({ id: "source" }, BACKGROUND_CONTEXT);
+			await source.mutate(
+				"main",
+				(mutator) =>
+					mutator.commit(
 						{
-							kind: "entry",
-							entry: {
-								id: "child",
-								parentId: "root",
-								type: "message",
-								message: { role: "user", content: "child", timestamp: 1 },
-							},
-						},
-						{ kind: "entry", entry: { id: "sibling", parentId: "root", type: "custom", customType: "sibling" } },
-						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "child" },
-						{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "source name" },
-						{ kind: "register", op: "set", namespace: "fact.label", key: "root", value: "root label" },
-						{ kind: "register", op: "set", namespace: "fact.label", key: "sibling", value: "sibling label" },
-						{
-							kind: "usage",
-							row: {
-								id: "usage",
-								adjustment: false,
-								usage: {
-									input: 1,
-									output: 1,
-									cacheRead: 0,
-									cacheWrite: 0,
-									totalTokens: 2,
-									cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							writes: [
+								{ kind: "entry", entry: { id: "root", parentId: null, type: "custom", customType: "root" } },
+								{
+									kind: "entry",
+									entry: {
+										id: "child",
+										parentId: "root",
+										type: "message",
+										message: { role: "user", content: "child", timestamp: 1 },
+									},
 								},
-							},
+								{
+									kind: "entry",
+									entry: { id: "sibling", parentId: "root", type: "custom", customType: "sibling" },
+								},
+								{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: "child" },
+								{ kind: "register", op: "set", namespace: "fact.name", key: "", value: "source name" },
+								{ kind: "register", op: "set", namespace: "fact.label", key: "root", value: "root label" },
+								{
+									kind: "register",
+									op: "set",
+									namespace: "fact.label",
+									key: "sibling",
+									value: "sibling label",
+								},
+								{
+									kind: "usage",
+									row: {
+										id: "usage",
+										adjustment: false,
+										usage: {
+											input: 1,
+											output: 1,
+											cacheRead: 0,
+											cacheWrite: 0,
+											totalTokens: 2,
+											cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+										},
+									},
+								},
+							],
 						},
-					],
-				}),
+						BACKGROUND_CONTEXT,
+					),
+				BACKGROUND_CONTEXT,
 			);
 
-			const fork = await repo.fork(source.metadata, { id: "fork", entryId: "child" });
+			const fork = await repo.fork(source.metadata, { id: "fork", entryId: "child" }, BACKGROUND_CONTEXT);
 
-			expect((await fork.findEntries({ order: "asc" })).map((entry) => entry.id)).toEqual(["root", "child"]);
-			expect(await fork.getLeafId()).toBe("child");
-			expect(await fork.getName()).toBe("source name");
-			expect(await fork.getLabel("root")).toBe("root label");
-			expect(await fork.getLabel("sibling")).toBeUndefined();
+			expect((await fork.findEntries({ order: "asc" }, BACKGROUND_CONTEXT)).map((entry) => entry.id)).toEqual([
+				"root",
+				"child",
+			]);
+			expect(await fork.getLeafId(BACKGROUND_CONTEXT)).toBe("child");
+			expect(await fork.getName(BACKGROUND_CONTEXT)).toBe("source name");
+			expect(await fork.getLabel("root", BACKGROUND_CONTEXT)).toBe("root label");
+			expect(await fork.getLabel("sibling", BACKGROUND_CONTEXT)).toBeUndefined();
 			await withDb(fork.metadata.path, (db) => {
 				expect(sql`SELECT COUNT(*) AS count FROM usage_ledger`.get<{ count: number }>(db)).toEqual({ count: 0 });
 			});
-			expect(await fork.getStats()).toEqual({
+			expect(await fork.getStats(BACKGROUND_CONTEXT)).toEqual({
 				messageCount: 1,
 				usage: {
 					input: 0,
@@ -294,7 +334,7 @@ describe("SqliteSessionRepo", () => {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 			});
-			await Promise.all([source.close(), fork.close()]);
+			await Promise.all([source.close(BACKGROUND_CONTEXT), fork.close(BACKGROUND_CONTEXT)]);
 		});
 	});
 });

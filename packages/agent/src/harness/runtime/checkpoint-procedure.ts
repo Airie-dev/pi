@@ -1,6 +1,6 @@
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { DriveOptions, TerminalOperationOutcome } from "../agent-harness.ts";
 import { HarnessClosed, HarnessFault } from "../agent-harness.ts";
+import type { Context } from "../context.ts";
 import { restoreLane } from "../restore.ts";
 import { SessionInvariantError } from "../session/session.ts";
 import type { LaneLastResult, OperationError, RunState } from "../session/types.ts";
@@ -24,16 +24,16 @@ export async function driveCheckpoint<TContext extends object | undefined>(
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	state: RunState,
-	runTelemetry: TelemetryContext,
+	context: Context,
 	options: DriveOptions,
 	recovery: boolean,
 ): Promise<CheckpointDisposition> {
 	if (state.phase.kind !== "checkpoint") throw new SessionInvariantError("Checkpoint procedure is not current");
 	if (state.phase.continuation.kind === "need_assistant") {
-		const advanced = await startGeneration(runtime, lane, active, state, runTelemetry, options);
+		const advanced = await startGeneration(runtime, lane, active, state, context, options);
 		return advanced ? { kind: "advanced" } : { kind: "yielded" };
 	}
-	const outcome = await finishRun(runtime, lane, active, undefined, options, recovery);
+	const outcome = await finishRun(runtime, lane, active, undefined, options, recovery, context);
 	return outcome === undefined ? { kind: "yielded" } : { kind: "settled", outcome };
 }
 
@@ -42,7 +42,7 @@ export async function driveFailureDrain<TContext extends object | undefined>(
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	state: RunState,
-	runTelemetry: TelemetryContext,
+	context: Context,
 	options: DriveOptions,
 	recovery: boolean,
 ): Promise<CheckpointDisposition> {
@@ -51,14 +51,14 @@ export async function driveFailureDrain<TContext extends object | undefined>(
 	}
 	const failure = state.phase.error;
 	const outcome = await startHarnessSpan(
-		runTelemetry,
 		"pi.harness.checkpoint",
 		{
 			"pi.lane.name": lane.name,
 			"pi.operation.id": active.operationId,
 			"pi.checkpoint.kind": "failure_drain",
 		},
-		() => finishRun(runtime, lane, active, failure, options, recovery),
+		(_span, checkpointContext) => finishRun(runtime, lane, active, failure, options, recovery, checkpointContext),
+		context,
 	);
 	return outcome === undefined ? { kind: "yielded" } : { kind: "settled", outcome };
 }
@@ -70,6 +70,7 @@ export async function finishRun<TContext extends object | undefined>(
 	error: OperationError | undefined,
 	options: DriveOptions,
 	recovery: boolean,
+	context: Context,
 ): Promise<TerminalOperationOutcome | undefined> {
 	await lane.breakpoint.hit({
 		kind: "run.finish",
@@ -79,98 +80,117 @@ export async function finishRun<TContext extends object | undefined>(
 	if (deadlineReached(options)) return undefined;
 	try {
 		runtime.assertOpen();
-		const lastResult = await runtime.sessionStorage.mutate(lane.name, async (mutator) => {
-			const restored = await restoreLane(mutator, lane.name);
-			const current = restored.current;
-			if (
-				current === undefined ||
-				current.operation.operationId !== active.operationId ||
-				current.state.kind !== "run"
-			) {
-				throw new SessionInvariantError("Run finish lost operation ownership");
-			}
-			if (
-				current.state.inbox.steer.length !== 0 ||
-				current.state.inbox.followUp.length !== 0 ||
-				current.state.inbox.writes.length !== 0
-			) {
-				throw new RuntimeSliceNotImplemented("finish(run with queued input)");
-			}
-			if (error === undefined) {
-				if (current.state.phase.kind !== "checkpoint" || current.state.phase.continuation.kind !== "may_finish") {
-					throw new SessionInvariantError("Completed run is not at a finish checkpoint");
+		const lastResult = await runtime.sessionStorage.mutate(
+			lane.name,
+			async (mutator) => {
+				const restored = await restoreLane(mutator, lane.name, undefined, context);
+				const current = restored.current;
+				if (
+					current === undefined ||
+					current.operation.operationId !== active.operationId ||
+					current.state.kind !== "run"
+				) {
+					throw new SessionInvariantError("Run finish lost operation ownership");
 				}
-			} else if (current.state.phase.kind !== "failure_drain") {
-				throw new SessionInvariantError("Failed run is not at failure drain");
-			}
-			if (restored.leafId === null) throw new SessionInvariantError("Run cannot finish at the root");
-			const latestAssistantEntryId = current.state.latestAssistantEntryId ?? undefined;
-			const includeFinalAssistant =
-				error === undefined &&
-				current.state.phase.kind === "checkpoint" &&
-				current.state.phase.continuation.kind === "may_finish" &&
-				current.state.phase.continuation.includeFinalAssistant;
-			const result: LaneLastResult =
-				error === undefined
-					? {
-							operationId: active.operationId,
-							kind: "run",
-							outcome: "completed",
-							leafId: restored.leafId,
-							runCompletion: includeFinalAssistant ? "assistant" : "terminated_tools",
-							...(includeFinalAssistant && latestAssistantEntryId !== undefined
-								? { finalAssistantEntryId: latestAssistantEntryId }
-								: {}),
-						}
-					: {
-							operationId: active.operationId,
-							kind: "run",
-							outcome: "failed",
-							leafId: restored.leafId,
-							error,
-							...(latestAssistantEntryId === undefined ? {} : { finalAssistantEntryId: latestAssistantEntryId }),
-						};
-			const [toolArgs, preparations] = await Promise.all([
-				mutator.listRegisters("op.tool_args", `${active.operationId}:`),
-				mutator.listRegisters("op.preparation", `${active.operationId}:`),
-			]);
-			const pendingIds = [
-				...current.state.inbox.steer,
-				...current.state.inbox.followUp,
-				...current.state.inbox.writes,
-				...(current.state.control.status === "cancel_requested"
-					? [...current.state.control.drainedSteer, ...current.state.control.drainedFollowUp]
-					: []),
-			];
-			await mutator.commit({
-				writes: [
-					{ kind: "register", op: "delete", namespace: "op.meta", key: active.operationId },
-					{ kind: "register", op: "delete", namespace: "op.state", key: active.operationId },
-					...toolArgs.map(
-						(register) =>
-							({ kind: "register", op: "delete", namespace: "op.tool_args", key: register.key }) as const,
-					),
-					...preparations.map(
-						(register) =>
-							({ kind: "register", op: "delete", namespace: "op.preparation", key: register.key }) as const,
-					),
-					...pendingIds.map(
-						(id) => ({ kind: "register", op: "delete", namespace: "pending.entry", key: id }) as const,
-					),
-					{ kind: "register", op: "set", namespace: "lane.lastResult", key: lane.name, value: result },
+				if (
+					current.state.inbox.steer.length !== 0 ||
+					current.state.inbox.followUp.length !== 0 ||
+					current.state.inbox.writes.length !== 0
+				) {
+					throw new RuntimeSliceNotImplemented("finish(run with queued input)");
+				}
+				if (error === undefined) {
+					if (
+						current.state.phase.kind !== "checkpoint" ||
+						current.state.phase.continuation.kind !== "may_finish"
+					) {
+						throw new SessionInvariantError("Completed run is not at a finish checkpoint");
+					}
+				} else if (current.state.phase.kind !== "failure_drain") {
+					throw new SessionInvariantError("Failed run is not at failure drain");
+				}
+				if (restored.leafId === null) throw new SessionInvariantError("Run cannot finish at the root");
+				const latestAssistantEntryId = current.state.latestAssistantEntryId ?? undefined;
+				const includeFinalAssistant =
+					error === undefined &&
+					current.state.phase.kind === "checkpoint" &&
+					current.state.phase.continuation.kind === "may_finish" &&
+					current.state.phase.continuation.includeFinalAssistant;
+				const result: LaneLastResult =
+					error === undefined
+						? {
+								operationId: active.operationId,
+								kind: "run",
+								outcome: "completed",
+								leafId: restored.leafId,
+								runCompletion: includeFinalAssistant ? "assistant" : "terminated_tools",
+								...(includeFinalAssistant && latestAssistantEntryId !== undefined
+									? { finalAssistantEntryId: latestAssistantEntryId }
+									: {}),
+							}
+						: {
+								operationId: active.operationId,
+								kind: "run",
+								outcome: "failed",
+								leafId: restored.leafId,
+								error,
+								...(latestAssistantEntryId === undefined
+									? {}
+									: { finalAssistantEntryId: latestAssistantEntryId }),
+							};
+				const [toolArgs, preparations] = await Promise.all([
+					mutator.listRegisters("op.tool_args", `${active.operationId}:`, context),
+					mutator.listRegisters("op.preparation", `${active.operationId}:`, context),
+				]);
+				const pendingIds = [
+					...current.state.inbox.steer,
+					...current.state.inbox.followUp,
+					...current.state.inbox.writes,
+					...(current.state.control.status === "cancel_requested"
+						? [...current.state.control.drainedSteer, ...current.state.control.drainedFollowUp]
+						: []),
+				];
+				await mutator.commit(
 					{
-						kind: "register",
-						op: "set",
-						namespace: "lane.state",
-						key: lane.name,
-						value: { ...restored.laneState, currentOperationId: null },
+						writes: [
+							{ kind: "register", op: "delete", namespace: "op.meta", key: active.operationId },
+							{ kind: "register", op: "delete", namespace: "op.state", key: active.operationId },
+							...toolArgs.map(
+								(register) =>
+									({ kind: "register", op: "delete", namespace: "op.tool_args", key: register.key }) as const,
+							),
+							...preparations.map(
+								(register) =>
+									({
+										kind: "register",
+										op: "delete",
+										namespace: "op.preparation",
+										key: register.key,
+									}) as const,
+							),
+							...pendingIds.map(
+								(id) => ({ kind: "register", op: "delete", namespace: "pending.entry", key: id }) as const,
+							),
+							{ kind: "register", op: "set", namespace: "lane.lastResult", key: lane.name, value: result },
+							{
+								kind: "register",
+								op: "set",
+								namespace: "lane.state",
+								key: lane.name,
+								value: { ...restored.laneState, currentOperationId: null },
+							},
+						],
 					},
-				],
-			});
-			return result;
-		});
-		const outcome = await runtime.sessionStorage.mutate(lane.name, (reader) =>
-			hydrateTerminalOutcome(reader, lastResult),
+					context,
+				);
+				return result;
+			},
+			context,
+		);
+		const outcome = await runtime.sessionStorage.mutate(
+			lane.name,
+			(reader) => hydrateTerminalOutcome(reader, lastResult, context),
+			context,
 		);
 		if (outcome.operation !== "run") throw new SessionInvariantError("Run terminal result hydrated as another kind");
 		runtime.attachedOperationIds.delete(active.operationId);
@@ -182,26 +202,32 @@ export async function finishRun<TContext extends object | undefined>(
 				? {}
 				: { finalEntryId: outcome.finalEntryId, finalMessage: outcome.finalMessage };
 		if (outcome.kind === "failed") {
-			await runtime.events.emit({
-				type: "run_end",
-				runId: active.operationId,
-				outcome: "failed",
-				leafId: outcome.leafId,
-				error: outcome.error,
-				...finalFields,
-				lane: lane.name,
-				...(recovery ? { recovery: true as const } : {}),
-			});
+			await runtime.events.emit(
+				{
+					type: "run_end",
+					runId: active.operationId,
+					outcome: "failed",
+					leafId: outcome.leafId,
+					error: outcome.error,
+					...finalFields,
+					lane: lane.name,
+					...(recovery ? { recovery: true as const } : {}),
+				},
+				context,
+			);
 		} else {
-			await runtime.events.emit({
-				type: "run_end",
-				runId: active.operationId,
-				outcome: outcome.kind,
-				leafId: outcome.leafId,
-				...finalFields,
-				lane: lane.name,
-				...(recovery ? { recovery: true as const } : {}),
-			});
+			await runtime.events.emit(
+				{
+					type: "run_end",
+					runId: active.operationId,
+					outcome: outcome.kind,
+					leafId: outcome.leafId,
+					...finalFields,
+					lane: lane.name,
+					...(recovery ? { recovery: true as const } : {}),
+				},
+				context,
+			);
 		}
 		return outcome;
 	} catch (caught) {
@@ -211,6 +237,6 @@ export async function finishRun<TContext extends object | undefined>(
 			caught instanceof HarnessFault
 		)
 			throw caught;
-		throw runtime.fault(caught);
+		throw runtime.fault(caught, context);
 	}
 }

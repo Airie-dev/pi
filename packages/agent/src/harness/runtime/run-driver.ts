@@ -1,5 +1,5 @@
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import { type DriveOptions, type DriveResult, OperationMismatch } from "../agent-harness.ts";
+import { type Context, withAbortSignal } from "../context.ts";
 import type { RestoredLane } from "../restore.ts";
 import { Result } from "../result.ts";
 import { SessionInvariantError } from "../session/session.ts";
@@ -27,9 +27,11 @@ export async function executeDrivePass<TContext extends object | undefined>(
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	options: DriveOptions,
+	context: Context,
 ): Promise<DriveResult> {
-	const initial = await loadExpected(runtime, lane.name, active.operationId, false);
-	if (initial.current === undefined) return settledOrMismatch(runtime, lane.name, active.operationId, initial);
+	const initial = await loadExpected(runtime, lane.name, active.operationId, false, context);
+	if (initial.current === undefined)
+		return settledOrMismatch(runtime, lane.name, active.operationId, initial, context);
 	const resultAtDeadline = (): DriveResult => {
 		const current = initial.current;
 		const state = current?.state;
@@ -85,7 +87,6 @@ export async function executeDrivePass<TContext extends object | undefined>(
 	const recoveryLifecycle =
 		recovery && (!runtime.resumeEventOperationIds.has(active.operationId) || recoveryPreludeRequired);
 	return startHarnessSpan(
-		runtime.telemetryContext,
 		"pi.harness.run",
 		{
 			"pi.session.id": runtime.sessionStorage.metadata.id,
@@ -94,7 +95,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 			"pi.operation.recovery": recoveryLifecycle,
 			"pi.operation.kind": "run",
 		},
-		async (runSpan) => {
+		async (runSpan, runContext) => {
 			const resultAtRunDeadline = (): DriveResult => {
 				const result = resultAtDeadline();
 				if (result.ok && result.value.kind === "waiting") {
@@ -104,7 +105,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 			};
 			if (recovery) {
 				if (!runtime.resumedOperationIds.has(active.operationId)) {
-					const resumed = await resumeRun(runtime, lane, active, initial, options);
+					const resumed = await resumeRun(runtime, lane, active, initial, options, runContext);
 					if (!resumed) return resultAtRunDeadline();
 					runtime.resumedOperationIds.add(active.operationId);
 				}
@@ -115,7 +116,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 					}
 					return resultAtRunDeadline();
 				}
-				const recovered = await recoverRunAtActivation(runtime, lane, active, runSpan, options);
+				const recovered = await recoverRunAtActivation(runtime, lane, active, runContext, options);
 				if (recovered.kind === "yielded") {
 					return Result.ok({ kind: "yielded", operationId: active.operationId });
 				}
@@ -132,9 +133,9 @@ export async function executeDrivePass<TContext extends object | undefined>(
 				runtime.restoredSuspensions.delete(lane.name);
 			}
 			while (true) {
-				const restored = await loadExpected(runtime, lane.name, active.operationId, true);
+				const restored = await loadExpected(runtime, lane.name, active.operationId, true, runContext);
 				if (restored.current === undefined) {
-					const terminal = await settledOrMismatch(runtime, lane.name, active.operationId, restored);
+					const terminal = await settledOrMismatch(runtime, lane.name, active.operationId, restored, runContext);
 					if (terminal.ok && terminal.value.kind === "settled" && terminal.value.outcome.operation === "run") {
 						const outcome = terminal.value.outcome;
 						runSpan.setAttributes({
@@ -151,7 +152,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 					throw new RuntimeSliceNotImplemented("drive(cancel_requested)");
 				}
 				if (state.phase.kind === "assistant" && state.phase.generation.status === "retry_wait") {
-					const retry = await driveAssistantRetryWait(runtime, lane, active, state, runSpan, options);
+					const retry = await driveAssistantRetryWait(runtime, lane, active, state, runContext, options);
 					if (retry !== "advanced") {
 						if (retry.ok && retry.value.kind === "waiting") {
 							runSpan.setAttributes({ "pi.operation.outcome": "suspended" });
@@ -164,7 +165,15 @@ export async function executeDrivePass<TContext extends object | undefined>(
 					if (state.phase.deferred.status !== "suspended") {
 						throw new RuntimeSliceNotImplemented("drive(deferred.effect_pending)");
 					}
-					const waiting = await waitForDeferred(runtime, lane, active, restored, state, recoveryLifecycle);
+					const waiting = await waitForDeferred(
+						runtime,
+						lane,
+						active,
+						restored,
+						state,
+						recoveryLifecycle,
+						runContext,
+					);
 					runSpan.setAttributes({ "pi.operation.outcome": "suspended" });
 					return waiting;
 				}
@@ -177,7 +186,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 							lane,
 							active,
 							state,
-							runSpan,
+							runContext,
 							options,
 							recoveryLifecycle,
 						);
@@ -202,7 +211,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 							active,
 							restored,
 							state,
-							runSpan,
+							runContext,
 							options,
 							recoveryLifecycle,
 						);
@@ -222,18 +231,18 @@ export async function executeDrivePass<TContext extends object | undefined>(
 					}
 					case "tools": {
 						const result = await startHarnessSpan(
-							runSpan,
 							"pi.harness.turn",
 							{
 								"pi.lane.name": lane.name,
 								"pi.operation.id": active.operationId,
 								"pi.turn.id": state.phase.batch.turnId,
 							},
-							(turnSpan) =>
-								executeOrdinaryToolBatch(runtime, lane, active, restored, state, turnSpan, options, {
+							(_turnSpan, turnContext) =>
+								executeOrdinaryToolBatch(runtime, lane, active, restored, state, turnContext, options, {
 									eventOrigin: recoveryLifecycle ? "recovery" : "live",
 									turn: "not_started",
 								}),
+							runContext,
 						);
 						if (result.kind === "yielded") {
 							return Result.ok({ kind: "yielded", operationId: active.operationId });
@@ -256,7 +265,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 							lane,
 							active,
 							state,
-							runSpan,
+							runContext,
 							options,
 							recoveryLifecycle,
 						);
@@ -279,6 +288,7 @@ export async function executeDrivePass<TContext extends object | undefined>(
 				}
 			}
 		},
+		context,
 	);
 }
 
@@ -288,13 +298,17 @@ async function resumeRun<TContext extends object | undefined>(
 	active: ActiveOperation,
 	restored: RestoredLane,
 	options: DriveOptions,
+	context: Context,
 ): Promise<boolean> {
 	const current = restored.current;
 	if (current === undefined || current.operation.intent.kind !== "run") {
 		throw new SessionInvariantError("Run resume is missing run metadata");
 	}
 	if (!runtime.resumeEventOperationIds.has(active.operationId)) {
-		await runtime.events.emit({ type: "run_resume", runId: active.operationId, lane: lane.name, recovery: true });
+		await runtime.events.emit(
+			{ type: "run_resume", runId: active.operationId, lane: lane.name, recovery: true },
+			context,
+		);
 		runtime.resumeEventOperationIds.add(active.operationId);
 	}
 	if (!runtime.hooks.has("before_resume")) return true;
@@ -321,6 +335,7 @@ async function resumeRun<TContext extends object | undefined>(
 		},
 		current.operation.intent.resumeData ?? {},
 		active.effectGate,
+		withAbortSignal(active.effectGate.context.abortSignal!, context),
 	);
 	return true;
 }
@@ -329,10 +344,10 @@ async function recoverRunAtActivation<TContext extends object | undefined>(
 	runtime: RuntimeProcedureContext<TContext>,
 	lane: RuntimeLane,
 	active: ActiveOperation,
-	runTelemetry: TelemetryContext,
+	context: Context,
 	options: DriveOptions,
 ): Promise<ToolBatchExecutionResult> {
-	const restored = await loadExpected(runtime, lane.name, active.operationId, true);
+	const restored = await loadExpected(runtime, lane.name, active.operationId, true, context);
 	const current = restored.current;
 	if (current === undefined || current.state.kind !== "run") return { kind: "advanced" };
 	const runState = current.state;
@@ -341,18 +356,19 @@ async function recoverRunAtActivation<TContext extends object | undefined>(
 	switch (runState.phase.kind) {
 		case "tools":
 			return startHarnessSpan(
-				runTelemetry,
 				"pi.harness.turn",
 				{
 					"pi.lane.name": lane.name,
 					"pi.operation.id": active.operationId,
 					"pi.turn.id": runState.phase.batch.turnId,
 				},
-				(turnSpan) => recoverToolBatchAtActivation(runtime, lane, active, restored, runState, turnSpan, options),
+				(_turnSpan, turnContext) =>
+					recoverToolBatchAtActivation(runtime, lane, active, restored, runState, turnContext, options),
+				context,
 			);
 		case "assistant":
 			if (runState.phase.generation.status !== "effect_pending") return { kind: "advanced" };
-			return recoverAssistantAtActivation(runtime, lane, active, runState, runTelemetry, options);
+			return recoverAssistantAtActivation(runtime, lane, active, runState, context, options);
 		default:
 			return { kind: "advanced" };
 	}
@@ -363,17 +379,20 @@ async function settledOrMismatch<TContext extends object | undefined>(
 	lane: string,
 	operationId: string,
 	restored: RestoredLane,
+	context: Context,
 ): Promise<DriveResult> {
 	if (restored.lastResult?.operationId !== operationId) {
 		return Result.err(mismatch(lane, operationId, restored));
 	}
 	try {
-		const outcome = await runtime.sessionStorage.mutate(lane, (reader) =>
-			hydrateTerminalOutcome(reader, restored.lastResult!),
+		const outcome = await runtime.sessionStorage.mutate(
+			lane,
+			(reader) => hydrateTerminalOutcome(reader, restored.lastResult!, context),
+			context,
 		);
 		return Result.ok({ kind: "settled", operationId, outcome });
 	} catch (error) {
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 }
 

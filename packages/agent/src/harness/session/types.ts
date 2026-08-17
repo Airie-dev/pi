@@ -2,6 +2,7 @@ import type { AssistantMessage, StopReason, Usage } from "@earendil-works/pi-ai"
 import type { AgentMessage, QueueMode, ThinkingLevel } from "../../types.ts";
 import type { BranchPreparation } from "../compaction/branch-summarization.ts";
 import type { CompactionPreparation, CompactionSettings } from "../compaction/compaction.ts";
+import type { Context } from "../context.ts";
 import type { AgentHarnessStreamOptions } from "../types.ts";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -53,7 +54,10 @@ export interface CustomEntry extends EntryBase {
 }
 
 /** Convert an application-defined custom entry into model context. */
-export type EntryProjector = (entry: CustomEntry) => AgentMessage[] | undefined | Promise<AgentMessage[] | undefined>;
+export type EntryProjector = (
+	entry: CustomEntry,
+	context: Context,
+) => AgentMessage[] | undefined | Promise<AgentMessage[] | undefined>;
 
 export type Entry = MessageEntry | CompactionEntry | BranchSummaryEntry | CustomEntry;
 
@@ -471,22 +475,24 @@ export interface SessionStats {
 }
 
 export interface Storage {
-	commit(transaction: Transaction): Promise<CommitResult>;
-	getEntries(ids: string[]): Promise<Map<string, Entry>>;
+	commit(transaction: Transaction, context: Context): Promise<CommitResult>;
+	getEntries(ids: string[], context: Context): Promise<Map<string, Entry>>;
 	getRegister<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
 		key: string,
+		context: Context,
 	): Promise<Register<TNamespace> | undefined>;
 	listRegisters<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
-		keyPrefix?: string,
+		keyPrefix: string | undefined,
+		context: Context,
 	): Promise<Register<TNamespace>[]>;
-	scanBranch(query: StorageBranchScan): Promise<Entry[]>;
-	scanBranchStructure(query: StorageBranchScan): Promise<EntryStructure[]>;
-	scanEntries(query: EntryScan): Promise<Entry[]>;
-	scanUsage(query: UsageScan): Promise<UsageRow[]>;
-	getStats(): Promise<SessionStats>;
-	close(): Promise<void>;
+	scanBranch(query: StorageBranchScan, context: Context): Promise<Entry[]>;
+	scanBranchStructure(query: StorageBranchScan, context: Context): Promise<EntryStructure[]>;
+	scanEntries(query: EntryScan, context: Context): Promise<Entry[]>;
+	scanUsage(query: UsageScan, context: Context): Promise<UsageRow[]>;
+	getStats(context: Context): Promise<SessionStats>;
+	close(context: Context): Promise<void>;
 }
 
 export interface SessionMetadata {
@@ -511,14 +517,16 @@ export interface EntryQuery {
 }
 
 export interface SessionReader {
-	getEntries(ids: string[]): Promise<Map<string, Entry>>;
+	getEntries(ids: string[], context: Context): Promise<Map<string, Entry>>;
 	getRegister<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
 		key: string,
+		context: Context,
 	): Promise<Register<TNamespace> | undefined>;
 	listRegisters<TNamespace extends RegisterNamespace>(
 		namespace: TNamespace,
-		keyPrefix?: string,
+		keyPrefix: string | undefined,
+		context: Context,
 	): Promise<Register<TNamespace>[]>;
 }
 
@@ -526,34 +534,43 @@ export interface SessionReader {
 export interface SessionMutator extends SessionReader {
 	readonly lane: string;
 	/** The mutation callback's sole commit. A second attempt rejects. */
-	commit(transaction: Transaction): Promise<CommitResult>;
+	commit(transaction: Transaction, context: Context): Promise<CommitResult>;
 }
 
 export interface SessionTree {
-	getLeafId(): Promise<string | null>;
-	getEntry(id: string): Promise<Entry | undefined>;
-	getStats(): Promise<SessionStats>;
-	getName(): Promise<string | undefined>;
-	setName(name: string | undefined): Promise<void>;
-	getLabel(targetId: string): Promise<string | undefined>;
-	setLabel(targetId: string, label: string | undefined): Promise<void>;
-	getCustomFact(key: string): Promise<JsonValue | undefined>;
-	setCustomFact(key: string, value: JsonValue | undefined): Promise<void>;
-	findEntries(query?: EntryQuery): Promise<Entry[]>;
-	findEntry(query?: EntryQuery): Promise<Entry | undefined>;
-	findEntriesOnBranch(query?: BranchScan): Promise<Entry[]>;
-	findEntryOnBranch(query?: BranchScan): Promise<Entry | undefined>;
-	appendMessage(message: AgentMessage): Promise<string>;
-	appendCustomEntry(customType: string, data?: JsonValue): Promise<string>;
+	getLeafId(context: Context): Promise<string | null>;
+	getEntry(id: string, context: Context): Promise<Entry | undefined>;
+	getStats(context: Context): Promise<SessionStats>;
+	getName(context: Context): Promise<string | undefined>;
+	setName(name: string | undefined, context: Context): Promise<void>;
+	getLabel(targetId: string, context: Context): Promise<string | undefined>;
+	setLabel(targetId: string, label: string | undefined, context: Context): Promise<void>;
+	getCustomFact(key: string, context: Context): Promise<JsonValue | undefined>;
+	setCustomFact(key: string, value: JsonValue | undefined, context: Context): Promise<void>;
+	findEntries(query: EntryQuery | undefined, context: Context): Promise<Entry[]>;
+	findEntry(query: EntryQuery | undefined, context: Context): Promise<Entry | undefined>;
+	findEntriesOnBranch(query: BranchScan | undefined, context: Context): Promise<Entry[]>;
+	findEntryOnBranch(query: BranchScan | undefined, context: Context): Promise<Entry | undefined>;
+	appendMessage(message: AgentMessage, context: Context): Promise<string>;
+	appendCustomEntry(customType: string, data: JsonValue | undefined, context: Context): Promise<string>;
 }
 
 export interface Session<TMetadata extends SessionMetadata = SessionMetadata> extends SessionTree, SessionReader {
 	readonly metadata: TMetadata;
 	readonly idGenerator: IdGenerator;
 	view(lane: string): SessionTree;
-	mutate<T>(lane: string, mutation: (mutator: SessionMutator) => T | Promise<T>): Promise<T>;
-	createLane(name: string, at: string | null, configuration: LaneConfiguration): Promise<SessionTree>;
-	close(): Promise<void>;
+	mutate<T>(
+		lane: string,
+		mutation: (mutator: SessionMutator, context: Context) => T | Promise<T>,
+		context: Context,
+	): Promise<T>;
+	createLane(
+		name: string,
+		at: string | null,
+		configuration: LaneConfiguration,
+		context: Context,
+	): Promise<SessionTree>;
+	close(context: Context): Promise<void>;
 }
 
 export interface SessionCreateOptions {
@@ -596,9 +613,9 @@ export interface SessionRepo<
 	TCreateOptions extends { id?: string; parentSessionId?: string } = SessionCreateOptions,
 	TListOptions = void,
 > {
-	create(options: TCreateOptions): Promise<Session<TMetadata>>;
-	open(metadata: TMetadata): Promise<Session<TMetadata>>;
-	list(options?: TListOptions): Promise<TMetadata[]>;
-	delete(metadata: TMetadata): Promise<void>;
-	fork(source: TMetadata, options: ForkOptions): Promise<Session<TMetadata>>;
+	create(options: TCreateOptions, context: Context): Promise<Session<TMetadata>>;
+	open(metadata: TMetadata, context: Context): Promise<Session<TMetadata>>;
+	list(options: TListOptions | undefined, context: Context): Promise<TMetadata[]>;
+	delete(metadata: TMetadata, context: Context): Promise<void>;
+	fork(source: TMetadata, options: ForkOptions, context: Context): Promise<Session<TMetadata>>;
 }

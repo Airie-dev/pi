@@ -1,5 +1,5 @@
-import type { TelemetryContext } from "@earendil-works/pi-telemetry";
 import type { BeforeResumePrepared, HookHandler, HookInvocation, HookMap, HookName, Hooks } from "./agent-harness.ts";
+import type { Context } from "./context.ts";
 import type { EffectGate } from "./execution/effect-gate.ts";
 import type { JsonValue } from "./session/types.ts";
 import { startHarnessSpan } from "./telemetry.ts";
@@ -7,10 +7,10 @@ import type { AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch } from "
 
 interface HookRegistration {
 	id?: string;
-	handler: (event: unknown) => unknown | Promise<unknown>;
+	handler: (event: unknown, context: Context) => unknown | Promise<unknown>;
 }
 
-type HookErrorReporter = (error: Error, hook: HookName, lane: string) => void | Promise<void>;
+type HookErrorReporter = (error: Error, hook: HookName, lane: string, context: Context) => void | Promise<void>;
 
 export interface BeforeRunAggregate {
 	result: HookMap["before_run"]["result"];
@@ -38,7 +38,7 @@ export class HookRegistry implements Hooks {
 		}
 		const registration: HookRegistration = {
 			...(options.id === undefined ? {} : { id: options.id }),
-			handler: (event) => handler(event as HookInvocation<TName>),
+			handler: (event, context) => handler(event as HookInvocation<TName>, context),
 		};
 		registrations.push(registration);
 		this.registrations.set(name, registrations);
@@ -57,9 +57,10 @@ export class HookRegistry implements Hooks {
 		name: TName,
 		event: HookInvocation<TName>,
 		effectGate: EffectGate,
+		context: Context,
 	): Promise<HookMap[TName]["result"]> {
 		effectGate.assertOpen();
-		return this.runAdmitted(name, event);
+		return this.runAdmitted(name, event, context);
 	}
 
 	/** Invoke a tool-hook aggregate with one telemetry span per registered handler. */
@@ -67,13 +68,13 @@ export class HookRegistry implements Hooks {
 		name: TName,
 		event: HookInvocation<TName>,
 		effectGate: EffectGate,
-		telemetryContext: TelemetryContext,
+		context: Context,
 	): Promise<HookMap[TName]["result"]> {
 		effectGate.assertOpen();
 		return (
 			name === "before_tool"
-				? this.beforeTool(event as HookInvocation<"before_tool">, telemetryContext)
-				: this.afterTool(event as HookInvocation<"after_tool">, telemetryContext)
+				? this.beforeTool(event as HookInvocation<"before_tool">, context)
+				: this.afterTool(event as HookInvocation<"after_tool">, context)
 		) as Promise<HookMap[TName]["result"]>;
 	}
 
@@ -81,9 +82,10 @@ export class HookRegistry implements Hooks {
 	runBeforeAcceptanceWithResumeData(
 		event: HookInvocation<"before_run">,
 		assertHarnessOpen: () => void,
+		context: Context,
 	): Promise<BeforeRunAggregate> {
 		assertHarnessOpen();
-		return this.beforeRunAggregate(event);
+		return this.beforeRunAggregate(event, context);
 	}
 
 	/** Give each before_resume handler only the restart data written by its matching before_run id. */
@@ -91,9 +93,10 @@ export class HookRegistry implements Hooks {
 		event: BeforeResumePrepared & { lane: string; runId: string },
 		resumeData: Readonly<Record<string, JsonValue>>,
 		effectGate: EffectGate,
+		context: Context,
 	): Promise<void> {
 		effectGate.assertOpen();
-		return this.beforeResumeAdmitted(event, resumeData);
+		return this.beforeResumeAdmitted(event, resumeData, context);
 	}
 
 	close(error: Error): void {
@@ -103,58 +106,70 @@ export class HookRegistry implements Hooks {
 	private async runAdmitted<TName extends HookName>(
 		name: TName,
 		event: HookInvocation<TName>,
+		context: Context,
 	): Promise<HookMap[TName]["result"]> {
 		if (this.closedError !== undefined) throw this.closedError;
-		const result = await this.aggregate(name, event);
+		const result = await this.aggregate(name, event, context);
 		return result as HookMap[TName]["result"];
 	}
 
-	private async aggregate(name: HookName, event: HookInvocation<HookName>): Promise<unknown> {
+	private async aggregate(name: HookName, event: HookInvocation<HookName>, context: Context): Promise<unknown> {
 		switch (name) {
 			case "before_run":
-				return (await this.beforeRunAggregate(event as HookInvocation<"before_run">)).result;
+				return (await this.beforeRunAggregate(event as HookInvocation<"before_run">, context)).result;
 			case "before_resume":
-				await this.invokeAll(name, event, () => {});
+				await this.invokeAll(name, event, () => {}, context);
 				return undefined;
 			case "before_run_end": {
 				let followUp: string | undefined;
-				await this.invokeAll(name, event, (value) => {
-					const result = value as HookMap["before_run_end"]["result"];
-					if (result?.followUp !== undefined) followUp = result.followUp;
-				});
+				await this.invokeAll(
+					name,
+					event,
+					(value) => {
+						const result = value as HookMap["before_run_end"]["result"];
+						if (result?.followUp !== undefined) followUp = result.followUp;
+					},
+					context,
+				);
 				return followUp === undefined ? undefined : { followUp };
 			}
 			case "transform_context":
-				return this.transformContext(event as HookInvocation<"transform_context">);
+				return this.transformContext(event as HookInvocation<"transform_context">, context);
 			case "before_request":
-				return this.beforeRequest(event as HookInvocation<"before_request">);
+				return this.beforeRequest(event as HookInvocation<"before_request">, context);
 			case "before_payload":
-				return this.beforePayload(event as HookInvocation<"before_payload">);
+				return this.beforePayload(event as HookInvocation<"before_payload">, context);
 			case "after_response":
-				return this.afterResponse(event as HookInvocation<"after_response">);
+				return this.afterResponse(event as HookInvocation<"after_response">, context);
 			case "before_tool":
-				return this.beforeTool(event as HookInvocation<"before_tool">);
+				return this.beforeTool(event as HookInvocation<"before_tool">, context);
 			case "after_tool":
-				return this.afterTool(event as HookInvocation<"after_tool">);
+				return this.afterTool(event as HookInvocation<"after_tool">, context);
 			case "before_compaction":
-				return this.firstStructural(name, event as HookInvocation<"before_compaction">, "compaction");
+				return this.firstStructural(name, event as HookInvocation<"before_compaction">, "compaction", context);
 			case "before_navigation":
-				return this.firstStructural(name, event as HookInvocation<"before_navigation">, "summary");
+				return this.firstStructural(name, event as HookInvocation<"before_navigation">, "summary", context);
 		}
 	}
 
-	private async beforeRunAggregate(event: HookInvocation<"before_run">): Promise<BeforeRunAggregate> {
+	private async beforeRunAggregate(
+		event: HookInvocation<"before_run">,
+		context: Context,
+	): Promise<BeforeRunAggregate> {
 		let prompt = event.prompt;
 		let systemPrompt = event.systemPrompt;
 		let injected: HookMap["before_run"]["event"]["prompt"] = [];
 		const resumeData = Object.create(null) as Record<string, JsonValue>;
 		for (const registration of this.registrationsFor("before_run")) {
 			try {
-				const result = (await registration.handler({
-					...event,
-					prompt,
-					systemPrompt,
-				})) as HookMap["before_run"]["result"];
+				const result = (await registration.handler(
+					{
+						...event,
+						prompt,
+						systemPrompt,
+					},
+					context,
+				)) as HookMap["before_run"]["result"];
 				if (result?.messages !== undefined) {
 					injected = [...injected, ...result.messages];
 					prompt = [...prompt, ...result.messages];
@@ -162,7 +177,12 @@ export class HookRegistry implements Hooks {
 				if (result?.systemPrompt !== undefined) systemPrompt = result.systemPrompt;
 				if (result?.resumeData !== undefined) resumeData[registration.id!] = result.resumeData;
 			} catch (error) {
-				await this.reportError(error instanceof Error ? error : new Error(String(error)), "before_run", event.lane);
+				await this.reportError(
+					error instanceof Error ? error : new Error(String(error)),
+					"before_run",
+					event.lane,
+					context,
+				);
 			}
 		}
 		return {
@@ -177,6 +197,7 @@ export class HookRegistry implements Hooks {
 	private async beforeResumeAdmitted(
 		event: BeforeResumePrepared & { lane: string; runId: string },
 		resumeData: Readonly<Record<string, JsonValue>>,
+		context: Context,
 	): Promise<void> {
 		if (this.closedError !== undefined) throw this.closedError;
 		for (const registration of this.registrationsFor("before_resume")) {
@@ -185,15 +206,19 @@ export class HookRegistry implements Hooks {
 					registration.id !== undefined && Object.hasOwn(resumeData, registration.id)
 						? resumeData[registration.id]
 						: undefined;
-				await registration.handler({
-					...event,
-					...(data === undefined ? {} : { resumeData: data }),
-				});
+				await registration.handler(
+					{
+						...event,
+						...(data === undefined ? {} : { resumeData: data }),
+					},
+					context,
+				);
 			} catch (error) {
 				await this.reportError(
 					error instanceof Error ? error : new Error(String(error)),
 					"before_resume",
 					event.lane,
+					context,
 				);
 			}
 		}
@@ -201,7 +226,7 @@ export class HookRegistry implements Hooks {
 
 	private async beforeTool(
 		event: HookInvocation<"before_tool">,
-		telemetryContext?: TelemetryContext,
+		context: Context,
 	): Promise<HookMap["before_tool"]["result"]> {
 		let args = event.args;
 		let block: { reason: string; terminate?: boolean } | undefined;
@@ -211,7 +236,7 @@ export class HookRegistry implements Hooks {
 					"before_tool",
 					registration,
 					{ ...event, args },
-					telemetryContext,
+					context,
 				)) as HookMap["before_tool"]["result"];
 				if (result?.args !== undefined) args = result.args;
 				if (result?.block !== undefined) {
@@ -220,7 +245,7 @@ export class HookRegistry implements Hooks {
 				}
 			} catch (error) {
 				const normalized = error instanceof Error ? error : new Error(String(error));
-				await this.reportError(normalized, "before_tool", event.lane);
+				await this.reportError(normalized, "before_tool", event.lane, context);
 				block = { reason: normalized.message };
 				break;
 			}
@@ -233,35 +258,46 @@ export class HookRegistry implements Hooks {
 
 	private async transformContext(
 		event: HookInvocation<"transform_context">,
+		context: Context,
 	): Promise<HookMap["transform_context"]["result"]> {
 		let messages = event.messages;
 		for (const registration of this.registrationsFor("transform_context")) {
 			try {
-				const result = (await registration.handler({
-					...event,
-					messages,
-				})) as HookMap["transform_context"]["result"];
+				const result = (await registration.handler(
+					{
+						...event,
+						messages,
+					},
+					context,
+				)) as HookMap["transform_context"]["result"];
 				if (result?.messages !== undefined) messages = result.messages;
 			} catch (error) {
 				await this.reportError(
 					error instanceof Error ? error : new Error(String(error)),
 					"transform_context",
 					event.lane,
+					context,
 				);
 			}
 		}
 		return { messages };
 	}
 
-	private async beforeRequest(event: HookInvocation<"before_request">): Promise<HookMap["before_request"]["result"]> {
+	private async beforeRequest(
+		event: HookInvocation<"before_request">,
+		context: Context,
+	): Promise<HookMap["before_request"]["result"]> {
 		let streamOptions = event.streamOptions;
 		let changed = false;
 		for (const registration of this.registrationsFor("before_request")) {
 			try {
-				const result = (await registration.handler({
-					...event,
-					streamOptions,
-				})) as HookMap["before_request"]["result"];
+				const result = (await registration.handler(
+					{
+						...event,
+						streamOptions,
+					},
+					context,
+				)) as HookMap["before_request"]["result"];
 				if (result?.streamOptions !== undefined) {
 					streamOptions = applyStreamOptionsPatch(streamOptions, result.streamOptions);
 					changed = true;
@@ -271,40 +307,55 @@ export class HookRegistry implements Hooks {
 					error instanceof Error ? error : new Error(String(error)),
 					"before_request",
 					event.lane,
+					context,
 				);
 			}
 		}
 		return changed ? { streamOptions: createStreamOptionsPatch(event.streamOptions, streamOptions) } : undefined;
 	}
 
-	private async beforePayload(event: HookInvocation<"before_payload">): Promise<HookMap["before_payload"]["result"]> {
+	private async beforePayload(
+		event: HookInvocation<"before_payload">,
+		context: Context,
+	): Promise<HookMap["before_payload"]["result"]> {
 		let payload = event.payload;
 		for (const registration of this.registrationsFor("before_payload")) {
 			try {
-				const result = (await registration.handler({ ...event, payload })) as HookMap["before_payload"]["result"];
+				const result = (await registration.handler(
+					{ ...event, payload },
+					context,
+				)) as HookMap["before_payload"]["result"];
 				if (result?.payload !== undefined) payload = result.payload;
 			} catch (error) {
 				await this.reportError(
 					error instanceof Error ? error : new Error(String(error)),
 					"before_payload",
 					event.lane,
+					context,
 				);
 			}
 		}
 		return { payload };
 	}
 
-	private async afterResponse(event: HookInvocation<"after_response">): Promise<HookMap["after_response"]["result"]> {
+	private async afterResponse(
+		event: HookInvocation<"after_response">,
+		context: Context,
+	): Promise<HookMap["after_response"]["result"]> {
 		let message = event.message;
 		for (const registration of this.registrationsFor("after_response")) {
 			try {
-				const result = (await registration.handler({ ...event, message })) as HookMap["after_response"]["result"];
+				const result = (await registration.handler(
+					{ ...event, message },
+					context,
+				)) as HookMap["after_response"]["result"];
 				if (result?.message !== undefined) message = result.message;
 			} catch (error) {
 				await this.reportError(
 					error instanceof Error ? error : new Error(String(error)),
 					"after_response",
 					event.lane,
+					context,
 				);
 			}
 		}
@@ -313,7 +364,7 @@ export class HookRegistry implements Hooks {
 
 	private async afterTool(
 		event: HookInvocation<"after_tool">,
-		telemetryContext?: TelemetryContext,
+		context: Context,
 	): Promise<HookMap["after_tool"]["result"]> {
 		let current = {
 			content: event.content,
@@ -328,7 +379,7 @@ export class HookRegistry implements Hooks {
 					"after_tool",
 					registration,
 					{ ...event, ...current },
-					telemetryContext,
+					context,
 				)) as HookMap["after_tool"]["result"];
 				if (result === undefined) continue;
 				if (result.content !== undefined) aggregate.content = result.content;
@@ -343,7 +394,12 @@ export class HookRegistry implements Hooks {
 					usage: result.usage === undefined ? current.usage : result.usage,
 				};
 			} catch (error) {
-				await this.reportError(error instanceof Error ? error : new Error(String(error)), "after_tool", event.lane);
+				await this.reportError(
+					error instanceof Error ? error : new Error(String(error)),
+					"after_tool",
+					event.lane,
+					context,
+				);
 			}
 		}
 		return Object.keys(aggregate).length === 0 ? undefined : aggregate;
@@ -353,10 +409,11 @@ export class HookRegistry implements Hooks {
 		name: "before_compaction" | "before_navigation",
 		event: HookInvocation<"before_compaction"> | HookInvocation<"before_navigation">,
 		resultField: "compaction" | "summary",
+		context: Context,
 	): Promise<unknown> {
 		for (const registration of this.registrationsFor(name)) {
 			try {
-				const value = await registration.handler(event);
+				const value = await registration.handler(event, context);
 				if (value === undefined || value === null || typeof value !== "object") continue;
 				const result = value as Record<string, unknown>;
 				if (result.decline === true && result[resultField] !== undefined) {
@@ -364,12 +421,18 @@ export class HookRegistry implements Hooks {
 						new Error(`${name} hook cannot return both decline and ${resultField}`),
 						name,
 						event.lane,
+						context,
 					);
 					continue;
 				}
 				if (result.decline === true || result[resultField] !== undefined) return value;
 			} catch (error) {
-				await this.reportError(error instanceof Error ? error : new Error(String(error)), name, event.lane);
+				await this.reportError(
+					error instanceof Error ? error : new Error(String(error)),
+					name,
+					event.lane,
+					context,
+				);
 			}
 		}
 		return undefined;
@@ -379,11 +442,9 @@ export class HookRegistry implements Hooks {
 		name: "before_tool" | "after_tool",
 		registration: HookRegistration,
 		event: HookInvocation<"before_tool"> | HookInvocation<"after_tool">,
-		telemetryContext: TelemetryContext | undefined,
+		context: Context,
 	): Promise<unknown> {
-		if (telemetryContext === undefined) return Promise.resolve(registration.handler(event));
 		return startHarnessSpan(
-			telemetryContext,
 			"pi.harness.hook",
 			{
 				"pi.lane.name": event.lane,
@@ -391,9 +452,9 @@ export class HookRegistry implements Hooks {
 				"pi.hook.name": name,
 				...(registration.id === undefined ? {} : { "pi.hook.registration_id": registration.id }),
 			},
-			async (span) => {
+			async (span, spanContext) => {
 				try {
-					const result = await registration.handler(event);
+					const result = await registration.handler(event, spanContext);
 					const blocked =
 						name === "before_tool" &&
 						result !== null &&
@@ -408,6 +469,7 @@ export class HookRegistry implements Hooks {
 					throw error;
 				}
 			},
+			context,
 		);
 	}
 
@@ -419,12 +481,18 @@ export class HookRegistry implements Hooks {
 		name: HookName,
 		event: HookInvocation<HookName>,
 		apply: (value: unknown) => void,
+		context: Context,
 	): Promise<void> {
 		for (const registration of this.registrationsFor(name)) {
 			try {
-				apply(await registration.handler(event));
+				apply(await registration.handler(event, context));
 			} catch (error) {
-				await this.reportError(error instanceof Error ? error : new Error(String(error)), name, event.lane);
+				await this.reportError(
+					error instanceof Error ? error : new Error(String(error)),
+					name,
+					event.lane,
+					context,
+				);
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 import { type Api, createModels, fauxProvider, type Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { HarnessClosed } from "../../../src/harness/agent-harness.ts";
+import { BACKGROUND_CONTEXT } from "../../../src/harness/context.ts";
 import { Lane } from "../../../src/harness/runtime2/lane.ts";
 import { restoreLane } from "../../../src/harness/runtime2/restore.ts";
 import { StorageBackedSession } from "../../../src/harness/session/session.ts";
@@ -26,20 +27,26 @@ async function createLane(): Promise<{
 		storage,
 	);
 	sessions.push(session);
-	await session.mutate("main", (mutator) =>
-		mutator.commit({
-			writes: [
-				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
-				{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration },
+	await session.mutate(
+		"main",
+		(mutator) =>
+			mutator.commit(
 				{
-					kind: "register",
-					op: "set",
-					namespace: "lane.state",
-					key: "main",
-					value: { currentOperationId: null, pendingNextRun: [] },
+					writes: [
+						{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
+						{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration },
+						{
+							kind: "register",
+							op: "set",
+							namespace: "lane.state",
+							key: "main",
+							value: { currentOperationId: null, pendingNextRun: [] },
+						},
+					],
 				},
-			],
-		}),
+				BACKGROUND_CONTEXT,
+			),
+		BACKGROUND_CONTEXT,
 	);
 	const faux = fauxProvider();
 	const models = createModels();
@@ -49,7 +56,7 @@ async function createLane(): Promise<{
 			"main",
 			session,
 			models,
-			await restoreLane(session, "main"),
+			await restoreLane(session, "main", BACKGROUND_CONTEXT),
 			(cause) => (cause instanceof Error ? cause : new Error(String(cause))),
 			() => Promise.resolve(),
 		),
@@ -83,11 +90,11 @@ function setThinkingLevel(
 			next,
 			materialize: () => thinkingLevel,
 		};
-	});
+	}, BACKGROUND_CONTEXT);
 }
 
 afterEach(async () => {
-	for (const session of sessions.splice(0)) await session.close();
+	for (const session of sessions.splice(0)) await session.close(BACKGROUND_CONTEXT);
 });
 
 describe("runtime2 Lane commands", () => {
@@ -95,14 +102,14 @@ describe("runtime2 Lane commands", () => {
 		const { lane, model, session } = await createLane();
 		const activeToolNames = ["read"];
 
-		await lane.setModel(model);
-		await lane.setThinkingLevel("high");
-		await lane.setActiveTools(activeToolNames);
+		await lane.setModel(model, BACKGROUND_CONTEXT);
+		await lane.setThinkingLevel("high", BACKGROUND_CONTEXT);
+		await lane.setActiveTools(activeToolNames, BACKGROUND_CONTEXT);
 
-		expect(await lane.getModel()).toBe(model);
-		expect(await lane.getThinkingLevel()).toBe("high");
-		expect(await lane.getActiveTools()).toBe(activeToolNames);
-		expect((await session.getRegister("lane.config", "main"))?.value).toEqual({
+		expect(await lane.getModel(BACKGROUND_CONTEXT)).toBe(model);
+		expect(await lane.getThinkingLevel(BACKGROUND_CONTEXT)).toBe("high");
+		expect(await lane.getActiveTools(BACKGROUND_CONTEXT)).toBe(activeToolNames);
+		expect((await session.getRegister("lane.config", "main", BACKGROUND_CONTEXT))?.value).toEqual({
 			model: { provider: model.provider, modelId: model.id },
 			thinkingLevel: "high",
 			activeToolNames,
@@ -118,9 +125,9 @@ describe("runtime2 Lane commands", () => {
 			await releaseCommit.promise;
 		};
 
-		const modelUpdate = lane.setModel(model);
+		const modelUpdate = lane.setModel(model, BACKGROUND_CONTEXT);
 		await commitStarted.promise;
-		const thinkingUpdate = lane.setThinkingLevel("high");
+		const thinkingUpdate = lane.setThinkingLevel("high", BACKGROUND_CONTEXT);
 		releaseCommit.resolve();
 		await Promise.all([modelUpdate, thinkingUpdate]);
 
@@ -136,12 +143,12 @@ describe("runtime2 Lane commands", () => {
 		const completion = deferred();
 		let completed = false;
 		const joined = lane
-			.command(() => ({ kind: "return", result: completion.promise }))
+			.command(() => ({ kind: "return", result: completion.promise }), BACKGROUND_CONTEXT)
 			.then(() => {
 				completed = true;
 			});
 
-		await lane.setThinkingLevel("high");
+		await lane.setThinkingLevel("high", BACKGROUND_CONTEXT);
 		expect(completed).toBe(false);
 		completion.resolve();
 		await joined;
@@ -151,9 +158,11 @@ describe("runtime2 Lane commands", () => {
 		const { lane } = await createLane();
 		const rejection = new Error("declined");
 
-		await expect(lane.command(() => ({ kind: "reject", error: rejection }))).rejects.toBe(rejection);
-		expect(await lane.getLeafId()).toBeNull();
-		await lane.setThinkingLevel("high");
+		await expect(lane.command(() => ({ kind: "reject", error: rejection }), BACKGROUND_CONTEXT)).rejects.toBe(
+			rejection,
+		);
+		expect(await lane.getLeafId(BACKGROUND_CONTEXT)).toBeNull();
+		await lane.setThinkingLevel("high", BACKGROUND_CONTEXT);
 	});
 
 	it("passes bounded reads and commit metadata through the serialized command", async () => {
@@ -162,7 +171,7 @@ describe("runtime2 Lane commands", () => {
 		let memoryPublished = false;
 
 		const commit = await lane.command(async (state, reader) => {
-			storedConfiguration = (await reader.getRegister("lane.config", "main"))?.value;
+			storedConfiguration = (await reader.getRegister("lane.config", "main", BACKGROUND_CONTEXT))?.value;
 			const configuration: LaneConfiguration = { ...state.configuration, thinkingLevel: "high" };
 			const next = { ...state, configuration };
 			return {
@@ -176,7 +185,7 @@ describe("runtime2 Lane commands", () => {
 					return commit;
 				},
 			};
-		});
+		}, BACKGROUND_CONTEXT);
 
 		expect(storedConfiguration).toEqual(configuration);
 		expect(memoryPublished).toBe(true);
@@ -201,11 +210,11 @@ describe("runtime2 Lane commands", () => {
 					next: { ...state, configuration },
 					materialize: async () => undefined,
 				};
-			}),
+			}, BACKGROUND_CONTEXT),
 		).rejects.toThrow("Lane command materialize() must be synchronous");
 
 		expect(lane.state.configuration.thinkingLevel).toBe("high");
-		expect((await session.getRegister("lane.config", "main"))?.value.thinkingLevel).toBe("high");
+		expect((await session.getRegister("lane.config", "main", BACKGROUND_CONTEXT))?.value.thinkingLevel).toBe("high");
 	});
 
 	it("rejects work after sealing while an admitted commit finishes", async () => {
@@ -222,8 +231,8 @@ describe("runtime2 Lane commands", () => {
 		const closed = new HarnessClosed();
 		lane.seal(closed);
 
-		await expect(lane.getLeafId()).rejects.toBe(closed);
-		await expect(lane.setThinkingLevel("low")).rejects.toBe(closed);
+		await expect(lane.getLeafId(BACKGROUND_CONTEXT)).rejects.toBe(closed);
+		await expect(lane.setThinkingLevel("low", BACKGROUND_CONTEXT)).rejects.toBe(closed);
 		releaseCommit.resolve();
 		await admitted;
 		expect(lane.state.configuration.thinkingLevel).toBe("high");
@@ -245,7 +254,7 @@ describe("runtime2 Lane commands", () => {
 		releaseCommit.resolve();
 		expect(await command).toBe("high");
 		expect(lane.state.configuration.thinkingLevel).toBe("high");
-		expect((await session.getRegister("lane.config", "main"))?.value.thinkingLevel).toBe("high");
+		expect((await session.getRegister("lane.config", "main", BACKGROUND_CONTEXT))?.value.thinkingLevel).toBe("high");
 	});
 
 	it("preserves memory when the durable commit fails", async () => {
@@ -258,7 +267,7 @@ describe("runtime2 Lane commands", () => {
 		await expect(setThinkingLevel(lane, "high")).rejects.toBe(failure);
 
 		expect(lane.state.configuration.thinkingLevel).toBe("off");
-		expect((await session.getRegister("lane.config", "main"))?.value.thinkingLevel).toBe("off");
+		expect((await session.getRegister("lane.config", "main", BACKGROUND_CONTEXT))?.value.thinkingLevel).toBe("off");
 	});
 
 	it("plans queued commands from the latest committed memory", async () => {

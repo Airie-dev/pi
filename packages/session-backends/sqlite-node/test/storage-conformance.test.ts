@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
 import {
 	type ConformanceCase,
 	createStorageConformance,
@@ -52,7 +53,7 @@ registerConformance(
 				storage,
 				async [Symbol.asyncDispose]() {
 					try {
-						await storage.close();
+						await storage.close(BACKGROUND_CONTEXT);
 					} finally {
 						db.close();
 					}

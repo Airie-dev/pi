@@ -1,3 +1,4 @@
+import { BACKGROUND_CONTEXT } from "../../../context.ts";
 import type { MessageEntry, NewEntry, Storage, Transaction } from "../../types.ts";
 import { STORAGE_BENCHMARK_DATASETS, type StorageBenchmarkDataset, storageBenchmarkEntryId } from "./datasets.ts";
 
@@ -42,7 +43,8 @@ export function* generateStorageBenchmarkSeedTransactions(dataset: StorageBenchm
 
 /** Seeds one deterministic synthetic linear branch. */
 export async function seedStorageBenchmark(storage: Storage, dataset: StorageBenchmarkDataset): Promise<void> {
-	for (const transaction of generateStorageBenchmarkSeedTransactions(dataset)) await storage.commit(transaction);
+	for (const transaction of generateStorageBenchmarkSeedTransactions(dataset))
+		await storage.commit(transaction, BACKGROUND_CONTEXT);
 }
 
 /** A steady-state read operation run against a pre-seeded fixture. */
@@ -95,7 +97,7 @@ export const STORAGE_READ_BENCHMARK_SCENARIOS: readonly StorageReadBenchmarkScen
 			return dataset.lookupIds.length;
 		},
 		async run(storage, dataset) {
-			return (await storage.getEntries([...dataset.lookupIds])).size;
+			return (await storage.getEntries([...dataset.lookupIds], BACKGROUND_CONTEXT)).size;
 		},
 	},
 	{
@@ -104,7 +106,7 @@ export const STORAGE_READ_BENCHMARK_SCENARIOS: readonly StorageReadBenchmarkScen
 			return Math.min(50, dataset.entryCount);
 		},
 		async run(storage) {
-			return (await storage.scanEntries({ order: "desc", limit: 50 })).length;
+			return (await storage.scanEntries({ order: "desc", limit: 50 }, BACKGROUND_CONTEXT)).length;
 		},
 	},
 	{
@@ -113,7 +115,8 @@ export const STORAGE_READ_BENCHMARK_SCENARIOS: readonly StorageReadBenchmarkScen
 			return dataset.entryCount;
 		},
 		async run(storage, dataset) {
-			return (await storage.scanBranchStructure({ start: dataset.leafId, order: "newestFirst" })).length;
+			return (await storage.scanBranchStructure({ start: dataset.leafId, order: "newestFirst" }, BACKGROUND_CONTEXT))
+				.length;
 		},
 	},
 ];
@@ -124,14 +127,14 @@ export const STORAGE_WRITE_BENCHMARK_SCENARIOS: readonly StorageWriteBenchmarkSc
 		name: "commit one message entry",
 		writeCount: 1,
 		async run(storage) {
-			return (await storage.commit(singleEntryTransaction)).seqs.length;
+			return (await storage.commit(singleEntryTransaction, BACKGROUND_CONTEXT)).seqs.length;
 		},
 	},
 	{
 		name: "commit 100 message entries",
 		writeCount: 100,
 		async run(storage) {
-			return (await storage.commit(hundredEntryTransaction)).seqs.length;
+			return (await storage.commit(hundredEntryTransaction, BACKGROUND_CONTEXT)).seqs.length;
 		},
 	},
 	{
@@ -141,7 +144,7 @@ export const STORAGE_WRITE_BENCHMARK_SCENARIOS: readonly StorageWriteBenchmarkSc
 			return seedStorageBenchmark(storage, WRITE_BASELINE_DATASET);
 		},
 		async run(storage) {
-			return (await storage.commit(mixedAppendTransaction)).seqs.length;
+			return (await storage.commit(mixedAppendTransaction, BACKGROUND_CONTEXT)).seqs.length;
 		},
 	},
 ];

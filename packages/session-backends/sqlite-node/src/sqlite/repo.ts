@@ -1,6 +1,7 @@
 import { access, mkdir, open as openFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type {
+	Context,
 	Entry,
 	ForkOptions,
 	Register,
@@ -269,7 +270,8 @@ export class SqliteSessionRepo {
 		this.now = options.now ?? Date.now;
 	}
 
-	async create(options: SqliteSessionCreateOptions = {}): Promise<SqliteOpenSession> {
+	async create(options: SqliteSessionCreateOptions | undefined, _context: Context): Promise<SqliteOpenSession> {
+		options ??= {};
 		await mkdir(this.directory, { recursive: true });
 		const createdAt = this.now();
 		const id = options.id ?? uuidv7(createdAt);
@@ -320,7 +322,7 @@ export class SqliteSessionRepo {
 		}
 	}
 
-	async open(metadata: SqliteSessionMetadata): Promise<SqliteOpenSession> {
+	async open(metadata: SqliteSessionMetadata, _context: Context): Promise<SqliteOpenSession> {
 		this.reserveId(metadata.id);
 		let db: SqliteDatabase | undefined;
 		let lease: WriterLeaseRow | undefined;
@@ -360,7 +362,7 @@ export class SqliteSessionRepo {
 		}
 	}
 
-	async list(): Promise<SqliteSessionMetadata[]> {
+	async list(_options: undefined, _context: Context): Promise<SqliteSessionMetadata[]> {
 		await mkdir(this.directory, { recursive: true });
 		const names = await readdir(this.directory);
 		const sessions: SqliteSessionMetadata[] = [];
@@ -384,7 +386,7 @@ export class SqliteSessionRepo {
 		return sessions.sort((left, right) => right.createdAt - left.createdAt);
 	}
 
-	async delete(metadata: SqliteSessionMetadata): Promise<void> {
+	async delete(metadata: SqliteSessionMetadata, _context: Context): Promise<void> {
 		if (this.pendingIds.has(metadata.id)) throw new Error(`Session is open: ${metadata.id}`);
 		await access(metadata.path);
 		const db = await this.databaseFactory.open(metadata.path);
@@ -400,12 +402,12 @@ export class SqliteSessionRepo {
 		await removeSessionFiles(metadata.path, { force: false });
 	}
 
-	async fork(source: SqliteSessionMetadata, options: ForkOptions): Promise<SqliteOpenSession> {
+	async fork(source: SqliteSessionMetadata, options: ForkOptions, context: Context): Promise<SqliteOpenSession> {
 		const createdAt = this.now();
 		const id = options.id ?? uuidv7(createdAt);
 		this.reserveId(id);
 		const sourceStorage = this.openStorages.get(source.id);
-		const activeSourceSnapshot = sourceStorage?.snapshot();
+		const activeSourceSnapshot = sourceStorage?.snapshot(undefined, context);
 		await mkdir(this.directory, { recursive: true });
 		const path = sessionPath(this.directory, id);
 		let db: SqliteDatabase | undefined;

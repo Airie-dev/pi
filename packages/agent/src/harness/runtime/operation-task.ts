@@ -1,5 +1,6 @@
 import type { DriveOptions, DriveResult } from "../agent-harness.ts";
 import { HarnessClosed, HarnessFault, OperationMismatch } from "../agent-harness.ts";
+import type { Context } from "../context.ts";
 import { OperationEffectGate } from "../execution/effect-gate.ts";
 import { type RestoredLane, restoreLane } from "../restore.ts";
 import { Result } from "../result.ts";
@@ -31,6 +32,7 @@ export async function driveLane<TContext extends object | undefined>(
 	runtime: OperationTaskContext<TContext>,
 	lane: RuntimeLane,
 	options: DriveOptions,
+	context: Context,
 ): Promise<DriveResult> {
 	const closed = runtime.resultClosedError();
 	if (closed !== undefined) return Result.err(closed);
@@ -42,52 +44,57 @@ export async function driveLane<TContext extends object | undefined>(
 	}
 	let arbitration: DriveArbitration;
 	try {
-		arbitration = await runtime.sessionStorage.mutate(lane.name, async (reader): Promise<DriveArbitration> => {
-			const restored = await restoreLane(reader, lane.name, { includeLastResult: true });
-			const currentId = restored.laneState.currentOperationId;
-			if (currentId === null) {
-				if (restored.lastResult?.operationId === options.operationId) {
-					return {
-						kind: "result",
-						result: Result.ok({
-							kind: "settled",
-							operationId: options.operationId,
-							outcome: await hydrateTerminalOutcome(reader, restored.lastResult),
-						}),
-					};
+		arbitration = await runtime.sessionStorage.mutate(
+			lane.name,
+			async (reader): Promise<DriveArbitration> => {
+				const restored = await restoreLane(reader, lane.name, { includeLastResult: true }, context);
+				const currentId = restored.laneState.currentOperationId;
+				if (currentId === null) {
+					if (restored.lastResult?.operationId === options.operationId) {
+						return {
+							kind: "result",
+							result: Result.ok({
+								kind: "settled",
+								operationId: options.operationId,
+								outcome: await hydrateTerminalOutcome(reader, restored.lastResult, context),
+							}),
+						};
+					}
+					return { kind: "result", result: Result.err(mismatch(lane.name, options.operationId, restored)) };
 				}
-				return { kind: "result", result: Result.err(mismatch(lane.name, options.operationId, restored)) };
-			}
-			if (currentId !== options.operationId) {
-				return { kind: "result", result: Result.err(mismatch(lane.name, options.operationId, restored)) };
-			}
-			const existing = runtime.activeOperations.get(lane.name);
-			if (existing !== undefined) {
-				if (existing.operationId !== options.operationId) {
-					throw new SessionInvariantError(`Lane ${JSON.stringify(lane.name)} has a task for another operation`);
+				if (currentId !== options.operationId) {
+					return { kind: "result", result: Result.err(mismatch(lane.name, options.operationId, restored)) };
 				}
-				return { kind: "join", completion: existing.completion };
-			}
-			if (restored.current === undefined) throw new SessionInvariantError("Current operation metadata is missing");
-			const deferred = deferredValue<DriveResult>();
-			const active: ActiveOperation = {
-				operationId: options.operationId,
-				operationKind: restored.current.operation.intent.kind,
-				completion: deferred.promise,
-				resolve: deferred.resolve,
-				reject: deferred.reject,
-				effectGate: new OperationEffectGate(),
-			};
-			runtime.activeOperations.set(lane.name, active);
-			return { kind: "installed", active };
-		});
+				const existing = runtime.activeOperations.get(lane.name);
+				if (existing !== undefined) {
+					if (existing.operationId !== options.operationId) {
+						throw new SessionInvariantError(`Lane ${JSON.stringify(lane.name)} has a task for another operation`);
+					}
+					return { kind: "join", completion: existing.completion };
+				}
+				if (restored.current === undefined)
+					throw new SessionInvariantError("Current operation metadata is missing");
+				const deferred = deferredValue<DriveResult>();
+				const active: ActiveOperation = {
+					operationId: options.operationId,
+					operationKind: restored.current.operation.intent.kind,
+					completion: deferred.promise,
+					resolve: deferred.resolve,
+					reject: deferred.reject,
+					effectGate: new OperationEffectGate(context),
+				};
+				runtime.activeOperations.set(lane.name, active);
+				return { kind: "installed", active };
+			},
+			context,
+		);
 	} catch (error) {
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 
 	if (arbitration.kind === "result") return arbitration.result;
 	if (arbitration.kind === "join") return arbitration.completion;
-	startDrivePass(runtime, lane, arbitration.active, options);
+	startDrivePass(runtime, lane, arbitration.active, options, context);
 	return arbitration.active.completion;
 }
 
@@ -96,20 +103,21 @@ function startDrivePass<TContext extends object | undefined>(
 	lane: RuntimeLane,
 	active: ActiveOperation,
 	options: DriveOptions,
+	context: Context,
 ): void {
 	active.task = (async () => {
 		try {
-			const result = await executeDrivePass(runtime, lane, active, options);
-			await removeActiveOperation(runtime, lane.name, active);
+			const result = await executeDrivePass(runtime, lane, active, options, context);
+			await removeActiveOperation(runtime, lane.name, active, context);
 			active.resolve(result);
 		} catch (error) {
-			await removeActiveOperation(runtime, lane.name, active);
+			await removeActiveOperation(runtime, lane.name, active, context);
 			active.reject(
 				error instanceof HarnessClosed ||
 					error instanceof HarnessFault ||
 					error instanceof RuntimeSliceNotImplemented
 					? error
-					: runtime.fault(error),
+					: runtime.fault(error, context),
 			);
 		}
 	})();
@@ -119,11 +127,16 @@ async function removeActiveOperation<TContext extends object | undefined>(
 	runtime: OperationTaskContext<TContext>,
 	lane: string,
 	active: ActiveOperation,
+	context: Context,
 ): Promise<void> {
 	if (runtime.state === "open") {
-		await runtime.sessionStorage.mutate(lane, () => {
-			if (runtime.activeOperations.get(lane) === active) runtime.activeOperations.delete(lane);
-		});
+		await runtime.sessionStorage.mutate(
+			lane,
+			() => {
+				if (runtime.activeOperations.get(lane) === active) runtime.activeOperations.delete(lane);
+			},
+			context,
+		);
 		return;
 	}
 	if (runtime.activeOperations.get(lane) === active) runtime.activeOperations.delete(lane);

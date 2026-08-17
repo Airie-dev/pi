@@ -1,4 +1,5 @@
 import { HarnessClosed, HarnessFault } from "../agent-harness.ts";
+import type { Context } from "../context.ts";
 import { type RestoredLane, restoreLane } from "../restore.ts";
 import { SessionInvariantError } from "../session/session.ts";
 import type { SessionMutator } from "../session/types.ts";
@@ -11,19 +12,24 @@ export async function loadExpected<TContext extends object | undefined>(
 	lane: string,
 	operationId: string,
 	includeLastResult: boolean,
+	context: Context,
 ): Promise<RestoredLane> {
 	try {
-		return await runtime.sessionStorage.mutate(lane, async (reader) => {
-			const restored = await restoreLane(reader, lane, { includeLastResult });
-			const currentId = restored.laneState.currentOperationId;
-			if (currentId !== null && currentId !== operationId) {
-				throw new SessionInvariantError(`Lane ${JSON.stringify(lane)} changed operation while a drive owns it`);
-			}
-			return restored;
-		});
+		return await runtime.sessionStorage.mutate(
+			lane,
+			async (reader) => {
+				const restored = await restoreLane(reader, lane, { includeLastResult }, context);
+				const currentId = restored.laneState.currentOperationId;
+				if (currentId !== null && currentId !== operationId) {
+					throw new SessionInvariantError(`Lane ${JSON.stringify(lane)} changed operation while a drive owns it`);
+				}
+				return restored;
+			},
+			context,
+		);
 	} catch (error) {
 		if (error instanceof HarnessClosed || error instanceof HarnessFault) throw error;
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 }
 
@@ -35,13 +41,18 @@ export async function mutateRun<TContext extends object | undefined, Result>(
 	runtime: RuntimeProcedureContext<TContext>,
 	lane: string,
 	mutation: (input: { mutator: SessionMutator; restored: RestoredLane }) => Result | Promise<Result>,
+	context: Context,
 ): Promise<Result> {
 	runtime.assertOpen();
 	try {
-		return await runtime.sessionStorage.mutate(lane, async (mutator) => {
-			const restored = await restoreLane(mutator, lane);
-			return mutation({ mutator, restored });
-		});
+		return await runtime.sessionStorage.mutate(
+			lane,
+			async (mutator) => {
+				const restored = await restoreLane(mutator, lane, undefined, context);
+				return mutation({ mutator, restored });
+			},
+			context,
+		);
 	} catch (error) {
 		if (
 			error instanceof RuntimeSliceNotImplemented ||
@@ -50,6 +61,6 @@ export async function mutateRun<TContext extends object | undefined, Result>(
 		) {
 			throw error;
 		}
-		throw runtime.fault(error);
+		throw runtime.fault(error, context);
 	}
 }
