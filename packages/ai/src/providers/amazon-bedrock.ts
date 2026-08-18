@@ -8,7 +8,7 @@ import { AMAZON_BEDROCK_MODELS } from "./amazon-bedrock.models.ts";
  * The login flow can store a token/profile choice; resolve also detects ambient
  * AWS credentials without copying them into pi's credential store.
  */
-const bedrockAuth: ApiKeyAuth = {
+export const bedrockAuth: ApiKeyAuth = {
 	name: "AWS credentials or bearer token",
 	login: async (interaction) => {
 		interaction.signal.throwIfAborted();

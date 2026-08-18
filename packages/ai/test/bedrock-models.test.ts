@@ -17,7 +17,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { complete, getModels } from "../src/compat.ts";
+import { complete, getModel, getModels } from "../src/compat.ts";
 import type { Context } from "../src/types.ts";
 import { hasBedrockCredentials } from "./bedrock-utils.ts";
 
@@ -32,6 +32,18 @@ describe("Amazon Bedrock Models", () => {
 	it("exposes Claude Opus 5 through an inference profile only", () => {
 		expect(models.some((model) => model.id === "global.anthropic.claude-opus-5")).toBe(true);
 		expect(models.some((model) => model.id === "anthropic.claude-opus-5")).toBe(false);
+	});
+
+	it("does not expose Bedrock Mantle OpenAI Responses models through Converse", () => {
+		expect(models.some((model) => model.id === "openai.gpt-5.5")).toBe(false);
+		expect(models.some((model) => model.id === "openai.gpt-5.4")).toBe(false);
+
+		const mantleModel = getModel("amazon-bedrock-mantle", "openai.gpt-5.5");
+		expect(mantleModel).toMatchObject({
+			api: "openai-responses",
+			provider: "amazon-bedrock-mantle",
+			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+		});
 	});
 
 	if (hasBedrockCredentials() && process.env.BEDROCK_EXTENSIVE_MODEL_TEST) {

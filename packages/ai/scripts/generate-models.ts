@@ -346,6 +346,7 @@ const ANT_LING_RING_THINKING_LEVEL_MAP = {
 } as const;
 
 const BEDROCK_INFERENCE_PROFILE_ONLY_MODEL_IDS = new Set(["anthropic.claude-opus-5"]);
+const BEDROCK_MANTLE_OPENAI_RESPONSES_MODEL_ID_PATTERN = /^(?:(?:global|us|eu|apac|jp|au)\.)?openai\.gpt-5\.(?:4|5|6)/;
 const MODELS_DEV_OPENAI_UNSUPPORTED_MODEL_IDS = new Set(["gpt-5.6"]);
 const OPENAI_TOOL_SEARCH_MODEL_IDS = new Set([
 	"gpt-5.4",
@@ -974,6 +975,14 @@ function getBedrockBaseUrl(modelId: string): string {
 		: "https://bedrock-runtime.us-east-1.amazonaws.com";
 }
 
+function getBedrockMantleBaseUrl(): string {
+	return "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+}
+
+function isBedrockMantleOpenAIResponsesModelId(modelId: string): boolean {
+	return BEDROCK_MANTLE_OPENAI_RESPONSES_MODEL_ID_PATTERN.test(modelId);
+}
+
 function normalizeNvidiaModelId(modelId: string): string {
 	return modelId.toLowerCase().replaceAll("_", ".");
 }
@@ -1340,6 +1349,33 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				if (BEDROCK_INFERENCE_PROFILE_ONLY_MODEL_IDS.has(modelId)) continue;
 
 				let id = modelId;
+
+				if (isBedrockMantleOpenAIResponsesModelId(id)) {
+					models.push({
+						id,
+						name: m.name || id,
+						api: "openai-responses" as const,
+						provider: "amazon-bedrock-mantle" as const,
+						baseUrl: getBedrockMantleBaseUrl(),
+						reasoning: m.reasoning === true,
+						input: (m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+						cost: {
+							input: m.cost?.input || 0,
+							output: m.cost?.output || 0,
+							cacheRead: m.cost?.cache_read || 0,
+							cacheWrite: m.cost?.cache_write || 0,
+						},
+						contextWindow: m.limit?.context || 4096,
+						maxTokens: m.limit?.output || 4096,
+						...(m.reasoning === true && { thinkingLevelMap: { off: null } }),
+						compat: {
+							sessionAffinityFormat: "openai-nosession" as const,
+							...(m.structured_output === true && { supportsStrictMode: true }),
+						},
+					});
+					recordModelsDevReasoningOptions("amazon-bedrock-mantle" as const, id, m);
+					continue;
+				}
 
 				if (id.startsWith("ai21.jamba")) {
 					// These models doesn't support tool use in streaming mode

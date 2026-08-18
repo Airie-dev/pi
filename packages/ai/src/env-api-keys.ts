@@ -76,6 +76,10 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 		return [ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_OAUTH_TOKEN_ENV, ANTHROPIC_API_KEY_ENV];
 	}
 
+	if (provider === "amazon-bedrock" || provider === "amazon-bedrock-mantle") {
+		return ["AWS_BEARER_TOKEN_BEDROCK"];
+	}
+
 	const envMap: Record<string, string> = {
 		"ant-ling": "ANT_LING_API_KEY",
 		"qwen-token-plan": "QWEN_TOKEN_PLAN_API_KEY",
@@ -164,7 +168,7 @@ export function getEnvApiKey(provider: string, env?: ProviderEnv): string | unde
 		}
 	}
 
-	if (provider === "amazon-bedrock") {
+	if (provider === "amazon-bedrock" || provider === "amazon-bedrock-mantle") {
 		// Amazon Bedrock supports multiple credential sources:
 		// 1. AWS_PROFILE - named profile from ~/.aws/credentials
 		// 2. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY - standard IAM keys
