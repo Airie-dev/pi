@@ -99,7 +99,7 @@ export interface SteppedSubmenuStep {
 	preselect?: (context: Record<string, string>) => string | undefined;
 }
 
-export interface SteppedSubmenuOptions {
+interface SteppedSubmenuOptions {
 	/** Start at this step index (0-based), skipping earlier steps. Requires initialContext for skipped keys. */
 	startAtStep?: number;
 	/** Pre-fill selections for skipped steps. */
