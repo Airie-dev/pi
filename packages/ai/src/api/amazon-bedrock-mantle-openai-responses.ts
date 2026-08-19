@@ -18,7 +18,7 @@ export interface AmazonBedrockMantleOpenAIResponsesOptions extends OpenAIRespons
 }
 
 const FALLBACK_REGION = "us-east-1";
-const SIGNING_SERVICE = "bedrock";
+const SIGNING_SERVICE = "bedrock-mantle";
 const DUMMY_OPENAI_API_KEY = "aws-sigv4";
 
 function getConfiguredProfile(
