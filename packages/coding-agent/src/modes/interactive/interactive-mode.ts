@@ -65,6 +65,7 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { DEFAULT_THINKING_LEVEL } from "../../core/defaults.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -4473,9 +4474,14 @@ export class InteractiveMode {
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
 			let selector: SettingsSelectorComponent | undefined;
+			const defaultProvider = this.settingsManager.getDefaultProvider();
+			const defaultModelId = this.settingsManager.getDefaultModel();
+			const defaultModel = defaultProvider && defaultModelId ? `${defaultProvider}/${defaultModelId}` : "not set";
 			selector = new SettingsSelectorComponent(
 				{
 					autoCompact: this.session.autoCompactionEnabled,
+					defaultModel,
+					availableDefaultModels: this.session.modelRuntime.getAvailableSnapshot(),
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
@@ -4485,7 +4491,7 @@ export class InteractiveMode {
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
-					thinkingLevel: this.session.thinkingLevel,
+					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
 					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
 					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
@@ -4514,6 +4520,18 @@ export class InteractiveMode {
 					onAutoCompactChange: (enabled) => {
 						this.session.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
+					},
+					onDefaultModelChange: async (model) => {
+						try {
+							await this.session.setModel(model, { persist: true });
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+							this.showStatus(`Default model: ${model.provider}/${model.id}`);
+							void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+							this.checkDaxnutsEasterEgg(model);
+						} catch (error) {
+							this.showError(error instanceof Error ? error.message : String(error));
+						}
 					},
 					onShowImagesChange: (enabled) => {
 						this.settingsManager.setShowImages(enabled);
@@ -4557,7 +4575,7 @@ export class InteractiveMode {
 						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
 					},
 					onThinkingLevelChange: (level) => {
-						this.session.setThinkingLevel(level);
+						this.session.setThinkingLevel(level, { persist: true });
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
 					},
@@ -4837,7 +4855,6 @@ export class InteractiveMode {
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
-				this.settingsManager,
 				this.session.modelRuntime,
 				this.session.scopedModels,
 				async (model) => {
@@ -5538,7 +5555,7 @@ export class InteractiveMode {
 					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
 				} else {
 					try {
-						await this.session.setModel(selectedModel);
+						await this.session.setModel(selectedModel, { persist: true });
 					} catch (error: unknown) {
 						selectedModel = undefined;
 						const errorMessage = error instanceof Error ? error.message : String(error);

@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Transport } from "@earendil-works/pi-ai";
+import type { Model, Transport } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Container,
@@ -36,6 +36,9 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	maxPrimaryColumnWidth: 32,
 };
 
+const NO_DEFAULT_MODEL_VALUE = "__none__";
+const NO_DEFAULT_MODEL_LABEL = "not set";
+
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
 	minimal: "Very brief reasoning (~1k tokens)",
@@ -58,6 +61,8 @@ const DEFAULT_PROJECT_TRUST_BY_LABEL = new Map(
 
 export interface SettingsConfig {
 	autoCompact: boolean;
+	defaultModel: string;
+	availableDefaultModels: readonly Model<any>[];
 	showImages: boolean;
 	imageWidthCells: number;
 	autoResizeImages: boolean;
@@ -95,6 +100,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
+	onDefaultModelChange: (model: Model<any>) => void | Promise<void>;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -236,6 +242,28 @@ class SelectSubmenu extends Container {
 	handleInput(data: string): void {
 		this.selectList.handleInput(data);
 	}
+}
+
+function modelSettingValue(model: Model<any>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function modelSettingLabel(model: Model<any>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function defaultModelItems(models: readonly Model<any>[]): SelectItem[] {
+	return [...models]
+		.sort((a, b) => {
+			const providerCompare = a.provider.localeCompare(b.provider);
+			if (providerCompare !== 0) return providerCompare;
+			return (a.name || a.id).localeCompare(b.name || b.id);
+		})
+		.map((model) => ({
+			value: modelSettingValue(model),
+			label: modelSettingLabel(model),
+			description: model.name,
+		}));
 }
 
 function themeItems(availableThemes: string[]): SelectItem[] {
@@ -493,6 +521,10 @@ export class SettingsSelectorComponent extends Container {
 		const supportsImages = getCapabilities().images;
 		const followUpKey = keyDisplayText("app.message.followUp");
 		let currentWarnings = { ...config.warnings };
+		const defaultModelOptions = defaultModelItems(config.availableDefaultModels);
+		const defaultModelByValue = new Map(
+			config.availableDefaultModels.map((model) => [modelSettingValue(model), model]),
+		);
 
 		const items: SettingItem[] = [
 			{
@@ -523,6 +555,40 @@ export class SettingsSelectorComponent extends Container {
 				description: "Preferred transport for providers that support multiple transports",
 				currentValue: config.transport,
 				values: ["sse", "websocket", "websocket-cached", "auto"],
+			},
+			{
+				id: "default-model",
+				label: "Default model",
+				description: "Startup model for new sessions",
+				currentValue: config.defaultModel,
+				submenu: (currentValue, done) => {
+					const options =
+						defaultModelOptions.length > 0
+							? defaultModelOptions
+							: [
+									{
+										value: NO_DEFAULT_MODEL_VALUE,
+										label: "No models available",
+										description: "Log in to a provider or configure an API key first",
+									},
+								];
+					return new SelectSubmenu(
+						"Default Model",
+						"Select the model to use when starting new sessions",
+						options,
+						currentValue === NO_DEFAULT_MODEL_LABEL ? NO_DEFAULT_MODEL_VALUE : currentValue,
+						(value) => {
+							const model = defaultModelByValue.get(value);
+							if (!model) {
+								done();
+								return;
+							}
+							void callbacks.onDefaultModelChange(model);
+							done(value);
+						},
+						() => done(),
+					);
+				},
 			},
 			{
 				id: "http-idle-timeout",
@@ -612,13 +678,13 @@ export class SettingsSelectorComponent extends Container {
 			},
 			{
 				id: "thinking",
-				label: "Thinking level",
-				description: "Reasoning depth for thinking-capable models",
+				label: "Default thinking level",
+				description: "Startup reasoning depth for thinking-capable models",
 				currentValue: config.thinkingLevel,
 				submenu: (currentValue, done) =>
 					new SelectSubmenu(
-						"Thinking Level",
-						"Select reasoning depth for thinking-capable models",
+						"Default Thinking Level",
+						"Select the reasoning depth to use when starting new sessions",
 						config.availableThinkingLevels.map((level) => ({
 							value: level,
 							label: level,
