@@ -231,6 +231,44 @@ function isDeadTerminalError(error: unknown): boolean {
 	return code !== undefined && DEAD_TERMINAL_ERROR_CODES.has(code);
 }
 
+export interface ModelCommandArgs {
+	searchTerm?: string;
+	persist: boolean;
+	error?: string;
+}
+
+export function parseModelCommandArgs(args: string | undefined): ModelCommandArgs {
+	if (!args?.trim()) return { persist: false };
+
+	let persist = false;
+	const searchTerms: string[] = [];
+	for (const token of args.trim().split(/\s+/u)) {
+		if (token === "--default") {
+			persist = true;
+			continue;
+		}
+
+		if (token.startsWith("--default=")) {
+			persist = true;
+			const value = token.slice("--default=".length);
+			if (value) searchTerms.push(value);
+			continue;
+		}
+
+		if (token.startsWith("--")) {
+			return {
+				persist,
+				searchTerm: searchTerms.join(" ") || undefined,
+				error: `Unknown /model option "${token}". Supported option: --default.`,
+			};
+		}
+
+		searchTerms.push(token);
+	}
+
+	return { persist, searchTerm: searchTerms.join(" ") || undefined };
+}
+
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage. Disable this warning in /settings.";
 
@@ -679,6 +717,16 @@ export class InteractiveMode {
 		const modelCommand = slashCommands.find((command) => command.name === "model");
 		if (modelCommand) {
 			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				const trimmedPrefix = prefix.trimStart();
+				if (trimmedPrefix.startsWith("--") && !trimmedPrefix.includes(" ")) {
+					return "--default".startsWith(trimmedPrefix)
+						? [{ value: "--default ", label: "--default", description: "Set as startup default" }]
+						: null;
+				}
+
+				const parsed = parseModelCommandArgs(prefix);
+				if (parsed.error) return null;
+
 				const models =
 					this.session.scopedModels.length > 0
 						? this.session.scopedModels.map((s) => s.model)
@@ -694,10 +742,11 @@ export class InteractiveMode {
 					label: `${m.provider}/${m.id}`,
 				}));
 
-				return createFuzzyAutocompleteItems(items, prefix, getModelSearchText, (item) => ({
-					value: item.label,
+				const searchPrefix = parsed.persist ? (parsed.searchTerm ?? "") : prefix;
+				return createFuzzyAutocompleteItems(items, searchPrefix, getModelSearchText, (item) => ({
+					value: parsed.persist ? `--default ${item.label}` : item.label,
 					label: item.id,
-					description: item.provider,
+					description: parsed.persist ? `${item.provider} · set as startup default` : item.provider,
 				}));
 			};
 		}
@@ -2931,9 +2980,13 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/model" || text.startsWith("/model ")) {
-				const searchTerm = text.startsWith("/model ") ? text.slice(7).trim() : undefined;
+				const args = parseModelCommandArgs(text.startsWith("/model ") ? text.slice(7).trim() : undefined);
 				this.editor.setText("");
-				await this.handleModelCommand(searchTerm);
+				if (args.error) {
+					this.showError(args.error);
+					return;
+				}
+				await this.handleModelCommand(args.searchTerm, { persist: args.persist });
 				return;
 			}
 			if (text === "/export" || text.startsWith("/export ")) {
@@ -4701,19 +4754,19 @@ export class InteractiveMode {
 		});
 	}
 
-	private async handleModelCommand(searchTerm?: string): Promise<void> {
+	private async handleModelCommand(searchTerm?: string, options: { persist?: boolean } = {}): Promise<void> {
 		if (!searchTerm) {
-			this.showModelSelector();
+			this.showModelSelector(undefined, options);
 			return;
 		}
 
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model);
+				await this.session.setModel(model, { persist: options.persist === true });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
-				this.showStatus(`Model: ${model.id}`);
+				this.showStatus(options.persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				this.checkDaxnutsEasterEgg(model);
 			} catch (error) {
@@ -4722,7 +4775,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.showModelSelector(searchTerm);
+		this.showModelSelector(searchTerm, options);
 	}
 
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
@@ -4850,7 +4903,7 @@ export class InteractiveMode {
 		});
 	}
 
-	private showModelSelector(initialSearchInput?: string): void {
+	private showModelSelector(initialSearchInput?: string, options: { persist?: boolean } = {}): void {
 		this.showSelector((done) => {
 			const selector = new ModelSelectorComponent(
 				this.ui,
@@ -4859,11 +4912,13 @@ export class InteractiveMode {
 				this.session.scopedModels,
 				async (model) => {
 					try {
-						await this.session.setModel(model);
+						await this.session.setModel(model, { persist: options.persist === true });
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
 						done();
-						this.showStatus(`Model: ${model.id}`);
+						this.showStatus(
+							options.persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`,
+						);
 						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 						this.checkDaxnutsEasterEgg(model);
 					} catch (error) {
