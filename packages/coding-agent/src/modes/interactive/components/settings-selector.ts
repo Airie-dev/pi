@@ -100,7 +100,7 @@ export interface SettingsConfig {
 
 export interface SettingsCallbacks {
 	onAutoCompactChange: (enabled: boolean) => void;
-	onDefaultModelChange: (model: Model<any>) => void | Promise<void>;
+	onDefaultModelChange: (model: Model<any>) => Promise<void>;
 	onShowImagesChange: (enabled: boolean) => void;
 	onImageWidthCellsChange: (width: number) => void;
 	onAutoResizeImagesChange: (enabled: boolean) => void;
@@ -244,11 +244,7 @@ class SelectSubmenu extends Container {
 	}
 }
 
-function modelSettingValue(model: Model<any>): string {
-	return `${model.provider}/${model.id}`;
-}
-
-function modelSettingLabel(model: Model<any>): string {
+function modelSettingKey(model: Model<any>): string {
 	return `${model.provider}/${model.id}`;
 }
 
@@ -259,11 +255,10 @@ function defaultModelItems(models: readonly Model<any>[]): SelectItem[] {
 			if (providerCompare !== 0) return providerCompare;
 			return (a.name || a.id).localeCompare(b.name || b.id);
 		})
-		.map((model) => ({
-			value: modelSettingValue(model),
-			label: modelSettingLabel(model),
-			description: model.name,
-		}));
+		.map((model) => {
+			const key = modelSettingKey(model);
+			return { value: key, label: key, description: model.name };
+		});
 }
 
 function themeItems(availableThemes: string[]): SelectItem[] {
@@ -523,7 +518,7 @@ export class SettingsSelectorComponent extends Container {
 		let currentWarnings = { ...config.warnings };
 		const defaultModelOptions = defaultModelItems(config.availableDefaultModels);
 		const defaultModelByValue = new Map(
-			config.availableDefaultModels.map((model) => [modelSettingValue(model), model]),
+			config.availableDefaultModels.map((model) => [modelSettingKey(model), model]),
 		);
 
 		const items: SettingItem[] = [
@@ -583,8 +578,10 @@ export class SettingsSelectorComponent extends Container {
 								done();
 								return;
 							}
-							void callbacks.onDefaultModelChange(model);
-							done(value);
+							void callbacks.onDefaultModelChange(model).then(
+								() => done(value),
+								() => done(),
+							);
 						},
 						() => done(),
 					);
