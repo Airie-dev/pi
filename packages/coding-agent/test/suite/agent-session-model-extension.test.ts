@@ -71,6 +71,16 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("high");
 	});
 
+	it("persists the requested default thinking level even when the current model clamps it", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true }] });
+		harnesses.push(harness);
+
+		harness.session.setThinkingLevel("max", { persist: true });
+
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("max");
+	});
+
 	it("cycleModel and cycleThinkingLevel are session-only by default", async () => {
 		const harness = await createHarness({
 			models: [

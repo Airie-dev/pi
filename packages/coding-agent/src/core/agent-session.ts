@@ -65,7 +65,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
-import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -302,9 +302,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // ============================================================================
 // Constants
 // ============================================================================
-
-/** Standard thinking levels */
-const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
 // ============================================================================
 // AgentSession Class
@@ -1712,8 +1709,8 @@ export class AgentSession {
 	/**
 	 * Set thinking level.
 	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves to the session transcript only if the level actually changes.
-	 * Persists to global defaults only when options.persist is true.
+	 * Saves the clamped level to the session transcript only if the level actually changes.
+	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
 		const availableLevels = this.getAvailableThinkingLevels();
@@ -1725,8 +1722,8 @@ export class AgentSession {
 
 		this.agent.state.thinkingLevel = effectiveLevel;
 
-		if (options.persist && (this.supportsThinking() || effectiveLevel !== "off")) {
-			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+		if (options.persist) {
+			this.settingsManager.setDefaultThinkingLevel(level);
 		}
 
 		if (isChanging) {
@@ -1761,7 +1758,7 @@ export class AgentSession {
 	 * The provider will clamp to what the specific model supports internally.
 	 */
 	getAvailableThinkingLevels(): ThinkingLevel[] {
-		if (!this.model) return THINKING_LEVELS;
+		if (!this.model) return [...THINKING_LEVEL_OPTIONS];
 		return getSupportedThinkingLevels(this.model) as ThinkingLevel[];
 	}
 
