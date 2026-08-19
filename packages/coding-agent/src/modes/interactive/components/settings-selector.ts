@@ -22,7 +22,7 @@ import type {
 import { getSettingsListTheme, parseAutoThemeSetting, type TerminalTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText } from "./keybinding-hints.ts";
-import { SelectSubmenu } from "./settings-submenu.ts";
+import { SelectSubmenu, SteppedSubmenu, type SteppedSubmenuStep } from "./settings-submenu.ts";
 
 const NO_DEFAULT_MODEL_VALUE = "__none__";
 const NO_DEFAULT_MODEL_LABEL = "not set";
@@ -175,6 +175,17 @@ const CLEAR_OVERRIDE_VALUE = "__clear__";
 
 function modelSettingKey(model: Model<any>): string {
 	return `${model.provider}/${model.id}`;
+}
+
+function defaultModelDisplayValue(defaultModel: string, overrides: Record<string, ThinkingLevel>): string {
+	const override = overrides[defaultModel];
+	return override ? `${defaultModel} \u00b7 ${override}` : defaultModel;
+}
+
+function modelThinkingOverridesSummary(overrides: Record<string, ThinkingLevel>): string {
+	const count = Object.keys(overrides).length;
+	if (count === 0) return "none";
+	return `${count} configured`;
 }
 
 function defaultModelItems(models: readonly Model<any>[]): SelectItem[] {
@@ -446,12 +457,14 @@ export class SettingsSelectorComponent extends Container {
 		const followUpKey = keyDisplayText("app.message.followUp");
 		let currentWarnings = { ...config.warnings };
 		const currentModelThinkingLevels = { ...config.modelThinkingLevels };
+		let lastSelectedDefaultModel: Model<any> | undefined;
 		const defaultModelOptions = defaultModelItems(config.availableDefaultModels);
 		const defaultModelByValue = new Map(
 			config.availableDefaultModels.map((model) => [modelSettingKey(model), model]),
 		);
-		let currentDefaultModel = defaultModelByValue.get(config.defaultModel);
-		let currentDefaultModelKey: string | undefined = currentDefaultModel ? config.defaultModel : undefined;
+		let currentDefaultModelKey: string | undefined = defaultModelByValue.has(config.defaultModel)
+			? config.defaultModel
+			: undefined;
 
 		const items: SettingItem[] = [
 			{
@@ -487,7 +500,7 @@ export class SettingsSelectorComponent extends Container {
 				id: "default-model",
 				label: "Default model",
 				description: "Startup model for new sessions",
-				currentValue: config.defaultModel,
+				currentValue: defaultModelDisplayValue(config.defaultModel, currentModelThinkingLevels),
 				submenu: (currentValue, done) => {
 					const options =
 						defaultModelOptions.length > 0
@@ -512,9 +525,11 @@ export class SettingsSelectorComponent extends Container {
 							}
 							void callbacks.onDefaultModelChange(model).then(
 								() => {
-									currentDefaultModel = model;
+									lastSelectedDefaultModel = model;
 									currentDefaultModelKey = value;
-									done(value, { navigateTo: "model-thinking" });
+									done(defaultModelDisplayValue(value, currentModelThinkingLevels), {
+										navigateTo: "model-thinking",
+									});
 								},
 								() => done(),
 							);
@@ -634,17 +649,57 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "model-thinking",
 				label: "Default thinking level per model",
-				description: currentDefaultModelKey
-					? `Override the default thinking level for ${currentDefaultModelKey}`
-					: "Set a default model first",
-				currentValue: currentDefaultModelKey
-					? (currentModelThinkingLevels[currentDefaultModelKey] ?? "not set")
-					: "—",
-				...(currentDefaultModel
-					? {
-							submenu: (currentValue, done) => {
-								const modelKey = currentDefaultModelKey!;
-								const model = currentDefaultModel!;
+				description: "Override the default thinking level for specific models",
+				currentValue: modelThinkingOverridesSummary(currentModelThinkingLevels),
+				submenu: (_currentValue, done) => {
+					const preselected = lastSelectedDefaultModel;
+					lastSelectedDefaultModel = undefined;
+
+					const steps: SteppedSubmenuStep[] = [
+						{
+							key: "model",
+							title: "Per-Model Thinking Level",
+							description: "Select a model to configure",
+							options: () => {
+								const sorted = [...config.availableDefaultModels].sort((a, b) => {
+									const aKey = modelSettingKey(a);
+									const bKey = modelSettingKey(b);
+									if (aKey === currentDefaultModelKey) return -1;
+									if (bKey === currentDefaultModelKey) return 1;
+									const pc = a.provider.localeCompare(b.provider);
+									if (pc !== 0) return pc;
+									return (a.name || a.id).localeCompare(b.name || b.id);
+								});
+								const items: SelectItem[] = sorted.map((model) => {
+									const key = modelSettingKey(model);
+									const override = currentModelThinkingLevels[key];
+									const isDefault = key === currentDefaultModelKey;
+									const desc = [
+										isDefault ? "default model" : undefined,
+										override ? `thinking: ${override}` : undefined,
+									]
+										.filter(Boolean)
+										.join(" \u00b7 ");
+									return { value: key, label: key, description: desc || undefined };
+								});
+								if (items.length === 0) {
+									items.push({
+										value: "__none__",
+										label: "No models available",
+										description: "Log in to a provider or configure an API key first",
+									});
+								}
+								return items;
+							},
+							preselect: () => currentDefaultModelKey,
+						},
+						{
+							key: "level",
+							title: (ctx) => `Thinking Level for ${ctx.model}`,
+							description: "Select default thinking level for this model",
+							options: (ctx) => {
+								const model = defaultModelByValue.get(ctx.model);
+								if (!model) return [];
 								const levels = (
 									model.reasoning ? getSupportedThinkingLevels(model) : ["off"]
 								) as ThinkingLevel[];
@@ -653,34 +708,53 @@ export class SettingsSelectorComponent extends Container {
 									label: level,
 									description: THINKING_DESCRIPTIONS[level],
 								}));
-								if (currentModelThinkingLevels[modelKey] !== undefined) {
+								if (currentModelThinkingLevels[ctx.model] !== undefined) {
 									items.push({
 										value: CLEAR_OVERRIDE_VALUE,
 										label: "(clear override)",
 										description: `Revert to global default (${config.thinkingLevel})`,
 									});
 								}
-								return new SelectSubmenu(
-									`Thinking Level for ${modelKey}`,
-									"Override the default thinking level for this model",
-									items,
-									currentValue === "not set" ? "" : currentValue,
-									(value) => {
-										if (value === CLEAR_OVERRIDE_VALUE) {
-											callbacks.onModelThinkingLevelRemove(model.provider, model.id);
-											delete currentModelThinkingLevels[modelKey];
-											done("not set");
-										} else {
-											callbacks.onModelThinkingLevelChange(model.provider, model.id, value as ThinkingLevel);
-											currentModelThinkingLevels[modelKey] = value as ThinkingLevel;
-											done(value);
-										}
-									},
-									() => done(),
-								);
+								return items;
 							},
-						}
-					: {}),
+							preselect: (ctx) => currentModelThinkingLevels[ctx.model],
+						},
+					];
+
+					const summary = () => modelThinkingOverridesSummary(currentModelThinkingLevels);
+
+					return new SteppedSubmenu(
+						steps,
+						(selections) => {
+							const model = defaultModelByValue.get(selections.model);
+							if (!model) return;
+							if (selections.level === CLEAR_OVERRIDE_VALUE) {
+								callbacks.onModelThinkingLevelRemove(model.provider, model.id);
+								delete currentModelThinkingLevels[selections.model];
+							} else {
+								callbacks.onModelThinkingLevelChange(
+									model.provider,
+									model.id,
+									selections.level as ThinkingLevel,
+								);
+								currentModelThinkingLevels[selections.model] = selections.level as ThinkingLevel;
+							}
+						},
+						() => {
+							this.settingsList.updateValue(
+								"default-model",
+								defaultModelDisplayValue(
+									currentDefaultModelKey ?? config.defaultModel,
+									currentModelThinkingLevels,
+								),
+							);
+							done(summary());
+						},
+						preselected
+							? { startAtStep: 1, initialContext: { model: modelSettingKey(preselected) } }
+							: { loop: true },
+					);
+				},
 			},
 			{
 				id: "tui-mode",
