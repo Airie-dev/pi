@@ -24,6 +24,7 @@ describe("SettingsSelectorComponent", () => {
 			defaultModel: "not set",
 			availableDefaultModels: [],
 			availableThinkingLevels: [],
+			modelThinkingLevels: {},
 			availableThemes: [],
 		} as unknown as SettingsConfig;
 		const callbacks = {

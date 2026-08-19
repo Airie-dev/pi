@@ -4546,6 +4546,7 @@ export class InteractiveMode {
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
 					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
+					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
 					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
@@ -4631,6 +4632,27 @@ export class InteractiveMode {
 						this.session.setThinkingLevel(level, { persist: true });
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
+					},
+					onModelThinkingLevelChange: (provider, modelId, level) => {
+						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
+						// If the override is for the current model, apply it to the session too
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							this.session.setThinkingLevel(level);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
+					},
+					onModelThinkingLevelRemove: (provider, modelId) => {
+						this.settingsManager.removeModelThinkingLevel(provider, modelId);
+						// If the override was for the current model, revert to global default
+						const current = this.session.model;
+						if (current && current.provider === provider && current.id === modelId) {
+							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+							this.session.setThinkingLevel(globalDefault);
+							this.footer.invalidate();
+							this.updateEditorBorderColor();
+						}
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);

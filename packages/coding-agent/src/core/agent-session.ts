@@ -1601,7 +1601,7 @@ export class AgentSession {
 		}
 
 		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (options.persist) {
@@ -1609,6 +1609,7 @@ export class AgentSession {
 		}
 
 		// Re-clamp session thinking level for new model's capabilities.
+		// Per-model thinking level overrides take priority over session carry-over.
 		// Model persistence does not implicitly rewrite the global thinking default.
 		this.setThinkingLevel(thinkingLevel);
 
@@ -1650,7 +1651,7 @@ export class AgentSession {
 		const len = scopedModels.length;
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
 		// Apply model
 		this.agent.state.model = next.model;
@@ -1686,7 +1687,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
@@ -1769,9 +1770,16 @@ export class AgentSession {
 		return !!this.model?.reasoning;
 	}
 
-	private _getThinkingLevelForModelSwitch(explicitLevel?: ThinkingLevel): ThinkingLevel {
+	private _getThinkingLevelForModelSwitch(targetModel?: Model<any>, explicitLevel?: ThinkingLevel): ThinkingLevel {
 		if (explicitLevel !== undefined) {
 			return explicitLevel;
+		}
+		// Per-model default takes priority when switching to a model that has one
+		if (targetModel) {
+			const perModel = this.settingsManager.getModelThinkingLevel(targetModel.provider, targetModel.id);
+			if (perModel !== undefined) {
+				return perModel;
+			}
 		}
 		if (!this.supportsThinking()) {
 			return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
