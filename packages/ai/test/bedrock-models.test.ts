@@ -34,20 +34,27 @@ describe("Amazon Bedrock Models", () => {
 		expect(models.some((model) => model.id === "anthropic.claude-opus-5")).toBe(false);
 	});
 
-	it("does not expose Bedrock Mantle OpenAI Responses models through Converse", () => {
-		expect(models.some((model) => model.id === "openai.gpt-5.5")).toBe(false);
-		expect(models.some((model) => model.id === "openai.gpt-5.4")).toBe(false);
-
-		const mantleModel = getModel("amazon-bedrock-mantle", "openai.gpt-5.5");
-		expect(mantleModel).toMatchObject({
+	it("exposes OpenAI-compatible Bedrock models under the Bedrock provider without routing them through Converse", () => {
+		const openAIResponsesModel = getModel("amazon-bedrock", "openai.gpt-5.5");
+		expect(openAIResponsesModel).toMatchObject({
 			api: "openai-responses",
-			provider: "amazon-bedrock-mantle",
+			provider: "amazon-bedrock",
 			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+		});
+
+		const converseModel = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1");
+		expect(converseModel).toMatchObject({
+			api: "bedrock-converse-stream",
+			provider: "amazon-bedrock",
 		});
 	});
 
 	if (hasBedrockCredentials() && process.env.BEDROCK_EXTENSIVE_MODEL_TEST) {
-		for (const model of models) {
+		const extensiveModels = process.env.BEDROCK_MANTLE_OPENAI_RESPONSES_TEST
+			? models
+			: models.filter((model) => model.api !== "openai-responses");
+
+		for (const model of extensiveModels) {
 			it(`should make a simple request with ${model.id}`, { timeout: 10_000 }, async () => {
 				const context: Context = {
 					systemPrompt: "You are a helpful assistant. Be extremely concise.",

@@ -1433,7 +1433,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						id,
 						name: m.name || id,
 						api: "openai-responses" as const,
-						provider: "amazon-bedrock-mantle" as const,
+						provider: "amazon-bedrock" as const,
 						baseUrl: getBedrockMantleBaseUrl(),
 						reasoning: m.reasoning === true,
 						input: (m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
@@ -1451,7 +1451,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 							...(m.structured_output === true && { supportsStrictMode: true }),
 						},
 					});
-					recordModelsDevReasoningOptions("amazon-bedrock-mantle" as const, id, m);
+					recordModelsDevReasoningOptions("amazon-bedrock" as const, id, m);
 					continue;
 				}
 

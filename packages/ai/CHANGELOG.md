@@ -8,13 +8,13 @@
 
 ### Added
 
-- Added Amazon Bedrock Mantle as a built-in provider for OpenAI Responses-compatible Bedrock models.
+- Added Amazon Bedrock internal routing for OpenAI Responses-compatible Bedrock models.
 - Added provider-neutral `toolChoice` support to simple stream requests.
 - Added China-specific ZAI Coding Plan models, including GLM-4.6V vision support, and API-equivalent usage cost estimates for models with published PAYG prices ([#8220](https://github.com/earendil-works/pi/issues/8220)).
 
 ### Fixed
 
-- Fixed OpenAI GPT-5.x models from the Bedrock catalog being routed through the Amazon Bedrock Converse adapter instead of Bedrock Mantle.
+- Fixed OpenAI GPT-5.x models from the Bedrock catalog being routed through the Amazon Bedrock Converse adapter instead of Bedrock's OpenAI-compatible Responses endpoint (Mantle).
 - Fixed OpenAI-compatible Chat Completions reasoning replay to preserve and resend assistant-level `reasoning_details` (`reasoning.text`, `reasoning.summary`, and `reasoning.encrypted`) verbatim and in order ([#7994](https://github.com/earendil-works/pi/issues/7994)).
 - Fixed Anthropic server-side fallback responses being priced with the requested model instead of the returned fallback model ([#8285](https://github.com/earendil-works/pi/issues/8285)).
 - Fixed Azure OpenAI Responses ignoring `toolChoice` in provider-specific stream requests.
