@@ -26,17 +26,6 @@ import {
 	serializeConversation,
 } from "./utils.ts";
 
-function getAnthropicSummarizationFallback(model: Model<any>): readonly { model: string }[] | undefined {
-	if (model.provider !== "anthropic" || model.api !== "anthropic-messages") {
-		return undefined;
-	}
-
-	const allowedFallbackModels = (model as Model<"anthropic-messages">).compat?.allowedFallbackModels;
-	// Use the primary permitted fallback for now. If future Anthropic models expose
-	// broader fallback behavior, this can become a user/config pick or a full chain.
-	return allowedFallbackModels && allowedFallbackModels.length > 0 ? [{ model: allowedFallbackModels[0] }] : undefined;
-}
-
 // ============================================================================
 // File Operation Tracking
 // ============================================================================
@@ -508,9 +497,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
-
-Update the existing structured summary with new information. RULES:
+const UPDATE_SUMMARIZATION_INSTRUCTIONS = `Update the existing structured summary with new information. RULES:
 - PRESERVE all existing information from the previous summary
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
@@ -547,6 +534,10 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
+
 function createSummarizationOptions(
 	model: Model<any>,
 	maxTokens: number,
@@ -558,10 +549,6 @@ function createSummarizationOptions(
 	sessionId: string | undefined,
 ): SimpleStreamOptions {
 	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
-	const refusalFallbacks = getAnthropicSummarizationFallback(model);
-	if (refusalFallbacks) {
-		options.refusalFallbacks = refusalFallbacks;
-	}
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
@@ -638,6 +625,20 @@ export async function generateSummary(
 	).text;
 }
 
+/** Build the provider context for a standalone summary request. */
+function buildSummarizationContext(promptText: string): Context {
+	return {
+		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+		messages: [
+			{
+				role: "user",
+				content: [{ type: "text", text: promptText }],
+				timestamp: Date.now(),
+			},
+		],
+	};
+}
+
 /** Generate or update a conversation summary and return its provider usage. */
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
@@ -678,14 +679,6 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
 	const completionOptions = createSummarizationOptions(
 		model,
 		maxTokens,
@@ -699,7 +692,7 @@ export async function generateSummaryWithUsage(
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText),
 		completionOptions,
 		streamFn,
 		retry,
@@ -980,17 +973,10 @@ async function generateTurnPrefixSummary(
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
 
 	const response = await completeSummarization(
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText),
 		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,
