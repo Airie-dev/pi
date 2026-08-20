@@ -1,4 +1,4 @@
-import { amazonBedrockMantleOpenAIResponsesApi } from "../api/amazon-bedrock-mantle-openai-responses.lazy.ts";
+import { bedrockMantleOpenAIResponsesApi } from "../api/bedrock-mantle-openai-responses.lazy.ts";
 import { bedrockConverseStreamApi } from "../api/bedrock-converse-stream.lazy.ts";
 import type { ApiKeyAuth } from "../auth/types.ts";
 import { createProvider, type Provider } from "../models.ts";
@@ -88,7 +88,7 @@ export function amazonBedrockProvider(): Provider<"bedrock-converse-stream" | "o
 		models: Object.values(AMAZON_BEDROCK_MODELS),
 		api: {
 			"bedrock-converse-stream": bedrockConverseStreamApi(),
-			"openai-responses": amazonBedrockMantleOpenAIResponsesApi(),
+			"openai-responses": bedrockMantleOpenAIResponsesApi(),
 		},
 	});
 }

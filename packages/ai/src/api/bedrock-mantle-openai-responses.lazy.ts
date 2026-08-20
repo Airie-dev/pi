@@ -22,9 +22,9 @@ export function setBedrockMantleOpenAIResponsesProviderModule(module: ProviderSt
 	bedrockMantleOpenAIResponsesModuleOverride = module;
 }
 
-export const amazonBedrockMantleOpenAIResponsesApi = (): ProviderStreams =>
+export const bedrockMantleOpenAIResponsesApi = (): ProviderStreams =>
 	lazyApi(
 		async () =>
 			bedrockMantleOpenAIResponsesModuleOverride ??
-			((await importNodeOnlyApi("./amazon-bedrock-mantle-openai-responses.ts")) as ProviderStreams),
+			((await importNodeOnlyApi("./bedrock-mantle-openai-responses.ts")) as ProviderStreams),
 	);

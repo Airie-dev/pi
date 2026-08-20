@@ -1,7 +1,7 @@
 import {
 	stream as bedrockMantleOpenAIResponsesStream,
 	streamSimple as bedrockMantleOpenAIResponsesStreamSimple,
-} from "./api/amazon-bedrock-mantle-openai-responses.ts";
+} from "./api/bedrock-mantle-openai-responses.ts";
 import {
 	stream as bedrockConverseStream,
 	streamSimple as bedrockConverseStreamSimple,

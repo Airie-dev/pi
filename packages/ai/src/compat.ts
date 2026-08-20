@@ -10,7 +10,7 @@
  * ModelManager migration.
  */
 
-export * from "./api/amazon-bedrock-mantle-openai-responses.lazy.ts";
+export * from "./api/bedrock-mantle-openai-responses.lazy.ts";
 export * from "./api/anthropic-messages.lazy.ts";
 export * from "./api/azure-openai-responses.lazy.ts";
 export * from "./api/bedrock-converse-stream.lazy.ts";
