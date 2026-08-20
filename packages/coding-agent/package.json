@@ -43,15 +43,13 @@
 		"prepublishOnly": "npm run clean && npm run build && npm run shrinkwrap"
 	},
 	"dependencies": {
-		"@aws-crypto/sha256-js": "5.2.0",
-		"@aws-sdk/credential-provider-node": "3.972.42",
+		"@aws/bedrock-token-generator": "1.1.0",
 		"@earendil-works/pi-agent-core": "^0.84.2",
 		"@earendil-works/pi-ai": "^0.84.2",
 		"@earendil-works/pi-client": "^0.84.2",
 		"@earendil-works/pi-protocol": "^0.84.2",
 		"@earendil-works/pi-tui": "^0.84.2",
 		"@silvia-odwyer/photon-node": "0.3.4",
-		"@smithy/signature-v4": "5.4.3",
 		"chalk": "5.6.2",
 		"cross-spawn": "7.0.6",
 		"diff": "8.0.4",

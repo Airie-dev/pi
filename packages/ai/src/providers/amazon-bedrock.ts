@@ -1,5 +1,5 @@
-import { bedrockMantleOpenAIResponsesApi } from "../api/bedrock-mantle-openai-responses.lazy.ts";
 import { bedrockConverseStreamApi } from "../api/bedrock-converse-stream.lazy.ts";
+import { bedrockMantleOpenAIResponsesApi } from "../api/bedrock-mantle-openai-responses.lazy.ts";
 import type { ApiKeyAuth } from "../auth/types.ts";
 import { createProvider, type Provider } from "../models.ts";
 import { AMAZON_BEDROCK_MODELS } from "./amazon-bedrock.models.ts";

@@ -92,26 +92,16 @@
 		"node": ">=22.19.0"
 	},
 	"devDependencies": {
-		"@aws-crypto/sha256-js": "5.2.0",
-		"@aws-sdk/credential-provider-node": "3.972.42",
-		"@smithy/signature-v4": "5.4.3",
+		"@aws/bedrock-token-generator": "1.1.0",
 		"@types/node": "24.12.4",
 		"canvas": "3.2.3",
 		"vitest": "4.1.9"
 	},
 	"peerDependencies": {
-		"@aws-crypto/sha256-js": "5.2.0",
-		"@aws-sdk/credential-provider-node": "3.972.42",
-		"@smithy/signature-v4": "5.4.3"
+		"@aws/bedrock-token-generator": "1.1.0"
 	},
 	"peerDependenciesMeta": {
-		"@aws-crypto/sha256-js": {
-			"optional": true
-		},
-		"@aws-sdk/credential-provider-node": {
-			"optional": true
-		},
-		"@smithy/signature-v4": {
+		"@aws/bedrock-token-generator": {
 			"optional": true
 		}
 	}
