@@ -1,7 +1,4 @@
-import { Sha256 } from "@aws-crypto/sha256-js";
-import { defaultProvider } from "@aws-sdk/credential-provider-node";
-import { SignatureV4 } from "@smithy/signature-v4";
-import type { AwsCredentialIdentity, HttpRequest } from "@smithy/types";
+import type { AwsCredentialIdentity, AwsCredentialIdentityProvider, HttpRequest } from "@smithy/types";
 import type { Model, ProviderHeaders, SimpleStreamOptions, StreamFunction } from "../types.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import {
@@ -27,9 +24,28 @@ function getConfiguredProfile(
 	return options?.profile || getProviderEnvValue("AWS_PROFILE", options?.env);
 }
 
+async function loadSigV4Dependencies() {
+	try {
+		const [{ Sha256 }, { defaultProvider }, { SignatureV4 }] = await Promise.all([
+			import("@aws-crypto/sha256-js"),
+			import("@aws-sdk/credential-provider-node"),
+			import("@smithy/signature-v4"),
+		]);
+		return { Sha256, defaultProvider, SignatureV4 };
+	} catch (error) {
+		throw new Error(
+			"AWS credential-chain auth for Amazon Bedrock Mantle requires optional peer dependencies. " +
+				"Install @aws-crypto/sha256-js, @aws-sdk/credential-provider-node, and @smithy/signature-v4, " +
+				"or set AWS_BEARER_TOKEN_BEDROCK to use bearer-token auth.",
+			{ cause: error },
+		);
+	}
+}
+
 function getConfiguredCredentials(
+	defaultProvider: typeof import("@aws-sdk/credential-provider-node").defaultProvider,
 	options?: Pick<AmazonBedrockMantleOpenAIResponsesOptions, "profile" | "env">,
-): AwsCredentialIdentity | ReturnType<typeof defaultProvider> {
+): AwsCredentialIdentity | AwsCredentialIdentityProvider {
 	const profile = getConfiguredProfile(options);
 	if (profile) return defaultProvider({ profile });
 
@@ -115,8 +131,9 @@ function createSigV4Fetch(
 		headers.host = url.host;
 		if (body && !headers["content-length"]) headers["content-length"] = String(body.byteLength);
 
+		const { Sha256, SignatureV4, defaultProvider } = await loadSigV4Dependencies();
 		const signer = new SignatureV4({
-			credentials: getConfiguredCredentials(options),
+			credentials: getConfiguredCredentials(defaultProvider, options),
 			region,
 			service: SIGNING_SERVICE,
 			sha256: Sha256,

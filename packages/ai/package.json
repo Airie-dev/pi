@@ -61,13 +61,10 @@
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "0.91.1",
-		"@aws-crypto/sha256-js": "5.2.0",
 		"@aws-sdk/client-bedrock-runtime": "3.1048.0",
-		"@aws-sdk/credential-provider-node": "3.972.42",
 		"@earendil-works/pi-telemetry": "^0.84.2",
 		"@google/genai": "1.52.0",
 		"@smithy/node-http-handler": "4.7.3",
-		"@smithy/signature-v4": "5.4.3",
 		"http-proxy-agent": "7.0.2",
 		"https-proxy-agent": "7.0.6",
 		"openai": "6.40.0",
@@ -95,8 +92,27 @@
 		"node": ">=22.19.0"
 	},
 	"devDependencies": {
+		"@aws-crypto/sha256-js": "5.2.0",
+		"@aws-sdk/credential-provider-node": "3.972.42",
+		"@smithy/signature-v4": "5.4.3",
 		"@types/node": "24.12.4",
 		"canvas": "3.2.3",
 		"vitest": "4.1.9"
+	},
+	"peerDependencies": {
+		"@aws-crypto/sha256-js": "5.2.0",
+		"@aws-sdk/credential-provider-node": "3.972.42",
+		"@smithy/signature-v4": "5.4.3"
+	},
+	"peerDependenciesMeta": {
+		"@aws-crypto/sha256-js": {
+			"optional": true
+		},
+		"@aws-sdk/credential-provider-node": {
+			"optional": true
+		},
+		"@smithy/signature-v4": {
+			"optional": true
+		}
 	}
 }
