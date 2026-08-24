@@ -12,8 +12,9 @@ import {
 
 export interface AmazonBedrockMantleOpenAIResponsesOptions extends OpenAIResponsesOptions, BedrockMantleAuthOptions {}
 
-function getMantleOpenAIResponsesBaseUrl(region: string): string {
-	return `https://bedrock-mantle.${region}.api.aws/openai/v1`;
+function getMantleOpenAIResponsesBaseUrl(region: string, modelBaseUrl: string | undefined): string {
+	const path = modelBaseUrl ? new URL(modelBaseUrl).pathname.replace(/\/$/, "") : "/openai/v1";
+	return `https://bedrock-mantle.${region}.api.aws${path || "/openai/v1"}`;
 }
 
 function withMantleOpenAIResponsesOptions(
@@ -23,7 +24,7 @@ function withMantleOpenAIResponsesOptions(
 	const auth = prepareBedrockMantleAuth(options, {
 		modelBaseUrl: model.baseUrl,
 		headers: model.headers,
-		baseUrlForRegion: getMantleOpenAIResponsesBaseUrl,
+		baseUrlForRegion: (region) => getMantleOpenAIResponsesBaseUrl(region, model.baseUrl),
 		regionFromBaseUrl: getRegionFromBedrockMantleBaseUrl,
 	});
 	const requestModel = { ...model, baseUrl: auth.baseUrl };

@@ -34,19 +34,48 @@ describe("Amazon Bedrock Models", () => {
 		expect(models.some((model) => model.id === "anthropic.claude-opus-5")).toBe(false);
 	});
 
-	it("exposes OpenAI-compatible Bedrock models under the Bedrock provider without routing them through Converse", () => {
-		const openAIResponsesModel = getModel("amazon-bedrock", "openai.gpt-5.5");
-		expect(openAIResponsesModel).toMatchObject({
-			api: "openai-responses",
-			provider: "amazon-bedrock",
-			baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
-		});
+	it("routes Bedrock Responses-compatible models through Mantle under the Bedrock provider", () => {
+		for (const id of [
+			"google.gemma-4-31b",
+			"google.gemma-4-26b-a4b",
+			"google.gemma-4-e2b",
+			"openai.gpt-5.6-sol",
+			"openai.gpt-5.6-terra",
+			"openai.gpt-5.6-luna",
+			"openai.gpt-5.6-cyber",
+			"openai.gpt-daybreak-blue-5.6-sol",
+			"openai.gpt-5.5",
+			"openai.gpt-5.4",
+			"xai.grok-4.3",
+			"xai.grok-4.6",
+		]) {
+			expect(getModel("amazon-bedrock", id)).toMatchObject({
+				api: "openai-responses",
+				provider: "amazon-bedrock",
+				baseUrl: "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+			});
+		}
 
-		const converseModel = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1");
-		expect(converseModel).toMatchObject({
-			api: "bedrock-converse-stream",
-			provider: "amazon-bedrock",
-		});
+		for (const id of ["openai.gpt-oss-120b", "openai.gpt-oss-20b"]) {
+			expect(getModel("amazon-bedrock", id)).toMatchObject({
+				api: "openai-responses",
+				provider: "amazon-bedrock",
+				baseUrl: "https://bedrock-mantle.us-east-1.api.aws/v1",
+			});
+		}
+	});
+
+	it("keeps non-Mantle Bedrock Runtime models on Converse", () => {
+		for (const id of [
+			"us.anthropic.claude-opus-4-6-v1",
+			"openai.gpt-oss-120b-1:0",
+			"global.openai.gpt-5.6-sol",
+		]) {
+			expect(getModel("amazon-bedrock", id)).toMatchObject({
+				api: "bedrock-converse-stream",
+				provider: "amazon-bedrock",
+			});
+		}
 	});
 
 	if (hasBedrockCredentials() && process.env.BEDROCK_EXTENSIVE_MODEL_TEST) {
