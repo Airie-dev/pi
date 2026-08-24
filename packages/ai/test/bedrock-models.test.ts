@@ -48,7 +48,7 @@ describe("Amazon Bedrock Models", () => {
 			"openai.gpt-5.4",
 			"xai.grok-4.3",
 			"xai.grok-4.6",
-		]) {
+		] as const) {
 			expect(getModel("amazon-bedrock", id)).toMatchObject({
 				api: "openai-responses",
 				provider: "amazon-bedrock",
@@ -56,7 +56,7 @@ describe("Amazon Bedrock Models", () => {
 			});
 		}
 
-		for (const id of ["openai.gpt-oss-120b", "openai.gpt-oss-20b"]) {
+		for (const id of ["openai.gpt-oss-120b", "openai.gpt-oss-20b"] as const) {
 			expect(getModel("amazon-bedrock", id)).toMatchObject({
 				api: "openai-responses",
 				provider: "amazon-bedrock",
@@ -70,7 +70,7 @@ describe("Amazon Bedrock Models", () => {
 			"us.anthropic.claude-opus-4-6-v1",
 			"openai.gpt-oss-120b-1:0",
 			"global.openai.gpt-5.6-sol",
-		]) {
+		] as const) {
 			expect(getModel("amazon-bedrock", id)).toMatchObject({
 				api: "bedrock-converse-stream",
 				provider: "amazon-bedrock",
