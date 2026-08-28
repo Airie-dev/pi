@@ -12,6 +12,18 @@ export interface SourceInfo {
 	changelogPath?: string;
 }
 
+export interface SourcePackageIdentity {
+	source: string;
+	scope: SourceScope;
+}
+
+export function getSourcePackageKey(identity: SourcePackageIdentity): string {
+	return JSON.stringify({
+		source: identity.source,
+		scope: identity.scope,
+	});
+}
+
 export function createSourceInfo(path: string, metadata: PathMetadata): SourceInfo {
 	return {
 		path,
