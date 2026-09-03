@@ -35,8 +35,8 @@ export function validateInternalVersion(version) {
 export function createPackageNameMap(packageNames) {
 	const nameMap = new Map();
 	for (const name of packageNames) {
-		if (!name.startsWith(`${UPSTREAM_SCOPE}/pi-`)) {
-			throw new Error(`Unexpected public package outside ${UPSTREAM_SCOPE}/pi-*: ${name}`);
+		if (!name.startsWith(`${UPSTREAM_SCOPE}/`)) {
+			throw new Error(`Unexpected public package outside ${UPSTREAM_SCOPE}: ${name}`);
 		}
 		nameMap.set(name, `${INTERNAL_SCOPE}/${name.slice(`${UPSTREAM_SCOPE}/`.length)}`);
 	}

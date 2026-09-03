@@ -25,6 +25,13 @@ test("validates the internal version convention", () => {
 	assert.throws(() => validateInternalVersion("0.84.3-dev.1"), /must match/);
 });
 
+test("maps every public upstream package into the internal scope", () => {
+	const packages = createPackageNameMap(["@earendil-works/pi-ai", "@earendil-works/chord"]);
+
+	assert.equal(packages.get("@earendil-works/pi-ai"), "@airie-dev/pi-ai");
+	assert.equal(packages.get("@earendil-works/chord"), "@airie-dev/chord");
+});
+
 test("rewrites package identity and pins internal dependencies", () => {
 	const manifest = rewritePackageManifest(
 		{

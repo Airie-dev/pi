@@ -138,7 +138,7 @@ prepareOutputDirectory(out);
 const tempRoot = mkdtempSync(join(tmpdir(), "pi-internal-packages-"));
 
 try {
-	console.log(`Packaging ${publicPackages.length} public workspaces as ${INTERNAL_SCOPE}/pi-* at ${version}\n`);
+	console.log(`Packaging ${publicPackages.length} public workspaces under ${INTERNAL_SCOPE} at ${version}\n`);
 	const packaged = publicPackages.map((pkg) => packageWorkspace(pkg, version, nameMap, out, tempRoot));
 	const manifest = {
 		formatVersion: 1,
