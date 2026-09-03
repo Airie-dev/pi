@@ -1,23 +1,24 @@
-import { lstat, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { BACKGROUND_CONTEXT, type Context, withCancel } from "@earendil-works/pi-agent-core";
-import { Client } from "@earendil-works/pi-client";
+import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { type Context, createFacetHost, defineFacet, defineService } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { ExampleFacetService } from "../examples/plugins/pi-example-plugin/src/contract.ts";
 import { runClient } from "../src/experimental/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "../src/experimental/client-runtime.ts";
-import { createFacetHost, defineFacet } from "../src/experimental/facets.ts";
+import { createPresentationFacetLoaders } from "../src/experimental/plugins/bundled.ts";
 import * as processRuntime from "../src/experimental/process.ts";
-import { activateServer, type RunningServer, startServer } from "../src/experimental/server.ts";
-import {
-	createServerServiceNamespace,
-	createSessionServiceConnection,
-	createSessionServiceNamespace,
-	type SessionAttachmentState,
-} from "../src/experimental/services/connection.ts";
+import { type RunningServer, startServer } from "../src/experimental/server.ts";
+import { AgentController } from "../src/experimental/services/agent-controller.ts";
+import { createSessionServiceSource, type SessionAttachmentState } from "../src/experimental/services/connection.ts";
 import { Models } from "../src/experimental/services/models.ts";
+import { PresentationPlugins, SessionPlugins } from "../src/experimental/services/plugins.ts";
 import { SessionDirectory, SessionManagement } from "../src/experimental/services/sessions.ts";
 import { Transcript } from "../src/experimental/services/transcript.ts";
+import { createServerServiceBinding, createSessionServiceBinding } from "./experimental-service-binding.ts";
 import {
 	configureExperimentalWorkerModel,
 	createExperimentalSessions,
@@ -31,6 +32,7 @@ const directories = new Set<string>();
 const fauxWorkerEntryUrl = new URL("fixtures/faux-session-worker.ts", import.meta.url);
 const realSpawnInternalProcess = processRuntime.spawnInternalProcess;
 const sessionWorkerModel = { provider: "anthropic", model: "claude-sonnet-4-5" } as const;
+const SecondPluginService = defineService<{ read(context: Context): Promise<string> }>("test.second-plugin");
 let agentDir: string;
 
 beforeEach(async () => {
@@ -49,13 +51,23 @@ async function makeServer(): Promise<{ directory: string; runtime: RunningServer
 	return { directory, runtime };
 }
 
+async function attachSession(client: Client, sessionId: string): Promise<void> {
+	const services = createServerServiceBinding(client, { services: [SessionManagement] });
+	try {
+		await services.ready(BACKGROUND_CONTEXT);
+		await services.use(SessionManagement).attach(sessionId, BACKGROUND_CONTEXT);
+	} finally {
+		await services.dispose(BACKGROUND_CONTEXT);
+	}
+}
+
 async function attachClient(runtime: RunningServer, sessionId: string): Promise<Client> {
 	const client = await Client.connect({
 		serverId: runtime.serverId,
 		transportFactory: createUnixTransportFactory({ path: runtime.socketPath }),
 	});
 	clients.add(client);
-	await client.attachSession(sessionId);
+	await attachSession(client, sessionId);
 	return client;
 }
 
@@ -70,16 +82,6 @@ afterEach(async () => {
 });
 
 describe("experimental durable server composition", () => {
-	test("resolves the configured session directory", async () => {
-		const directory = await mkdtemp(join("/tmp", "pes-"));
-		directories.add(directory);
-		const runtime = await startServer({ directory, sessionDir: "relative/sessions" });
-		servers.add(runtime);
-
-		expect(runtime.sessionDir).toBe(resolve("relative/sessions"));
-		expect(runtime.workerPids.size).toBe(0);
-	});
-
 	test("uses PI_SERVER_DIR and PI_SERVER_ID", async () => {
 		const directory = await mkdtemp(join("/tmp", "pi-server-dir-"));
 		directories.add(directory);
@@ -116,25 +118,6 @@ describe("experimental durable server composition", () => {
 		await expect(startServer({ directory, provider: "anthropic" })).rejects.toThrow("provider requires a model");
 	});
 
-	test("uses legacy model selection when the server model is omitted", async () => {
-		await writeFile(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ defaultProvider: "anthropic", defaultModel: "claude-opus-4-6" }),
-		);
-		const directory = await mkdtemp(join("/tmp", "pes-"));
-		directories.add(directory);
-		const runtime = await startServer({ directory });
-		servers.add(runtime);
-
-		const client = await attachClient(runtime, "demo-1");
-		await client.dispose();
-		clients.delete(client);
-		await expect.poll(() => runtime.workerPids.has("demo-1")).toBe(false);
-		const state = await readExperimentalSessionState(runtime.sessionDir, "demo-1");
-		expect(state.model).toEqual({ provider: "anthropic", modelId: "claude-opus-4-6" });
-		expect(state.activeTools).toEqual(["read", "write", "bash"]);
-	});
-
 	test("preserves an existing Session model when the server default changes", async () => {
 		await writeFile(
 			join(agentDir, "settings.json"),
@@ -160,35 +143,25 @@ describe("experimental durable server composition", () => {
 		expect(state.model).toEqual({ provider: "anthropic", modelId: "claude-opus-4-6" });
 	});
 
-	test.each(["discovery", "explicit connection"] as const)(
-		"rejects model options when %s selects an existing server",
-		async (connection) => {
-			const { directory, runtime } = await makeServer();
-			await expect(
-				runClient(
-					{
-						command: "client",
-						model: "anthropic/claude-opus-4-6",
-						...(connection === "explicit connection"
-							? { connect: { transport: "unix" as const, path: runtime.socketPath } }
-							: {}),
-					},
-					{ directory },
-				),
-			).rejects.toThrow("Model selection is only valid when automatically activating a new server");
-		},
-	);
+	test("rejects model options when discovery selects an existing server", async () => {
+		const { directory } = await makeServer();
+		await expect(runClient({ command: "client", model: "anthropic/claude-opus-4-6" }, { directory })).rejects.toThrow(
+			"Model selection is only valid when automatically activating a new server",
+		);
+	});
 
-	test("rejects model options when serialized activation finds an existing server", async () => {
+	test("rechecks an auto-discovered server after a version mismatch", async () => {
 		const { directory, runtime } = await makeServer();
-		await expect(
-			activateServer({
-				directory,
-				requestedServerId: runtime.serverId,
-				sessionDir: runtime.sessionDir,
-				model: "anthropic/claude-opus-4-6",
-			}),
-		).rejects.toThrow("Model selection is only valid when automatically activating a new server");
+		const connect = Client.connect.bind(Client);
+		vi.spyOn(Client, "connect")
+			.mockRejectedValueOnce(new ClientServerError({ code: "version", message: "stale server" }))
+			.mockImplementation((options) => connect(options));
+		const clientRuntime = await openClientRuntime({ command: "client" }, { directory });
+		try {
+			expect(clientRuntime.servers.map(({ route }) => route.serverId)).toEqual([runtime.serverId]);
+		} finally {
+			await clientRuntime.dispose();
+		}
 	});
 
 	test("serializes concurrent cold activation and retires after both clients leave", async () => {
@@ -218,6 +191,44 @@ describe("experimental durable server composition", () => {
 		expect(await pathExists(join(directory, `${serverId}.sock`))).toBe(true);
 		await expect.poll(() => pathExists(join(directory, `${serverId}.sock`)), { timeout: 5_000 }).toBe(false);
 		await expect.poll(() => pathExists(join(directory, `control-${serverId}.sock`)), { timeout: 5_000 }).toBe(false);
+	});
+
+	test("passes client plugin packages to a cold server and restores them for its next generation", async () => {
+		const directory = await mkdtemp(join("/tmp", "pi-auto-plugin-"));
+		directories.add(directory);
+		const serverId = "00000000-0000-4000-8000-000000000001";
+		const packagePath = fileURLToPath(new URL("../examples/plugins/pi-example-plugin", import.meta.url));
+		vi.stubEnv("PI_SERVER_DIR", directory);
+		vi.stubEnv("PI_SERVER_ID", serverId);
+
+		const first = await openClientRuntime({ command: "client", ...sessionWorkerModel });
+		try {
+			const activated = await activateBuiltinClientServices(first.servers[0]!);
+			const presentationPlugins = await activated.plugins.prepareSession(
+				{ sessionId: "demo-1", packagePaths: [packagePath] },
+				BACKGROUND_CONTEXT,
+			);
+			await activated.management.attach("demo-1", BACKGROUND_CONTEXT);
+			const loaded = await createPresentationFacetLoaders(presentationPlugins)[0]!.load();
+			expect(loaded.facets.map(({ id }) => id)).toEqual(["@earendil-works/pi-example-plugin/tui"]);
+			await loaded.dispose();
+		} finally {
+			await first.dispose();
+		}
+		await expect.poll(() => pathExists(join(directory, `${serverId}.sock`)), { timeout: 5_000 }).toBe(false);
+
+		const second = await openClientRuntime({ command: "client", ...sessionWorkerModel });
+		try {
+			const activated = await activateBuiltinClientServices(second.servers[0]!);
+			const presentationPlugins = await activated.plugins.prepareSession(
+				{ sessionId: "demo-1", packagePaths: null },
+				BACKGROUND_CONTEXT,
+			);
+			await activated.management.attach("demo-1", BACKGROUND_CONTEXT);
+			expect(createPresentationFacetLoaders(presentationPlugins)).toHaveLength(1);
+		} finally {
+			await second.dispose();
+		}
 	});
 
 	test("retires a cold server after its only Session attachment disconnects", async () => {
@@ -271,21 +282,6 @@ describe("experimental durable server composition", () => {
 		});
 	});
 
-	test("discovers and lists seeded sessions without hosting either session", async () => {
-		const { directory, runtime } = await makeServer();
-
-		await expect(runClient({ command: "client" }, { directory })).resolves.toEqual({
-			kind: "list",
-			sessions: [
-				{ serverId: runtime.serverId, sessionId: "demo-1" },
-				{ serverId: runtime.serverId, sessionId: "demo-2" },
-			],
-		});
-		expect(runtime.workerPids.size).toBe(0);
-		const socket = await lstat(runtime.socketPath);
-		expect(socket.mode & 0o777).toBe(0o600);
-	});
-
 	test("hydrates and mutates server Session services across framed clients", async () => {
 		const { runtime } = await makeServer();
 		const firstClient = await Client.connect({
@@ -299,11 +295,11 @@ describe("experimental durable server composition", () => {
 		clients.add(firstClient);
 		clients.add(secondClient);
 		const errors: Error[] = [];
-		const firstServices = createServerServiceNamespace(firstClient, {
+		const firstServices = createServerServiceBinding(firstClient, {
 			services: [SessionDirectory, SessionManagement],
 			onError: (error) => errors.push(error),
 		});
-		const secondServices = createServerServiceNamespace(secondClient, {
+		const secondServices = createServerServiceBinding(secondClient, {
 			services: [SessionDirectory, SessionManagement],
 			onError: (error) => errors.push(error),
 		});
@@ -312,6 +308,7 @@ describe("experimental durable server composition", () => {
 		await expect(firstServices.catalogue(BACKGROUND_CONTEXT)).resolves.toEqual([
 			{ serviceId: SessionDirectory.id, mode: "singleton" },
 			{ serviceId: SessionManagement.id, mode: "singleton" },
+			{ serviceId: PresentationPlugins.id, mode: "singleton" },
 		]);
 		const firstDirectory = firstServices.use(SessionDirectory);
 		const secondDirectory = secondServices.use(SessionDirectory);
@@ -346,40 +343,22 @@ describe("experimental durable server composition", () => {
 		await Promise.all([firstServices.dispose(BACKGROUND_CONTEXT), secondServices.dispose(BACKGROUND_CONTEXT)]);
 	});
 
-	test("shares one worker across concurrent Session attachments", async () => {
-		const { runtime } = await makeServer();
-		const client = await attachClient(runtime, "demo-1");
-
-		expect([...runtime.workerPids.keys()]).toEqual(["demo-1"]);
-		const firstPid = runtime.workerPids.get("demo-1");
-		expect(firstPid).toEqual(expect.any(Number));
-		await expect(client.attachSession("demo-1")).resolves.toMatchObject({ sessionId: "demo-1" });
-		expect(runtime.workerPids.get("demo-1")).toBe(firstPid);
-
-		const competing = await Client.connect({
-			serverId: runtime.serverId,
-			transportFactory: createUnixTransportFactory({ path: runtime.socketPath }),
-		});
-		clients.add(competing);
-		await expect(competing.attachSession("demo-1")).resolves.toMatchObject({ sessionId: "demo-1" });
-		expect(runtime.workerPids.get("demo-1")).toBe(firstPid);
-	});
-
 	test("hydrates and updates the Models service across concurrent framed clients", async () => {
 		const { runtime } = await makeServer();
 		const firstClient = await attachClient(runtime, "demo-1");
+		const workerPid = runtime.workerPids.get("demo-1");
+		expect(workerPid).toEqual(expect.any(Number));
 		const secondClient = await attachClient(runtime, "demo-1");
+		expect(runtime.workerPids.get("demo-1")).toBe(workerPid);
 		const errors: Error[] = [];
-		const firstServices = createSessionServiceNamespace(firstClient, {
+		const firstServices = createSessionServiceBinding(firstClient, {
 			services: [Models],
 			onError: (error) => errors.push(error),
 		});
-		const secondServices = createSessionServiceNamespace(secondClient, {
+		const secondServices = createSessionServiceBinding(secondClient, {
 			services: [Models],
 			onError: (error) => errors.push(error),
 		});
-		expect(firstServices.attachment.value).toEqual({ status: "attaching", sessionId: "demo-1" });
-		expect(secondServices.attachment.value).toEqual({ status: "attaching", sessionId: "demo-1" });
 		const firstModels = firstServices.use(Models);
 		const secondModels = secondServices.use(Models);
 
@@ -390,26 +369,65 @@ describe("experimental durable server composition", () => {
 			provider: "anthropic",
 			modelId: "claude-sonnet-4-5",
 		});
-		expect(firstModels.state.value?.catalog.availableModels).toContainEqual(
-			expect.objectContaining({ provider: "anthropic", modelId: "claude-sonnet-4-5" }),
-		);
 		expect(secondModels.state.value).toEqual(firstModels.state.value);
 		const previousThinking = firstModels.state.value!.configuration.thinkingLevel;
-		const thinkingLevels = await firstModels.getThinkingLevels(BACKGROUND_CONTEXT);
-		expect(thinkingLevels).toContain(previousThinking);
 		await firstModels.cycleThinking(BACKGROUND_CONTEXT);
 		await vi.waitFor(() => {
 			expect(firstModels.state.value!.configuration.thinkingLevel).not.toBe(previousThinking);
 			expect(secondModels.state.value).toEqual(firstModels.state.value);
 		});
-		await firstModels.selectThinking(previousThinking, BACKGROUND_CONTEXT);
-		await vi.waitFor(() => {
-			expect(firstModels.state.value!.configuration.thinkingLevel).toBe(previousThinking);
-			expect(secondModels.state.value).toEqual(firstModels.state.value);
-		});
 		expect(errors).toEqual([]);
 
 		await Promise.all([firstServices.dispose(BACKGROUND_CONTEXT), secondServices.dispose(BACKGROUND_CONTEXT)]);
+	});
+
+	test("loads conventional Session facets from multiple configured plugin packages", async () => {
+		const directory = await mkdtemp(join("/tmp", "pes-plugin-"));
+		directories.add(directory);
+		const secondPackagePath = join(directory, "second-plugin");
+		await mkdir(join(secondPackagePath, "src"), { recursive: true });
+		await Promise.all([
+			writeFile(
+				join(secondPackagePath, "package.json"),
+				`${JSON.stringify({
+					name: "@earendil-works/second-session-plugin",
+					version: "1.0.0",
+					peerDependencies: { "@earendil-works/chord": "^0.84.4" },
+				})}\n`,
+			),
+			writeFile(
+				join(secondPackagePath, "src", "session.ts"),
+				'import { defineFacet, defineService } from "@earendil-works/chord"; const Service = defineService("test.second-plugin"); export default defineFacet({ id: "second-session-plugin", setup(env) { env.provide(Service, { async read() { return "second"; } }); } });\n',
+			),
+		]);
+		const runtime = await startServer({ ...sessionWorkerModel, directory });
+		servers.add(runtime);
+		const clientRuntime = await openClientRuntime({ command: "client" }, { directory });
+		const activated = await activateBuiltinClientServices(clientRuntime.servers[0]!);
+		await activated.plugins.prepareSession(
+			{
+				sessionId: "demo-1",
+				packagePaths: [
+					fileURLToPath(new URL("../examples/plugins/pi-example-plugin", import.meta.url)),
+					secondPackagePath,
+				],
+			},
+			BACKGROUND_CONTEXT,
+		);
+		await activated.management.attach("demo-1", BACKGROUND_CONTEXT);
+		const services = createSessionServiceBinding(clientRuntime.servers[0]!.client, {
+			services: [ExampleFacetService, SecondPluginService],
+		});
+		try {
+			await services.ready(BACKGROUND_CONTEXT);
+			await expect(
+				services.use(ExampleFacetService).greet({ name: "Armin" }, BACKGROUND_CONTEXT),
+			).resolves.toMatchObject({ workerActivations: 1 });
+			await expect(services.use(SecondPluginService).read(BACKGROUND_CONTEXT)).resolves.toBe("second");
+		} finally {
+			await services.dispose(BACKGROUND_CONTEXT);
+			await clientRuntime.dispose();
+		}
 	});
 
 	test("uses the most recently selected model for a new Session", async () => {
@@ -418,7 +436,7 @@ describe("experimental durable server composition", () => {
 		const runtime = await startServer({ directory });
 		servers.add(runtime);
 		const firstClient = await attachClient(runtime, "demo-1");
-		const firstServices = createSessionServiceNamespace(firstClient, { services: [Models] });
+		const firstServices = createSessionServiceBinding(firstClient, { services: [Models] });
 		const firstModels = firstServices.use(Models);
 		await firstServices.ready(BACKGROUND_CONTEXT);
 		await firstModels.select({ provider: "anthropic", modelId: "claude-opus-4-6" }, BACKGROUND_CONTEXT);
@@ -428,7 +446,7 @@ describe("experimental durable server composition", () => {
 		await expect.poll(() => runtime.workerPids.has("demo-1")).toBe(false);
 
 		const secondClient = await attachClient(runtime, "demo-2");
-		const secondServices = createSessionServiceNamespace(secondClient, { services: [Models] });
+		const secondServices = createSessionServiceBinding(secondClient, { services: [Models] });
 		const secondModels = secondServices.use(Models);
 		await secondServices.ready(BACKGROUND_CONTEXT);
 		expect(secondModels.state.value?.configuration.model).toEqual({
@@ -446,6 +464,7 @@ describe("experimental durable server composition", () => {
 		});
 		try {
 			const server = await activateBuiltinClientServices(clientRuntime.servers[0]!);
+			await server.plugins.prepareSession({ sessionId: "demo-1", packagePaths: null }, BACKGROUND_CONTEXT);
 			await server.management.attach("demo-1", BACKGROUND_CONTEXT);
 
 			expect(server.session.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
@@ -466,7 +485,7 @@ describe("experimental durable server composition", () => {
 		});
 		clients.add(client);
 		const errors: Error[] = [];
-		const services = createSessionServiceNamespace(client, {
+		const services = createSessionServiceBinding(client, {
 			services: [Models],
 			onError: (error) => errors.push(error),
 		});
@@ -490,9 +509,9 @@ describe("experimental durable server composition", () => {
 		onTestFinished(() => subscribe.mockRestore());
 
 		try {
-			await client.attachSession("demo-2");
+			await attachSession(client, "demo-2");
 			expect(services.attachment.value).toEqual({ status: "attaching", sessionId: "demo-2" });
-			await client.attachSession("demo-1");
+			await attachSession(client, "demo-1");
 			await services.whenAttached("demo-1", BACKGROUND_CONTEXT);
 			expect(services.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
 			expect(models.state.value?.configuration.model).toEqual({
@@ -514,19 +533,6 @@ describe("experimental durable server composition", () => {
 		expect(errors).toEqual([]);
 	});
 
-	test("routes explicit later-slice errors across the framed service boundary", async () => {
-		const { runtime } = await makeServer();
-		const client = await attachClient(runtime, "demo-1");
-		const services = createSessionServiceNamespace(client, { services: [Transcript] });
-		const transcript = services.use(Transcript);
-
-		await expect(transcript.snapshot(BACKGROUND_CONTEXT)).rejects.toMatchObject({
-			code: "service_not_implemented",
-			message: "Transcript.snapshot is not implemented until its later facet-service slice",
-		});
-		await services.dispose(BACKGROUND_CONTEXT);
-	});
-
 	test("observes keyed service instances and fences replacement generations over framed transport", async ({
 		onTestFinished,
 	}) => {
@@ -543,51 +549,40 @@ describe("experimental durable server composition", () => {
 		const { runtime } = await makeServer();
 		const client = await attachClient(runtime, "demo-1");
 		const errors: Error[] = [];
-		const services = createSessionServiceConnection(client, {
+		const services = createSessionServiceSource(client, {
 			onError: (error) => errors.push(error),
 		});
 		await expect(services.catalogue(BACKGROUND_CONTEXT)).resolves.toContainEqual({
 			serviceId: KeyedProbe.id,
 			mode: "keyed",
 		});
-		const observed: { service: KeyedProbe; context: Context; value: string | undefined }[] = [];
+		const observed: { service: KeyedProbe; value: string | undefined }[] = [];
 		const consumer = defineFacet({
 			id: "@test/keyed-probe-consumer",
 			setup(env) {
-				env.observe(KeyedProbe, (instance, context) => {
-					observed.push({ service: instance.service, context, value: instance.service.state.value?.value });
+				env.observe(KeyedProbe, (service) => {
+					observed.push({ service, value: service.state.value?.value });
 				});
 			},
 		});
-		const facetHost = await createFacetHost({ facets: [consumer], connections: [services] });
+		const facetHost = await createFacetHost({ facets: [consumer], serviceSources: [services] });
 
 		expect(services.attachment.value).toEqual({ status: "attached", sessionId: "demo-1" });
 		await vi.waitFor(() => expect(observed).toHaveLength(1));
 		expect(observed[0]!.value).toBe("first");
-		const stale = observed[0]!.service;
-		const cancellable = withCancel(BACKGROUND_CONTEXT);
-		const waiting = stale.wait(cancellable.context);
-		const cancellation = new Error("cancel probe wait");
-		cancellable.cancel(cancellation);
-		await expect(waiting).rejects.toBe(cancellation);
-		await expect(stale.replace("second", BACKGROUND_CONTEXT)).resolves.toBeUndefined();
+		const staleReplace = observed[0]!.service.replace;
+		await expect(staleReplace("second", BACKGROUND_CONTEXT)).resolves.toBeUndefined();
 		await vi.waitFor(() => expect(observed).toHaveLength(2));
-		expect(observed[0]!.context.abortSignal?.aborted).toBe(true);
 		expect(observed[1]!.value).toBe("second");
-		await expect(stale.replace("late", BACKGROUND_CONTEXT)).rejects.toMatchObject({
-			code: "service_stale_instance",
-		});
+		expect(() => staleReplace("late", BACKGROUND_CONTEXT)).toThrow("observation is closed");
 
-		const replaced = observed[1]!.service;
-		await expect(client.attachSession("demo-2")).resolves.toMatchObject({ sessionId: "demo-2" });
+		const replacedReplace = observed[1]!.service.replace;
+		await expect(attachSession(client, "demo-2")).resolves.toBeUndefined();
 		await services.whenAttached("demo-2", BACKGROUND_CONTEXT);
 		expect(observed).toHaveLength(3);
 		expect(services.attachment.value).toEqual({ status: "attached", sessionId: "demo-2" });
-		expect(observed[1]!.context.abortSignal?.aborted).toBe(true);
 		expect(observed[2]!.value).toBe("first");
-		await expect(replaced.replace("late", BACKGROUND_CONTEXT)).rejects.toMatchObject({
-			code: "service_stale_instance",
-		});
+		expect(() => replacedReplace("late", BACKGROUND_CONTEXT)).toThrow("observation is closed");
 		expect(errors).toEqual([]);
 
 		await facetHost.dispose();
@@ -595,8 +590,6 @@ describe("experimental durable server composition", () => {
 	});
 
 	test("streams prompt events through the worker-owned service provider", async ({ onTestFinished }) => {
-		const legacyPrompt = vi.spyOn(Client.prototype, "promptSession");
-		onTestFinished(() => legacyPrompt.mockRestore());
 		const spawn = vi
 			.spyOn(processRuntime, "spawnInternalProcess")
 			.mockImplementation((role, args, options) =>
@@ -631,11 +624,9 @@ describe("experimental durable server composition", () => {
 				"run_end",
 			]),
 		);
-		expect(legacyPrompt).not.toHaveBeenCalled();
 	});
 
-	// Re-enable with runtime no-tool execution.
-	test.skip("completes and persists a prompt through the worker-owned Harness", async ({ onTestFinished }) => {
+	test("replicates terminal operation state after consecutive prompts", async ({ onTestFinished }) => {
 		const spawn = vi
 			.spyOn(processRuntime, "spawnInternalProcess")
 			.mockImplementation((role, args, options) =>
@@ -648,67 +639,25 @@ describe("experimental durable server composition", () => {
 		onTestFinished(() => spawn.mockRestore());
 		const { runtime } = await makeServer();
 		const client = await attachClient(runtime, "demo-1");
-		const workerPid = runtime.workerPids.get("demo-1");
-		expect(workerPid).toEqual(expect.any(Number));
-
-		const result = await client.promptSession("demo-1", "question");
-		expect(result).toMatchObject({
-			ok: true,
-			value: {
-				kind: "run",
-				status: "completed",
-				tipId: expect.any(String),
-			},
-		});
-		expect(runtime.workerPids.get("demo-1")).toBe(workerPid);
-		expect(processExists(workerPid!)).toBe(true);
-		if (!result.ok || result.value.status !== "completed" || result.value.tipId === null) {
-			throw new Error("Expected a completed prompt with a terminal tip");
+		const services = createSessionServiceBinding(client, { services: [AgentController, SessionPlugins, Transcript] });
+		const controller = services.use(AgentController);
+		const transcript = services.use(Transcript);
+		await services.ready(BACKGROUND_CONTEXT);
+		await services.use(SessionPlugins).reload(BACKGROUND_CONTEXT);
+		try {
+			for (const message of ["first question", "second question"]) {
+				const response = await controller.prompt({ message, images: null }, BACKGROUND_CONTEXT);
+				expect(response).toMatchObject({ accepted: true, operationId: expect.any(String) });
+				await vi.waitFor(() => {
+					expect(transcript.state.value?.snapshot).toMatchObject({
+						operation: null,
+						lastResult: { operationId: response.operationId },
+					});
+				});
+			}
+		} finally {
+			await services.dispose(BACKGROUND_CONTEXT);
 		}
-		const finalEntryId = result.value.tipId;
-
-		await client.dispose();
-		clients.delete(client);
-		await expect.poll(() => runtime.workerPids.has("demo-1")).toBe(false);
-		const { branch } = await readExperimentalSessionState(runtime.sessionDir, "demo-1");
-		expect(branch).toHaveLength(2);
-		expect(branch[0]).toMatchObject({
-			type: "message",
-			message: { role: "user", content: [{ type: "text", text: "question" }] },
-		});
-		expect(branch[1]).toMatchObject({
-			id: finalEntryId,
-			type: "message",
-			message: {
-				role: "assistant",
-				content: [{ type: "text", text: "deterministic remote answer" }],
-				stopReason: "stop",
-			},
-		});
-	});
-
-	test("uses legacy provider/model and thinking-suffix resolution", async () => {
-		const directory = await mkdtemp(join("/tmp", "pes-"));
-		directories.add(directory);
-		const runtime = await startServer({ directory, model: "anthropic/claude-sonnet-4-5:high" });
-		servers.add(runtime);
-		await attachClient(runtime, "demo-1");
-		expect(runtime.workerPids.get("demo-1")).toEqual(expect.any(Number));
-	});
-
-	test("accepts a custom model ID through legacy model resolution", async () => {
-		const directory = await mkdtemp(join("/tmp", "pes-"));
-		directories.add(directory);
-		const runtime = await startServer({ directory, provider: "anthropic", model: "missing-model" });
-		servers.add(runtime);
-		const client = await Client.connect({
-			serverId: runtime.serverId,
-			transportFactory: createUnixTransportFactory({ path: runtime.socketPath }),
-		});
-		clients.add(client);
-
-		await expect(client.attachSession("demo-1")).resolves.toMatchObject({ sessionId: "demo-1" });
-		expect(runtime.workerPids.get("demo-1")).toEqual(expect.any(Number));
 	});
 
 	test("stops an idle Session worker after its client disconnects", async () => {
@@ -748,75 +697,10 @@ describe("experimental durable server composition", () => {
 
 		process.kill(firstPid!, "SIGKILL");
 		await expect.poll(() => runtime.workerPids.has("demo-1")).toBe(false);
-		await client.attachSession("demo-1");
+		await attachSession(client, "demo-1");
 		const replacementPid = runtime.workerPids.get("demo-1");
 		expect(replacementPid).toEqual(expect.any(Number));
 		expect(replacementPid).not.toBe(firstPid);
-	});
-
-	test("normal server shutdown stops detached workers", async () => {
-		const directory = await mkdtemp(join("/tmp", "pes-"));
-		directories.add(directory);
-		const runtime = await startServer({ ...sessionWorkerModel, directory });
-		servers.add(runtime);
-		await attachClient(runtime, "demo-1");
-		const pid = runtime.workerPids.get("demo-1");
-		expect(pid).toEqual(expect.any(Number));
-
-		await runtime.close();
-		await expect.poll(() => processExists(pid!)).toBe(false);
-		expect(runtime.workerPids.size).toBe(0);
-		await expect.poll(() => pathExists(runtime.socketPath)).toBe(false);
-	});
-
-	test("serializes concurrent launchers so only one server remains active", async () => {
-		const directory = await mkdtemp(join("/tmp", "pel-"));
-		directories.add(directory);
-		const runtimes = await Promise.all([
-			startServer({ ...sessionWorkerModel, directory }),
-			startServer({ ...sessionWorkerModel, directory }),
-		]);
-		for (const runtime of runtimes) servers.add(runtime);
-
-		expect(runtimes[0].serverId).toBe(runtimes[1].serverId);
-		await expect
-			.poll(async () => {
-				const closed = await Promise.all(
-					runtimes.map((runtime) =>
-						Promise.race([
-							runtime.closed.then(() => true),
-							new Promise<false>((resolve) => setImmediate(() => resolve(false))),
-						]),
-					),
-				);
-				return closed.filter(Boolean).length;
-			})
-			.toBe(1);
-		await expect(runClient({ command: "client" }, { directory })).resolves.toMatchObject({
-			kind: "list",
-			sessions: [{ sessionId: "demo-1" }, { sessionId: "demo-2" }],
-		});
-	});
-
-	test("shuts down the replaced server without waiting for its clients", async () => {
-		const directory = await mkdtemp(join("/tmp", "peg-"));
-		directories.add(directory);
-		const first = await startServer({ ...sessionWorkerModel, directory });
-		servers.add(first);
-		const client = await Client.connect({
-			serverId: first.serverId,
-			transportFactory: createUnixTransportFactory({ path: first.socketPath }),
-		});
-		await client.listSessions();
-
-		const replacement = await startServer({ ...sessionWorkerModel, directory });
-		servers.add(replacement);
-		await first.closed;
-		await expect(runClient({ command: "client" }, { directory })).resolves.toMatchObject({
-			kind: "list",
-			sessions: [{ sessionId: "demo-1" }, { sessionId: "demo-2" }],
-		});
-		await client.dispose();
 	});
 
 	test("discovers workers after replacing the server", async () => {

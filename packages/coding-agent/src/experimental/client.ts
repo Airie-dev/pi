@@ -1,8 +1,10 @@
-import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
-import type { LaneEvent, PromptMessage, SessionAddress } from "@earendil-works/pi-protocol";
+import { resolve } from "node:path";
+import { BACKGROUND_CONTEXT, type LaneWatchEvent } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
 import type { AgentOperationResponse } from "./services/agent-controller.ts";
+import type { SessionAddress } from "./services/sessions.ts";
 
 export type ClientResult =
 	| {
@@ -16,7 +18,7 @@ export interface RunClientOptions {
 	/** Directory searched when --connect is omitted. Defaults to PI_SERVER_DIR or ~/.pi/server. */
 	readonly directory?: string;
 	/** Receives snapshot-ordered main-lane events while a prompt is active. */
-	readonly onEvent?: (event: LaneEvent) => void | Promise<void>;
+	readonly onEvent?: (event: LaneWatchEvent) => void | Promise<void>;
 }
 
 /** Discover servers, then list Sessions, attach to one, or create one for a prompt. */
@@ -65,6 +67,13 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 				await match.management.create({ id: selectedSessionId }, BACKGROUND_CONTEXT);
 			}
 		}
+		await match.plugins.prepareSession(
+			{
+				sessionId,
+				packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
+			},
+			BACKGROUND_CONTEXT,
+		);
 		await match.management.attach(sessionId, BACKGROUND_CONTEXT);
 		if (command.prompt === undefined) {
 			return { kind: "attached", serverId: match.route.serverId, sessionId };
@@ -72,19 +81,27 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 
 		const agent = match.agent;
 		const completedText = new Map<string, string>();
-		// AgentController returns no transcript content. Keep the lane watch until Transcript owns live deltas.
-		const watch = await match.client.watchSession(sessionId);
-		await watch.start(async (event) => {
-			if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
-				completedText.set(event.runId, messageText(event.message));
-			}
-			await options.onEvent?.(event);
+		let deliveryTail = Promise.resolve();
+		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
+			if (delivery.kind !== "update" || value.event === null) return;
+			const event = value.event;
+			deliveryTail = deliveryTail.then(async () => {
+				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
+					completedText.set(event.runId, messageText(event.message));
+				}
+				await options.onEvent?.(event);
+			});
 		});
+		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
+			unsubscribe();
+			throw new Error("Transcript has no initialized snapshot");
+		}
 		let response: AgentOperationResponse;
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
 		} finally {
-			await watch.dispose();
+			unsubscribe();
+			await deliveryTail;
 		}
 		if (!response.accepted) throw new Error(response.error.message);
 		if (response.error !== null) throw new Error(response.error.message);
@@ -99,7 +116,7 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 	}
 }
 
-function messageText(message: Extract<PromptMessage, { role: "assistant" }>): string {
+function messageText(message: AssistantMessage): string {
 	return message.content
 		.filter((content) => content.type === "text")
 		.map((content) => content.text)

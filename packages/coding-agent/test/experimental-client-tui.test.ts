@@ -1,37 +1,76 @@
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
+import {
+	createRemoteServiceBinding,
+	type MutableReplicatedState,
+	RemoteServiceProvider,
+	type RemoteServiceTransport,
+	replicatedState,
+} from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+	FACET_BUNDLE_ARTIFACT_FORMAT,
+	FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
+	type FacetBundleArtifact,
+} from "@earendil-works/chord/node";
 import {
 	type AgentLane,
-	BACKGROUND_CONTEXT,
-	createLoopbackServiceConnection,
-	RemoteServiceNamespace,
-	RemoteServiceProvider,
-	replicatedState,
+	type LaneSnapshot,
+	type LaneTranscriptSnapshot,
+	type LaneWatchEvent,
+	reduceLaneSnapshot,
 } from "@earendil-works/pi-agent-core";
-import type { LaneEvent, LaneSnapshot, SessionSummary } from "@earendil-works/pi-protocol";
 import { ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { type ClientTuiServer, ExperimentalClientTui } from "../src/experimental/client-tui.ts";
-import type { FacetLoader } from "../src/experimental/facet-loader.ts";
-import { defineFacet } from "../src/experimental/facets.ts";
+import { createPresentationFacetData } from "../src/experimental/plugins/bundled.ts";
 import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import { createAgentController } from "../src/experimental/services/agent-controller-provider.ts";
 import type {
 	ServerConnectionState,
-	ServerServiceConnection,
+	ServerServiceSource,
 	SessionAttachmentState,
-	SessionServiceConnection,
+	SessionServiceSource,
 } from "../src/experimental/services/connection.ts";
 import { Models, type ModelsState } from "../src/experimental/services/models.ts";
+import { PresentationPlugins, SessionPlugins } from "../src/experimental/services/plugins.ts";
 import {
 	SessionDirectory,
 	type SessionDirectoryState,
 	SessionManagement,
+	type SessionSummary,
 } from "../src/experimental/services/sessions.ts";
+import { Transcript, type TranscriptState } from "../src/experimental/services/transcript.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 const serverId = "00000000-0000-4000-8000-000000000001";
 
 function session(sessionId: string, createdAt: number): SessionSummary {
 	return { serverId, sessionId, createdAt };
+}
+
+function createLoopbackServiceTransport(provider: RemoteServiceProvider): RemoteServiceTransport {
+	return {
+		invoke: (call, context) => provider.invoke(call, context),
+		subscribe: async (serviceId, mode, listener) => {
+			const subscription = provider.subscribe(serviceId, mode, (update) => listener(update, BACKGROUND_CONTEXT));
+			return {
+				snapshot: subscription.snapshot,
+				activate: () => subscription.activate(),
+				close: () => subscription.close(),
+			};
+		},
+	};
+}
+
+function publishReplacement<T extends object>(state: MutableReplicatedState<T>, value: T): void {
+	const target = state.state as unknown as Record<string, unknown>;
+	const replacement = value as unknown as Record<string, unknown>;
+	for (const key of Object.keys(target)) {
+		if (!Object.hasOwn(replacement, key)) delete target[key];
+	}
+	Object.assign(target, replacement);
+	state.publish(BACKGROUND_CONTEXT);
 }
 
 function laneSnapshot(): LaneSnapshot {
@@ -67,9 +106,10 @@ describe("experimental client TUI", () => {
 	test.each([
 		["new", { command: "client" as const }, "two", 1],
 		["continued", { command: "client" as const, continue: true }, "one", 0],
+		["plugin-selected", { command: "client" as const, pluginPackages: ["./example-plugin"] }, "two", 1],
 	] as const)(
-		"opens a %s Session directly and renders a Harness-backed turn",
-		async (_kind, command, sessionId, creates) => {
+		"opens a %s Session directly and exercises the full lifecycle only for a new Session",
+		async (kind, command, sessionId, creates) => {
 			const directoryState = replicatedState<SessionDirectoryState>({ revision: 1, sessions: [session("one", 1)] });
 			const attachment = replicatedState<SessionAttachmentState>({ status: "detached" });
 			const connectionState = replicatedState<ServerConnectionState>({ status: "connected", since: "now" });
@@ -86,40 +126,44 @@ describe("experimental client TUI", () => {
 			});
 			const create = vi.fn(async () => {
 				const created = session("two", 2);
-				directoryState.set(
-					{ revision: 2, sessions: [...directoryState.value.sessions, created] },
-					BACKGROUND_CONTEXT,
-				);
+				directoryState.state.revision = 2;
+				directoryState.state.sessions.push(created);
+				directoryState.publish(BACKGROUND_CONTEXT);
 				return created;
 			});
 			const select = vi.fn(async (model: { provider: string; modelId: string }) => {
-				modelsState.set(
-					{ ...modelsState.value, configuration: { ...modelsState.value.configuration, model } },
-					BACKGROUND_CONTEXT,
-				);
+				modelsState.state.configuration.model = model;
+				modelsState.publish(BACKGROUND_CONTEXT);
 			});
 			const selectThinking = vi.fn(async (thinkingLevel: "off" | "high") => {
-				modelsState.set(
-					{ ...modelsState.value, configuration: { ...modelsState.value.configuration, thinkingLevel } },
-					BACKGROUND_CONTEXT,
-				);
+				modelsState.state.configuration.thinkingLevel = thinkingLevel;
+				modelsState.publish(BACKGROUND_CONTEXT);
 			});
-			let watchListener: ((event: LaneEvent) => void | Promise<void>) | undefined;
-			const snapshot = laneSnapshot();
-			const watchSession = vi.fn(async (sessionId: string) => ({
-				id: "watch-1",
-				sessionId,
-				snapshot,
-				async start(listener: (event: LaneEvent) => void | Promise<void>) {
-					watchListener = listener;
-				},
-				async resnapshot() {
-					return snapshot;
-				},
-				async dispose() {},
-			}));
+			const transcriptState = replicatedState<TranscriptState>({
+				snapshot: laneSnapshot() as LaneTranscriptSnapshot,
+				event: null,
+			});
+			const emitTranscriptEvent = (event: LaneWatchEvent): void => {
+				const snapshot = transcriptState.state.snapshot as LaneSnapshot;
+				if (reduceLaneSnapshot(snapshot, event) === "rebase") {
+					throw new Error("Test transcript event unexpectedly requires a rebase");
+				}
+				transcriptState.state.event = event;
+				transcriptState.publish(BACKGROUND_CONTEXT);
+			};
+			let finishPrompt!: () => void;
+			const promptFinished = new Promise<void>((resolve) => {
+				finishPrompt = resolve;
+			});
 			const prompt = vi.fn(async () => {
-				await watchListener?.({
+				emitTranscriptEvent({
+					type: "run_start",
+					lane: "main",
+					runId: "run-1",
+					startedAt: 1,
+				});
+				await promptFinished;
+				emitTranscriptEvent({
 					type: "entry_added",
 					lane: "main",
 					entry: {
@@ -131,7 +175,7 @@ describe("experimental client TUI", () => {
 						message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 },
 					},
 				});
-				await watchListener?.({
+				emitTranscriptEvent({
 					type: "entry_added",
 					lane: "main",
 					entry: {
@@ -146,11 +190,20 @@ describe("experimental client TUI", () => {
 							provider: "test",
 							model: "one",
 							api: "test",
-							usage: snapshot.stats.usage,
+							usage: transcriptState.value.snapshot!.stats.usage,
 							stopReason: "stop",
 							timestamp: 2,
 						},
 					},
+				});
+				emitTranscriptEvent({
+					type: "run_end",
+					lane: "main",
+					runId: "run-1",
+					status: "completed",
+					fromTipId: null,
+					tipId: "entry-assistant",
+					endedAt: 2,
 				});
 				return {
 					ok: true as const,
@@ -166,19 +219,42 @@ describe("experimental client TUI", () => {
 				};
 			});
 
-			const serverProvider = new RemoteServiceProvider([SessionDirectory, SessionManagement]);
+			const reloadSource =
+				'"use strict";\nconst { defineFacet, defineService } = require("@earendil-works/chord");\nconst Models = defineService("pi.models");\nmodule.exports = { __esModule: true, default: defineFacet({ id: "test-tui-facet", setup(env) { env.use(Models); } }) };\n';
+			const reloadArtifact: FacetBundleArtifact = {
+				format: FACET_BUNDLE_ARTIFACT_FORMAT,
+				formatVersion: FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
+				plugin: { id: "test-tui-plugin" },
+				entryName: "tui",
+				entry: {
+					file: "tui.cjs",
+					integrity: `sha256-${createHash("sha256").update(reloadSource).digest("base64")}`,
+					externalImports: ["@earendil-works/chord"],
+				},
+				source: reloadSource,
+			};
+			const reloadData = createPresentationFacetData([reloadArtifact]);
+			const prepareSessionPlugins = vi.fn(async () => reloadData);
+			const reloadPresentationPlugins = vi.fn(async () => reloadData);
+			const reloadSessionPlugins = vi.fn(async () => {});
+			const serverProvider = new RemoteServiceProvider([SessionDirectory, SessionManagement, PresentationPlugins]);
 			serverProvider.provide(SessionDirectory, { state: directoryState });
+			serverProvider.provide(PresentationPlugins, {
+				prepareSession: prepareSessionPlugins,
+				reload: reloadPresentationPlugins,
+			});
 			serverProvider.provide(SessionManagement, {
 				create,
 				async remove() {},
 				async attach(sessionId) {
-					attachment.set({ status: "attaching", sessionId }, BACKGROUND_CONTEXT);
+					publishReplacement(attachment, { status: "attaching", sessionId });
 				},
 				async detach() {
-					attachment.set({ status: "detached" }, BACKGROUND_CONTEXT);
+					publishReplacement(attachment, { status: "detached" });
 				},
 			});
-			const sessionProvider = new RemoteServiceProvider([Models, AgentController]);
+			const sessionProvider = new RemoteServiceProvider([Models, AgentController, SessionPlugins, Transcript]);
+			sessionProvider.provide(SessionPlugins, { reload: reloadSessionPlugins });
 			sessionProvider.provide(Models, {
 				state: modelsState,
 				async cycleThinking() {},
@@ -190,85 +266,78 @@ describe("experimental client TUI", () => {
 				selectThinking,
 			});
 			sessionProvider.provide(AgentController, createAgentController({ prompt } as unknown as AgentLane));
+			sessionProvider.provide(Transcript, { state: transcriptState });
 
-			const serverNamespace = new RemoteServiceNamespace({
-				services: [SessionDirectory, SessionManagement],
-				connection: createLoopbackServiceConnection(serverProvider),
+			const serverNamespace = createRemoteServiceBinding({
+				services: [SessionDirectory, SessionManagement, PresentationPlugins],
+				transport: createLoopbackServiceTransport(serverProvider),
 				bound: false,
 			});
-			const serverServices: ServerServiceConnection = Object.assign(serverNamespace, {
+			const serverNamespaceReady = serverNamespace.ready.bind(serverNamespace);
+			const serverServices: ServerServiceSource = Object.assign(serverNamespace, {
 				acceptsUnavailableServices: false,
 				connection: connectionState,
 				async catalogue() {
 					return serverProvider.catalogue;
 				},
 				open() {
-					return serverNamespace;
+					return {
+						use: serverNamespace.use.bind(serverNamespace),
+						observe: serverNamespace.observe.bind(serverNamespace),
+						async ready() {
+							await serverNamespace.rebind(true, BACKGROUND_CONTEXT);
+							await serverNamespaceReady(BACKGROUND_CONTEXT);
+						},
+						async dispose() {},
+					};
 				},
-				async activate() {
+				async ready() {
 					await serverNamespace.rebind(true, BACKGROUND_CONTEXT);
-					await serverNamespace.ready(BACKGROUND_CONTEXT);
+					await serverNamespaceReady(BACKGROUND_CONTEXT);
 				},
 			});
-			const sessionNamespace = new RemoteServiceNamespace({
-				services: [Models, AgentController],
-				connection: createLoopbackServiceConnection(sessionProvider),
+			const sessionNamespace = createRemoteServiceBinding({
+				services: [Models, AgentController, SessionPlugins, Transcript],
+				transport: createLoopbackServiceTransport(sessionProvider),
 				bound: false,
 			});
-			const sessionServices: SessionServiceConnection = Object.assign(sessionNamespace, {
+			const sessionServices: SessionServiceSource = Object.assign(sessionNamespace, {
 				acceptsUnavailableServices: true,
 				attachment,
 				async catalogue() {
 					return [];
 				},
 				open() {
-					return sessionNamespace;
-				},
-				async activate() {
-					await sessionNamespace.ready(BACKGROUND_CONTEXT);
+					return {
+						use: sessionNamespace.use.bind(sessionNamespace),
+						observe: sessionNamespace.observe.bind(sessionNamespace),
+						ready: sessionNamespace.ready.bind(sessionNamespace),
+						async dispose() {},
+					};
 				},
 				async whenAttached(sessionId: string) {
 					await sessionNamespace.rebind(true, BACKGROUND_CONTEXT);
 					await sessionNamespace.ready(BACKGROUND_CONTEXT);
-					attachment.set({ status: "attached", sessionId }, BACKGROUND_CONTEXT);
+					publishReplacement(attachment, { status: "attached", sessionId });
 				},
 				async whenDetached() {
 					await sessionNamespace.rebind(false, BACKGROUND_CONTEXT);
-					attachment.set({ status: "detached" }, BACKGROUND_CONTEXT);
+					publishReplacement(attachment, { status: "detached" });
 				},
 			});
 			const server: ClientTuiServer = {
 				serverId,
 				radius: true,
-				laneWatches: { watchSession },
 				server: serverServices,
 				session: sessionServices,
 			};
 			let finished = false;
 			const requestRender = vi.fn();
-			const disposeLoadedFacets = vi.fn(async () => {});
-			const facetLoader: FacetLoader = {
-				async load() {
-					return {
-						facets: [
-							defineFacet({
-								id: "test-tui-facet",
-								setup(env) {
-									const models = env.use(Models);
-									env.onActivate(() => env.own(models.state.subscribe(() => {})));
-								},
-							}),
-						],
-						dispose: disposeLoadedFacets,
-					};
-				},
-			};
 			const ui = new TuiMainScreen(new ProcessTerminal());
 			const component = await ExperimentalClientTui.create({
 				command,
 				ui,
 				servers: [server],
-				facetLoader,
 				requestRender,
 				finish() {
 					finished = true;
@@ -276,8 +345,17 @@ describe("experimental client TUI", () => {
 			});
 			try {
 				expect(create).toHaveBeenCalledTimes(creates);
+				expect(prepareSessionPlugins).toHaveBeenCalledWith(
+					{
+						sessionId,
+						packagePaths:
+							"pluginPackages" in command
+								? command.pluginPackages.map((packagePath) => resolve(packagePath))
+								: null,
+					},
+					expect.anything(),
+				);
 				expect(attachment.value).toEqual({ status: "attached", sessionId });
-				expect(watchSession).toHaveBeenCalledWith(sessionId);
 				expect(select).not.toHaveBeenCalled();
 				expect(component.render(80).join("\n")).toContain(`Server: ${serverId}`);
 				expect(component.render(80).join("\n")).toContain(`Session: ${sessionId}`);
@@ -285,28 +363,35 @@ describe("experimental client TUI", () => {
 				expect(component.render(80).join("\n")).not.toContain("Experimental Sessions");
 				expect(component.render(80).join("\n")).not.toContain("Experimental Models");
 
-				component.handleInput("/");
-				await vi.waitFor(() => {
-					const rendered = component.render(80).join("\n");
-					expect(rendered).toContain("Select model");
-					expect(rendered).toContain("Set thinking level");
-					expect(rendered).toContain("Send a greeting from the example plugin");
-				});
+				// Startup selection is the only behavior specific to continue and plugin-selected Sessions.
+				if (kind !== "new") return;
+
 				component.handleInput("hello");
-				component.handleInput("\u001b");
 				component.handleInput("\r");
-				await vi.waitFor(() =>
-					expect(prompt).toHaveBeenCalledWith("Hello from the example plugin.", undefined, expect.anything()),
-				);
+				await vi.waitFor(() => expect(prompt).toHaveBeenCalledWith("hello", undefined, BACKGROUND_CONTEXT));
+				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("Working..."));
+				finishPrompt();
 				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("remote answer"));
 				expect(component.render(80).join("\n")).toContain("hello");
+				expect(component.render(80).join("\n")).not.toContain("Working...");
 				expect(component.render(80).join("\n")).not.toContain("Operation run-1 completed");
 
-				attachment.set({ status: "detached" }, BACKGROUND_CONTEXT);
-				connectionState.set(
-					{ status: "disconnected", since: "later", reason: "network lost", retryAt: null },
-					BACKGROUND_CONTEXT,
-				);
+				component.handleInput("/reload");
+				component.handleInput("\u001b");
+				component.handleInput("\r");
+				await vi.waitFor(() => {
+					expect(reloadPresentationPlugins).toHaveBeenCalledOnce();
+					expect(reloadSessionPlugins).toHaveBeenCalledOnce();
+				});
+				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("Reloaded plugins."));
+
+				publishReplacement(attachment, { status: "detached" });
+				publishReplacement(connectionState, {
+					status: "disconnected",
+					since: "later",
+					reason: "network lost",
+					retryAt: null,
+				});
 				await vi.waitFor(() => expect(component.render(80).join("\n")).toContain("retrying"));
 				component.handleInput("\u0003");
 				expect(finished).toBe(true);
@@ -314,10 +399,9 @@ describe("experimental client TUI", () => {
 				component.handleInput("\u0004");
 				expect(finished).toBe(true);
 				finished = false;
-				connectionState.set({ status: "connecting", attempt: 1 }, BACKGROUND_CONTEXT);
-				connectionState.set({ status: "connected", since: "reconnected" }, BACKGROUND_CONTEXT);
-				attachment.set({ status: "attached", sessionId }, BACKGROUND_CONTEXT);
-				await vi.waitFor(() => expect(watchSession).toHaveBeenCalledTimes(2));
+				publishReplacement(connectionState, { status: "connecting", attempt: 1 });
+				publishReplacement(connectionState, { status: "connected", since: "reconnected" });
+				publishReplacement(attachment, { status: "attached", sessionId });
 				await vi.waitFor(() => expect(component.render(80).join("\n")).not.toContain("Reattaching"));
 
 				component.handleInput("/model");
@@ -345,11 +429,13 @@ describe("experimental client TUI", () => {
 				await vi.waitFor(() => expect(finished).toBe(true));
 
 				await component.close();
-				expect(disposeLoadedFacets).toHaveBeenCalledOnce();
 				const rendersAfterClose = requestRender.mock.calls.length;
-				directoryState.set({ revision: 3, sessions: [] }, BACKGROUND_CONTEXT);
-				attachment.set({ status: "detached" }, BACKGROUND_CONTEXT);
-				modelsState.set({ ...modelsState.value, refresh: { status: "refreshing" } }, BACKGROUND_CONTEXT);
+				directoryState.state.revision = 3;
+				directoryState.state.sessions = [];
+				directoryState.publish(BACKGROUND_CONTEXT);
+				publishReplacement(attachment, { status: "detached" });
+				modelsState.state.refresh = { status: "refreshing" };
+				modelsState.publish(BACKGROUND_CONTEXT);
 				expect(requestRender).toHaveBeenCalledTimes(rendersAfterClose);
 			} finally {
 				await component.close();

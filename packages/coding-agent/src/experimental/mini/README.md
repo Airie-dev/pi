@@ -34,7 +34,8 @@ is answered by the server.
 
 The first `mini` to start spawns the server detached. The server kills a worker when its last
 presentation disconnects, and retires itself ten seconds after the last presentation leaves, so the
-next start always runs current code.
+next start always runs current code. If that worker held an open durable operation, its replacement
+automatically resumes the operation from the last recorded recovery state.
 
 ## Layout
 

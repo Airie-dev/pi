@@ -1,6 +1,6 @@
 import { basename } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
-import { Client } from "@earendil-works/pi-client";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { Client, ServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@earendil-works/pi-client/unix";
 import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
@@ -9,13 +9,15 @@ import { createRadiusClientTransportFactory, RadiusClientReconnect } from "./rad
 import { activateServer, ENV_SERVER_ID, resolveServerDirectory, resolveSessionDirectory } from "./server.ts";
 import { AgentController } from "./services/agent-controller.ts";
 import {
-	createServerServiceConnection,
-	createSessionServiceConnection,
-	type ServerServiceConnection,
-	type SessionServiceConnection,
+	createServerServiceSource,
+	createSessionServiceSource,
+	type ServerServiceSource,
+	type SessionServiceSource,
 } from "./services/connection.ts";
 import { Models } from "./services/models.ts";
+import { PresentationPlugins } from "./services/plugins.ts";
 import { SessionDirectory, SessionManagement } from "./services/sessions.ts";
+import { Transcript } from "./services/transcript.ts";
 
 export type ClientRuntimeRoute =
 	| ({ readonly transport: "unix" } & UnixServerRoute)
@@ -24,15 +26,17 @@ export type ClientRuntimeRoute =
 export interface ClientRuntimeServer {
 	readonly route: ClientRuntimeRoute;
 	readonly client: Client;
-	readonly server: ServerServiceConnection;
-	readonly session: SessionServiceConnection;
+	readonly server: ServerServiceSource;
+	readonly session: SessionServiceSource;
 }
 
 export interface ActivatedClientRuntimeServer extends ClientRuntimeServer {
 	readonly directory: SessionDirectory;
 	readonly management: SessionManagement;
+	readonly plugins: PresentationPlugins;
 	readonly models: Models;
 	readonly agent: AgentController;
+	readonly transcript: Transcript;
 }
 
 export interface ClientRuntime {
@@ -58,6 +62,9 @@ export async function openClientRuntime(
 	}
 	if (command.connect && command.model !== undefined) {
 		throw new Error("Model selection is only valid when automatically activating a new server");
+	}
+	if (command.connect?.transport === "radius" && command.pluginPackages !== undefined) {
+		throw new Error("Plugin package paths can only be configured on a local Unix server");
 	}
 	const directory = resolveServerDirectory(options.directory);
 	let routes: ClientRuntimeRoute[];
@@ -85,21 +92,24 @@ export async function openClientRuntime(
 			activatedClient = activated.client;
 		}
 	}
+	if (command.pluginPackages !== undefined && routes.length !== 1) {
+		throw new Error("Plugin selection requires exactly one local server");
+	}
 
 	const clients: Client[] = [];
 	const reconnectors: RadiusClientReconnect[] = [];
-	const serviceConnections: Array<ServerServiceConnection | SessionServiceConnection> = [];
+	const serviceSources: Array<ServerServiceSource | SessionServiceSource> = [];
 	const servers: ClientRuntimeServer[] = [];
 	let disposed = false;
 	const dispose = async (): Promise<void> => {
 		if (disposed) return;
 		disposed = true;
 		const reconnectResults = await Promise.allSettled(reconnectors.map((reconnector) => reconnector.dispose()));
-		const connectionResults = await Promise.allSettled(
-			serviceConnections.map((connection) => connection.dispose(BACKGROUND_CONTEXT)),
+		const sourceResults = await Promise.allSettled(
+			serviceSources.map((source) => source.dispose(BACKGROUND_CONTEXT)),
 		);
 		const clientResults = await Promise.allSettled(clients.map((client) => client.dispose()));
-		const errors = [...reconnectResults, ...connectionResults, ...clientResults].flatMap((result) =>
+		const errors = [...reconnectResults, ...sourceResults, ...clientResults].flatMap((result) =>
 			result.status === "rejected" ? [result.reason] : [],
 		);
 		if (errors.length === 1) throw errors[0];
@@ -108,24 +118,57 @@ export async function openClientRuntime(
 
 	try {
 		for (const route of routes) {
-			const client =
-				activatedClient ??
-				(await Client.connect({
-					serverId: route.serverId,
-					transportFactory:
-						route.transport === "unix"
-							? createUnixTransportFactory({ path: route.path })
-							: createRadiusClientTransportFactory({
-									serverId: route.serverId,
-									auth: new RadiusRelayAuthResolver(command.auth),
-								}),
-				}));
+			let client = activatedClient;
+			if (client === undefined) {
+				try {
+					client = await Client.connect({
+						serverId: route.serverId,
+						transportFactory:
+							route.transport === "unix"
+								? createUnixTransportFactory({ path: route.path })
+								: createRadiusClientTransportFactory({
+										serverId: route.serverId,
+										auth: new RadiusRelayAuthResolver(command.auth),
+									}),
+					});
+				} catch (error) {
+					if (
+						command.connect !== undefined ||
+						route.transport !== "unix" ||
+						!(error instanceof ServerError) ||
+						error.code !== "version"
+					) {
+						throw error;
+					}
+					client = (
+						await activateServer({
+							directory,
+							requestedServerId: route.serverId,
+							sessionDir: resolveSessionDirectory(),
+						})
+					).client;
+				}
+			}
 			activatedClient = undefined;
 			clients.push(client);
-			if (route.transport === "radius") reconnectors.push(new RadiusClientReconnect(client));
-			const server = createServerServiceConnection(client);
-			const session = createSessionServiceConnection(client);
-			serviceConnections.push(server, session);
+			const server = createServerServiceSource(client);
+			serviceSources.push(server);
+			if (route.transport === "radius") {
+				const reconnectServices = server.open({
+					services: [SessionManagement],
+					assertAccess() {},
+					onError() {},
+				});
+				const reconnectManagement = reconnectServices.use(SessionManagement);
+				reconnectors.push(
+					new RadiusClientReconnect(client, async (sessionId) => {
+						await reconnectServices.ready(BACKGROUND_CONTEXT);
+						await reconnectManagement.attach(sessionId, BACKGROUND_CONTEXT);
+					}),
+				);
+			}
+			const session = createSessionServiceSource(client);
+			serviceSources.push(session);
 			servers.push({ route, client, server, session });
 		}
 		return { servers, dispose };
@@ -144,12 +187,12 @@ export async function activateBuiltinClientServices(
 	server: ClientRuntimeServer,
 ): Promise<ActivatedClientRuntimeServer> {
 	const serverServices = server.server.open({
-		services: [SessionDirectory, SessionManagement],
+		services: [SessionDirectory, SessionManagement, PresentationPlugins],
 		assertAccess() {},
 		onError() {},
 	});
 	const sessionServices = server.session.open({
-		services: [Models, AgentController],
+		services: [Models, AgentController, Transcript],
 		assertAccess() {},
 		onError() {},
 	});
@@ -171,10 +214,12 @@ export async function activateBuiltinClientServices(
 			await server.session.whenDetached(context);
 		},
 	};
+	const plugins = serverServices.use(PresentationPlugins);
 	const models = sessionServices.use(Models);
 	const agent = sessionServices.use(AgentController);
-	await Promise.all([serverServices.activate(BACKGROUND_CONTEXT), sessionServices.activate(BACKGROUND_CONTEXT)]);
-	return { ...server, directory, management, models, agent };
+	const transcript = sessionServices.use(Transcript);
+	await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
+	return { ...server, directory, management, plugins, models, agent, transcript };
 }
 
 function routeFromExplicitPath(path: string): UnixServerRoute {

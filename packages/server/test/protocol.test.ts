@@ -91,7 +91,7 @@ test("accepts fragmented hello and request frames", async () => {
 	};
 	const frame = encodeClientMessage(request);
 	await client.sendFragmentedMessage(request, Math.floor(frame.byteLength / 2));
-	await expect(response).resolves.toMatchObject({ ok: true, result: [] });
+	await expect(response).resolves.toMatchObject({ ok: false, error: { code: "internal_error" } });
 });
 
 test.each([
@@ -137,8 +137,8 @@ test("processes a hello and request coalesced in one byte chunk", async () => {
 	await expect(client.next((message) => message.type === "response")).resolves.toMatchObject({
 		type: "response",
 		id: "request-1",
-		ok: true,
-		result: [],
+		ok: false,
+		error: { code: "internal_error" },
 	});
 });
 

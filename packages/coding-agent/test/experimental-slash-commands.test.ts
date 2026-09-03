@@ -1,6 +1,5 @@
+import { createFacetHost, defineFacet } from "@earendil-works/chord";
 import { describe, expect, test, vi } from "vitest";
-import { createFacetHost, defineFacet } from "../src/experimental/facets.ts";
-import helloPluginFacet from "../src/experimental/plugins/hello.ts";
 import { SlashCommands } from "../src/experimental/services/slash-commands.ts";
 import {
 	createSlashCommandsRuntimeFacet,
@@ -12,9 +11,9 @@ describe("experimental slash command facets", () => {
 		const registry = new SlashCommandRegistry();
 		const snapshots: string[][] = [];
 		const unsubscribe = registry.subscribe((commands) => snapshots.push(commands.map(({ name }) => name)));
-		const close = registry.register({ name: "hello", description: "Hello", run() {} });
+		const close = registry.register({ name: "hello", description: "Hello", run: () => undefined });
 		expect(registry.list().map(({ name }) => name)).toEqual(["hello"]);
-		expect(() => registry.register({ name: "hello", run() {} })).toThrow("already registered");
+		expect(() => registry.register({ name: "hello", run: () => undefined })).toThrow("already registered");
 		close();
 		close();
 		expect(registry.list()).toEqual([]);
@@ -22,21 +21,67 @@ describe("experimental slash command facets", () => {
 		unsubscribe();
 	});
 
+	test("stages replacements until the previous registration retires", () => {
+		const registry = new SlashCommandRegistry();
+		const first = { name: "hello", description: "First", run: () => undefined };
+		const second = { name: "hello", description: "Second", run: () => undefined };
+		const closeFirst = registry.register(first);
+		const closeSecond = registry.replace(second);
+		expect(registry.list()).toEqual([first]);
+
+		closeSecond();
+		expect(registry.list()).toEqual([first]);
+		const closeReplacement = registry.replace(second);
+		closeFirst();
+		expect(registry.list()).toEqual([second]);
+		closeReplacement();
+		expect(registry.list()).toEqual([]);
+	});
+
 	test("tracks plugin facet reload and unload", async () => {
 		const registry = new SlashCommandRegistry();
+		const originalRun = vi.fn();
 		const host = await createFacetHost({
-			facets: [createSlashCommandsRuntimeFacet(registry), helloPluginFacet],
+			facets: [
+				createSlashCommandsRuntimeFacet(registry),
+				defineFacet({
+					id: "@test/example-hello",
+					setup(env) {
+						const commands = env.use(SlashCommands);
+						env.onActivate(() =>
+							env.own(commands.replace({ name: "hello", description: "Original", run: originalRun })),
+						);
+					},
+				}),
+			],
 		});
 		expect(registry.list().map(({ name }) => name)).toEqual(["hello"]);
+
+		const failure = new Error("replacement failed");
+		await expect(
+			host.reload([
+				defineFacet({
+					id: "@test/example-hello",
+					setup(env) {
+						const commands = env.use(SlashCommands);
+						env.onActivate(() => {
+							env.own(commands.replace({ name: "hello", description: "Failing", run: () => undefined }));
+							throw failure;
+						});
+					},
+				}),
+			]),
+		).rejects.toBe(failure);
+		expect(registry.list()).toEqual([expect.objectContaining({ name: "hello", run: originalRun })]);
 
 		const replacementRun = vi.fn();
 		await host.reload([
 			defineFacet({
-				id: "@pi/example-hello",
+				id: "@test/example-hello",
 				setup(env) {
 					const commands = env.use(SlashCommands);
 					env.onActivate(() =>
-						env.own(commands.register({ name: "hello", description: "Replacement", run: replacementRun })),
+						env.own(commands.replace({ name: "hello", description: "Replacement", run: replacementRun })),
 					);
 				},
 			}),

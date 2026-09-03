@@ -1,43 +1,11 @@
 import { randomUUID } from "node:crypto";
+import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type Context, type SessionMetadata } from "@earendil-works/pi-agent-core";
-import {
-	createRpcDispatcher,
-	type EventEnvelope,
-	type PromptArguments,
-	type ProtocolRpcCall,
-	type ProtocolRpcResult,
-	ProtocolValidationError,
-	type RpcTarget,
-	type RunResult,
-	type ServerEventEnvelope,
-	ServiceRpc,
-	type ServiceRpcCall,
-	type ServiceRpcResultUnion,
-	type SessionSummary,
-	type SessionTarget,
-} from "@earendil-works/pi-protocol";
-import {
-	NotSupportedError,
-	ServerDrainingError,
-	SessionAmbiguousError,
-	SessionNotAttachedError,
-	SessionNotFoundError,
-	WatchInUseError,
-	WatchNotFoundError,
-} from "./errors.ts";
-import type { RoutedSessionAttachment, RoutedSessionHandle, RoutedSessionWatch, ServerHost } from "./types.ts";
+import type { RpcTarget, SessionTarget } from "@earendil-works/pi-protocol";
+import { ServerDrainingError, SessionNotAttachedError } from "./errors.ts";
+import type { RoutedSessionAttachment, RoutedSessionHandle, ServerHost } from "./types.ts";
 
 class SessionCleanupError extends AggregateError {}
-
-function toSessionSummary(serverId: string, metadata: SessionMetadata): SessionSummary {
-	return { serverId, sessionId: metadata.id, createdAt: metadata.createdAt };
-}
-
-interface ActiveWatch {
-	readonly id: string;
-	readonly handle: RoutedSessionWatch;
-	started: boolean;
-}
 
 interface ClientAttachment {
 	readonly id: string;
@@ -47,14 +15,6 @@ interface ClientAttachment {
 	acquiring?: Promise<RoutedSessionAttachment>;
 	lease?: RoutedSessionAttachment;
 	releasing?: Promise<void>;
-	watch?: ActiveWatch;
-}
-
-interface RpcContext {
-	readonly client: object;
-	readonly context: Context;
-	readonly target: RpcTarget;
-	publish(message: EventEnvelope, context: Context): Promise<void>;
 }
 
 interface HostedSession {
@@ -79,81 +39,25 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 	private readonly disconnectedClients = new Set<object>();
 	private readonly clientOperations = new Map<object, Promise<void>>();
 	private closePromise?: Promise<void>;
-	private readonly dispatchRpc: (call: ServiceRpcCall, context: RpcContext) => Promise<ServiceRpcResultUnion>;
 
 	constructor(options: SessionRouterOptions<TMetadata>) {
 		this.options = options;
-		this.dispatchRpc = createRpcDispatcher(
-			ServiceRpc,
-			{
-				list: async ({ context, target }, ..._args: never[]) => {
-					this.requireServerTarget(target);
-					return (await this.options.host.sessions.list(context)).map((metadata) =>
-						toSessionSummary(target.serverId, metadata),
-					);
-				},
-				create: async ({ client, context, target }, createOptions) => {
-					this.requireServerTarget(target);
-					return this.runForClient(client, async () => {
-						if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
-						return toSessionSummary(
-							target.serverId,
-							await this.options.host.sessions.create(createOptions, context),
-						);
-					});
-				},
-				attach: async ({ client, context, target }, sessionId) => {
-					this.requireServerTarget(target);
-					if (this.options.isClosing()) throw new ServerDrainingError();
-					return this.attachClient(client, sessionId, context);
-				},
-				prompt: async ({ client, context, target }, prompt) => {
-					const admitted = await this.runForClient(client, () =>
-						this.startPrompt(client, target, prompt, context),
-					);
-					return admitted.result;
-				},
-				watch: ({ client, context, target }, ..._args: never[]) =>
-					this.runForClient(client, () => this.createWatch(client, target, context)),
-				startWatch: ({ client, publish, context, target }, watchId) =>
-					this.runForClient(client, () => this.startWatch(client, target, watchId, publish, context)),
-				resnapshotWatch: ({ client, context, target }, watchId) =>
-					this.runForClient(client, () => this.resnapshotWatch(client, target, watchId, context)),
-				stopWatch: ({ client, context, target }, watchId) =>
-					this.runForClient(client, () => this.stopWatch(client, target, watchId, context)),
-			},
-			(message) => new ProtocolValidationError(message),
-		);
-	}
-
-	executeCall(
-		call: ServiceRpcCall,
-		target: RpcTarget,
-		client: object,
-		publish: (message: EventEnvelope, context: Context) => Promise<void>,
-		context: Context,
-	): Promise<ServiceRpcResultUnion> {
-		return this.dispatchRpc(call, { client, target, publish, context });
 	}
 
 	async executeServiceCall(
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		target: RpcTarget,
 		client: object,
-		publish: (message: ServerEventEnvelope, context: Context) => Promise<void>,
+		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult> {
+	): Promise<JsonValue | undefined> {
 		const admitted = await this.runForClient(client, () =>
 			this.startServiceCall(client, target, call, publish, context),
 		);
 		return admitted.result;
 	}
 
-	attachClient(
-		client: object,
-		sessionId: string,
-		context: Context,
-	): Promise<{ sessionId: string; attachmentId: string }> {
+	attachClient(client: object, sessionId: string, context: Context): Promise<void> {
 		if (this.options.isClosing()) return Promise.reject(new ServerDrainingError());
 		return this.runForClient(client, () => this.attachClientNow(client, sessionId, context));
 	}
@@ -253,14 +157,10 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		return result;
 	}
 
-	private async attachClientNow(
-		client: object,
-		sessionId: string,
-		context: Context,
-	): Promise<{ sessionId: string; attachmentId: string }> {
+	private async attachClientNow(client: object, sessionId: string, context: Context): Promise<void> {
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		const current = this.attachmentsByClient.get(client);
-		if (current?.session.id === sessionId) return { sessionId, attachmentId: current.id };
+		if (current?.session.id === sessionId) return;
 		const hosted = await this.acquire(sessionId, context);
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		if (current) await this.releaseAttachment(current, context, false);
@@ -294,38 +194,19 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 			{ serverId: this.options.serverId, sessionId, attachmentId: attachment.id },
 			context,
 		);
-		return { sessionId, attachmentId: attachment.id };
-	}
-
-	private async startPrompt(
-		client: object,
-		target: RpcTarget,
-		prompt: PromptArguments,
-		context: Context,
-	): Promise<{ result: Promise<RunResult> }> {
-		const attachment = this.requireAttachment(client, target);
-		const lease = attachment.lease;
-		if (lease === undefined) throw new SessionNotAttachedError();
-		const result = lease.prompt(prompt, context);
-		this.trackOperation(attachment, result);
-		return { result };
 	}
 
 	private async startServiceCall(
 		client: object,
 		target: RpcTarget,
-		call: ProtocolRpcCall,
-		publish: (message: ServerEventEnvelope, context: Context) => Promise<void>,
+		call: ServiceCall,
+		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => Promise<void>,
 		context: Context,
-	): Promise<{ result: Promise<ProtocolRpcResult> }> {
+	): Promise<{ result: Promise<JsonValue | undefined> }> {
 		const attachment = this.requireAttachment(client, target);
-		const invoke = attachment.lease?.invokeService;
-		if (invoke === undefined) throw new NotSupportedError("Routed Session does not support plugin services");
-		const result = invoke.call(
-			attachment.lease,
+		const result = attachment.lease!.invokeService(
 			call,
-			(subscriptionId, update, updateContext) =>
-				publish({ type: "service_update", subscriptionId, update }, updateContext),
+			(subscriptionId, update, updateContext) => publish(subscriptionId, update, updateContext),
 			context,
 		);
 		this.trackOperation(attachment, result);
@@ -340,77 +221,6 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		void result.then(remove, remove);
 	}
 
-	private async createWatch(
-		client: object,
-		target: RpcTarget,
-		context: Context,
-	): Promise<{ watchId: string; snapshot: RoutedSessionWatch["snapshot"] }> {
-		const attachment = this.requireAttachment(client, target);
-		if (attachment.watch !== undefined) throw new WatchInUseError();
-		const create = attachment.lease?.watch;
-		if (create === undefined) throw new NotSupportedError("Routed Session does not support lane watches");
-		const handle = await create.call(attachment.lease, context);
-		const watch = { id: randomUUID(), handle, started: false } satisfies ActiveWatch;
-		attachment.watch = watch;
-		return { watchId: watch.id, snapshot: handle.snapshot };
-	}
-
-	private async startWatch(
-		client: object,
-		target: RpcTarget,
-		watchId: string,
-		publish: (message: EventEnvelope, context: Context) => Promise<void>,
-		context: Context,
-	): Promise<{ watchId: string }> {
-		const attachment = this.requireAttachment(client, target);
-		const watch = attachment.watch;
-		if (watch?.id !== watchId) throw new WatchNotFoundError();
-		if (!watch.started) {
-			watch.started = true;
-			try {
-				await watch.handle.start(
-					(event, eventContext) => publish({ type: "event", watchId, event }, eventContext),
-					context,
-				);
-			} catch (error) {
-				delete attachment.watch;
-				try {
-					await watch.handle.unsubscribe(context);
-				} catch (cleanupError) {
-					throw new AggregateError([error, cleanupError], "Failed to start and clean up lane watch");
-				}
-				throw error;
-			}
-		}
-		return { watchId };
-	}
-
-	private async resnapshotWatch(
-		client: object,
-		target: RpcTarget,
-		watchId: string,
-		context: Context,
-	): Promise<{ watchId: string; snapshot: RoutedSessionWatch["snapshot"] }> {
-		const attachment = this.requireAttachment(client, target);
-		const watch = attachment.watch;
-		if (watch?.id !== watchId) throw new WatchNotFoundError();
-		return { watchId, snapshot: await watch.handle.resnapshot(context) };
-	}
-
-	private async stopWatch(
-		client: object,
-		target: RpcTarget,
-		watchId: string,
-		context: Context,
-	): Promise<{ watchId: string }> {
-		const attachment = this.requireAttachment(client, target);
-		const watch = attachment.watch;
-		if (watch?.id !== watchId) throw new WatchNotFoundError();
-		delete attachment.watch;
-		await watch.handle.unsubscribe(context);
-		return { watchId };
-	}
-
 	private requireAttachment(client: object, target: RpcTarget): ClientAttachment {
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		if (!("sessionId" in target)) throw new SessionNotAttachedError();
@@ -421,21 +231,10 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		return attachment;
 	}
 
-	private requireServerTarget(target: RpcTarget): void {
-		if ("sessionId" in target) throw new ProtocolValidationError("Server operation cannot target a Session");
-	}
-
 	private releaseAttachment(attachment: ClientAttachment, context: Context, publish = true): Promise<void> {
 		attachment.releasing ??= (async () => {
 			const errors: unknown[] = [];
 			try {
-				const watch = attachment.watch;
-				delete attachment.watch;
-				try {
-					await watch?.handle.unsubscribe(context);
-				} catch (error) {
-					errors.push(error);
-				}
 				await Promise.allSettled(attachment.operations);
 				try {
 					const lease = attachment.lease ?? (await attachment.acquiring);
@@ -475,12 +274,7 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 	}
 
 	private async open(sessionId: string, context: Context): Promise<HostedSession> {
-		const matches = (await this.options.host.sessions.list(context)).filter(
-			(candidate) => candidate.id === sessionId,
-		);
-		if (matches.length === 0) throw new SessionNotFoundError(`Unknown session: ${sessionId}`);
-		if (matches.length > 1) throw new SessionAmbiguousError();
-		const metadata = matches[0]!;
+		const metadata = await this.options.host.resolveSession(sessionId, context);
 		const handle = await this.options.host.openSession(metadata, context);
 		if (this.options.isClosing()) {
 			try {

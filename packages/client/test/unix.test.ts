@@ -5,6 +5,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { Server as RuntimeServer } from "../../server/src/server.ts";
+import { createTestServerServices } from "../../server/src/testing/host.ts";
 import { createUnixListener } from "../../server/src/transports/unix/listener.ts";
 import { discoverUnixServers } from "../src/unix.ts";
 
@@ -32,10 +33,8 @@ async function startServer(
 	const path = join(directory, `${fileServerId}.sock`);
 	const server = new RuntimeServer(
 		{
-			sessions: {
-				list: async () => [],
-				create: async () => Promise.reject(new Error("unused")),
-			},
+			serverServices: createTestServerServices(),
+			resolveSession: async () => Promise.reject(new Error("unused")),
 			openSession: async () => Promise.reject(new Error("unused")),
 		},
 		{ listeners: [createUnixListener({ path })], serverId: reportedServerId },

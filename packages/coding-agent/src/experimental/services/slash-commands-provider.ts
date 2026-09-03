@@ -1,8 +1,10 @@
+import { defineFacet, type Facet, type JsonValue } from "@earendil-works/chord";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { defineFacet, type Facet } from "../facets.ts";
-import { AgentController, type AgentOperationResponse } from "./agent-controller.ts";
+import { AgentController } from "./agent-controller.ts";
 import { type ModelSummary, Models, type Models as ModelsService } from "./models.ts";
-import { type SlashCommandContribution, type SlashCommandExecutionContext, SlashCommands } from "./slash-commands.ts";
+import { PresentationPlugins, SessionPlugins } from "./plugins.ts";
+import { PresentationUI } from "./presentation-ui.ts";
+import { type SlashCommandContribution, SlashCommands } from "./slash-commands.ts";
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -14,36 +16,56 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	max: "Maximum reasoning",
 };
 
+interface RegisteredSlashCommand {
+	readonly command: SlashCommandContribution;
+	closed: boolean;
+}
+
 export class SlashCommandRegistry implements SlashCommands {
-	readonly #commands = new Map<string, SlashCommandContribution>();
+	readonly #commands = new Map<string, RegisteredSlashCommand[]>();
 	readonly #listeners = new Set<(commands: readonly SlashCommandContribution[]) => void>();
 
 	register(command: SlashCommandContribution): () => void {
-		if (!/^[a-z0-9][a-z0-9:-]*$/u.test(command.name)) {
-			throw new TypeError(`Invalid slash command name: ${command.name}`);
-		}
+		this.#validate(command);
 		if (this.#commands.has(command.name)) throw new Error(`Slash command /${command.name} is already registered`);
-		const registered = Object.freeze({ ...command });
-		this.#commands.set(command.name, registered);
-		this.#publish();
-		let closed = false;
-		return () => {
-			if (closed) return;
-			closed = true;
-			if (this.#commands.get(command.name) !== registered) return;
-			this.#commands.delete(command.name);
-			this.#publish();
-		};
+		return this.#add(command);
+	}
+
+	replace(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		return this.#add(command);
 	}
 
 	list(): readonly SlashCommandContribution[] {
-		return Object.freeze([...this.#commands.values()]);
+		return Object.freeze([...this.#commands.values()].map((entries) => entries[0]!.command));
 	}
 
 	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void {
 		this.#listeners.add(listener);
 		listener(this.list());
 		return () => this.#listeners.delete(listener);
+	}
+
+	#add(command: SlashCommandContribution): () => void {
+		const entry: RegisteredSlashCommand = { command: Object.freeze({ ...command }), closed: false };
+		const entries = this.#commands.get(command.name) ?? [];
+		entries.push(entry);
+		this.#commands.set(command.name, entries);
+		if (entries.length === 1) this.#publish();
+		return () => {
+			if (entry.closed) return;
+			entry.closed = true;
+			if (entries[0] !== entry) return;
+			while (entries[0]?.closed) entries.shift();
+			if (entries.length === 0) this.#commands.delete(command.name);
+			this.#publish();
+		};
+	}
+
+	#validate(command: SlashCommandContribution): void {
+		if (!/^[a-z0-9][a-z0-9:-]*$/u.test(command.name)) {
+			throw new TypeError(`Invalid slash command name: ${command.name}`);
+		}
 	}
 
 	#publish(): void {
@@ -61,23 +83,42 @@ export function createSlashCommandsRuntimeFacet(registry = new SlashCommandRegis
 	});
 }
 
-export function createBuiltInSlashCommandsFacet(): Facet {
+export function createBuiltInSlashCommandsFacet(options: {
+	reloadPresentationPlugins(data: JsonValue): Promise<void>;
+}): Facet {
 	return defineFacet({
 		id: "@pi/slash-commands-builtin",
 		setup(env) {
 			const commands = env.use(SlashCommands);
 			const models = env.use(Models);
 			const controller = env.use(AgentController);
+			const ui = env.use(PresentationUI);
+			const presentationPlugins = env.use(PresentationPlugins);
+			const sessionPlugins = env.use(SessionPlugins);
 			env.onActivate(() => {
-				env.own(commands.register(modelCommand(models)));
-				env.own(commands.register(thinkingCommand(models)));
-				env.own(commands.register(compactCommand(controller)));
+				env.own(commands.replace(modelCommand(models, ui)));
+				env.own(commands.replace(thinkingCommand(models, ui)));
+				env.own(commands.replace(compactCommand(controller, ui)));
+				env.own(
+					commands.replace({
+						name: "reload",
+						description: "Reload server-selected plugins",
+						async run(_args, context) {
+							ui.showStatus("Reloading plugins…", context);
+							const data = await presentationPlugins.reload(context);
+							await sessionPlugins.reload(context);
+							await options.reloadPresentationPlugins(data);
+							ui.showStatus("Reloaded plugins.", context);
+							return undefined;
+						},
+					}),
+				);
 			});
 		},
 	});
 }
 
-function modelCommand(models: ModelsService): SlashCommandContribution {
+function modelCommand(models: ModelsService, ui: PresentationUI): SlashCommandContribution {
 	return {
 		name: "model",
 		description: "Select model",
@@ -100,7 +141,7 @@ function modelCommand(models: ModelsService): SlashCommandContribution {
 				throw new Error(`Unknown model: ${args}`);
 			}
 			if (selected === undefined) {
-				const value = await context.select(
+				const value = await ui.select(
 					"Select model:",
 					state.catalog.availableModels.map((model) => ({
 						value: `${model.provider}/${model.modelId}`,
@@ -114,30 +155,32 @@ function modelCommand(models: ModelsService): SlashCommandContribution {
 					state.configuration.model === null
 						? undefined
 						: `${state.configuration.model.provider}/${state.configuration.model.modelId}`,
+					context,
 				);
-				if (value === undefined) return;
+				if (value === undefined) return undefined;
 				selected = exactModel(state.catalog.availableModels, value);
 				if (selected === undefined) throw new Error(`Unknown model: ${value}`);
 			}
-			await models.select({ provider: selected.provider, modelId: selected.modelId }, context.operation);
-			context.showStatus(`Selected ${selected.provider}/${selected.modelId}.`);
+			await models.select({ provider: selected.provider, modelId: selected.modelId }, context);
+			ui.showStatus(`Selected ${selected.provider}/${selected.modelId}.`, context);
+			return undefined;
 		},
 	};
 }
 
-function thinkingCommand(models: ModelsService): SlashCommandContribution {
+function thinkingCommand(models: ModelsService, ui: PresentationUI): SlashCommandContribution {
 	return {
 		name: "thinking",
 		description: "Set thinking level",
 		argumentHint: "<level>",
 		async run(args, context) {
-			const levels = await models.getThinkingLevels(context.operation);
+			const levels = await models.getThinkingLevels(context);
 			let selected = levels.find((level) => level === args.toLowerCase());
 			if (args.length > 0 && selected === undefined) {
 				throw new Error(`Unknown thinking level "${args}". Available levels: ${levels.join(", ")}.`);
 			}
 			if (selected === undefined) {
-				const value = await context.select(
+				const value = await ui.select(
 					"Select thinking level:",
 					levels.map((level) => ({
 						value: level,
@@ -145,28 +188,27 @@ function thinkingCommand(models: ModelsService): SlashCommandContribution {
 						description: THINKING_DESCRIPTIONS[level],
 					})),
 					models.state.value?.configuration.thinkingLevel,
+					context,
 				);
-				if (value === undefined) return;
+				if (value === undefined) return undefined;
 				selected = levels.find((level) => level === value);
 				if (selected === undefined) throw new Error(`Unknown thinking level: ${value}`);
 			}
-			await models.selectThinking(selected, context.operation);
-			context.showStatus(`Thinking level: ${selected}.`);
+			await models.selectThinking(selected, context);
+			ui.showStatus(`Thinking level: ${selected}.`, context);
+			return undefined;
 		},
 	};
 }
 
-function compactCommand(controller: AgentController): SlashCommandContribution {
+function compactCommand(controller: AgentController, ui: PresentationUI): SlashCommandContribution {
 	return {
 		name: "compact",
 		description: "Manually compact the session context",
 		argumentHint: "<instructions>",
-		async run(args, context) {
-			context.showStatus("Compacting…");
-			reportOperation(
-				await controller.compact({ customInstructions: args.length === 0 ? null : args }, context.operation),
-				context,
-			);
+		run(args, context) {
+			ui.showStatus("Compacting…", context);
+			return controller.compact({ customInstructions: args.length === 0 ? null : args }, context);
 		},
 	};
 }
@@ -180,14 +222,4 @@ function exactModel(models: readonly ModelSummary[], query: string): ModelSummar
 			model.modelId.toLowerCase() === normalized,
 	);
 	return matches.length === 1 ? matches[0] : undefined;
-}
-
-function reportOperation(response: AgentOperationResponse, context: SlashCommandExecutionContext): void {
-	context.showStatus(
-		response.accepted
-			? response.error === null
-				? ""
-				: `Operation failed: ${response.error.message}`
-			: `Operation rejected: ${response.error.message}`,
-	);
 }

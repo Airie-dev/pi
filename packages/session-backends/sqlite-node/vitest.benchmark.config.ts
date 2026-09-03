@@ -17,6 +17,7 @@ export default defineConfig({
 		},
 	},
 	resolve: {
+		conditions: ["source"],
 		alias: [
 			{ find: /^@earendil-works\/pi-telemetry$/, replacement: telemetryIndex },
 			{ find: /^@earendil-works\/pi-agent-core\/session\/testing$/, replacement: agentSessionTesting },
@@ -24,4 +25,5 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-ai$/, replacement: aiIndex },
 		],
 	},
+	ssr: { resolve: { conditions: ["source"] } },
 });

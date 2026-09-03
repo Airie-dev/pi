@@ -1,23 +1,20 @@
 import {
-	BACKGROUND_CONTEXT,
 	type Context,
-	type ServiceProviderUpdate as CoreServiceProviderUpdate,
+	createRemoteServiceEndpoint,
+	type JsonValue,
 	RemoteServiceProvider,
 	replicatedState,
-	type ServiceProviderSubscription,
-} from "@earendil-works/pi-agent-core";
-import {
-	decodeServiceControlCall,
-	type JsonValue,
-	JsonValueSchema,
-	type ServiceProviderUpdate as ProtocolServiceProviderUpdate,
-	ServiceProviderUpdateSchema,
-	type SessionCreateOptions,
-	type SessionSummary,
-} from "@earendil-works/pi-protocol";
+} from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { RoutedServerServiceAttachment, RoutedServerServiceHost } from "@earendil-works/pi-server";
-import { Check } from "typebox/value";
-import { SessionDirectory, type SessionDirectoryState, SessionManagement } from "./sessions.ts";
+import { PresentationPlugins } from "./plugins.ts";
+import {
+	type SessionCreateOptions,
+	SessionDirectory,
+	type SessionDirectoryState,
+	SessionManagement,
+	type SessionSummary,
+} from "./sessions.ts";
 
 export interface ExperimentalServerServices {
 	readonly host: RoutedServerServiceHost;
@@ -29,6 +26,12 @@ export async function createExperimentalServerServices(options: {
 	list(context: Context): Promise<SessionSummary[]>;
 	create(createOptions: SessionCreateOptions, context: Context): Promise<SessionSummary>;
 	remove(sessionId: string, context: Context): Promise<void>;
+	prepareSessionPlugins(
+		sessionId: string,
+		packagePaths: readonly string[] | undefined,
+		context: Context,
+	): Promise<{ readonly packagePaths: readonly string[]; readonly presentationPlugins: JsonValue }>;
+	reloadPresentationPlugins(packagePaths: readonly string[], context: Context): Promise<JsonValue>;
 }): Promise<ExperimentalServerServices> {
 	let revision = 1;
 	const directory = replicatedState<SessionDirectoryState>({
@@ -41,7 +44,9 @@ export async function createExperimentalServerServices(options: {
 	const refreshNow = async (context: Context): Promise<void> => {
 		const sessions = await options.list(context);
 		revision += 1;
-		directory.set({ revision, sessions }, context);
+		directory.state.revision = revision;
+		directory.state.sessions = sessions;
+		directory.publish(context);
 	};
 	const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
 		const result = mutationTail.catch(() => {}).then(operation);
@@ -55,11 +60,32 @@ export async function createExperimentalServerServices(options: {
 	return {
 		host: {
 			attachClient(presentation) {
+				let preparedPluginPackagePaths: readonly string[] | undefined;
 				const provider = new RemoteServiceProvider([
 					{ service: SessionDirectory, mode: "singleton" },
 					{ service: SessionManagement, mode: "singleton" },
+					{ service: PresentationPlugins, mode: "singleton" },
 				]);
 				provider.provide(SessionDirectory, { state: directory });
+				provider.provide(PresentationPlugins, {
+					prepareSession: ({ sessionId, packagePaths }, context) =>
+						serialize(async () => {
+							const selected = await options.prepareSessionPlugins(
+								sessionId,
+								packagePaths ?? undefined,
+								context,
+							);
+							preparedPluginPackagePaths = selected.packagePaths;
+							return selected.presentationPlugins;
+						}),
+					reload: (context) =>
+						serialize(() => {
+							if (preparedPluginPackagePaths === undefined) {
+								throw new Error("No Session plugin selection is prepared");
+							}
+							return options.reloadPresentationPlugins(preparedPluginPackagePaths, context);
+						}),
+				});
 				provider.provide(SessionManagement, {
 					create: (createOptions, context) =>
 						serialize(async () => {
@@ -80,6 +106,7 @@ export async function createExperimentalServerServices(options: {
 					detach: (context) =>
 						serialize(async () => {
 							await presentation.detachSession(context);
+							preparedPluginPackagePaths = undefined;
 						}),
 				});
 				const attachment = createProviderAttachment(provider, () => attachments.delete(attachment));
@@ -105,53 +132,19 @@ function createProviderAttachment(
 	provider: RemoteServiceProvider,
 	onRelease: () => void,
 ): RoutedServerServiceAttachment {
-	const subscriptions = new Map<string, ServiceProviderSubscription>();
+	const endpoint = createRemoteServiceEndpoint(provider);
 	let released = false;
 	return {
-		async invokeService(call, publish, context) {
-			if (released) throw new Error("Server service attachment is released");
-			const control = decodeServiceControlCall(call);
-			if (control?.type === "catalogue") return toProtocolJson(provider.catalogue);
-			if (control?.type === "subscribe") {
-				if (subscriptions.has(control.subscriptionId)) {
-					throw new Error("Service subscription ID is already active");
-				}
-				const subscription = provider.subscribe(control.serviceId, control.mode, (update, updateContext) => {
-					void Promise.resolve(
-						publish(control.subscriptionId, toProtocolServiceUpdate(update), updateContext),
-					).catch(() => {});
-				});
-				subscriptions.set(control.subscriptionId, subscription);
-				subscription.activate();
-				return toProtocolJson(subscription.snapshot);
-			}
-			if (control?.type === "unsubscribe") {
-				const subscription = subscriptions.get(control.subscriptionId);
-				if (subscription === undefined) throw new Error("Service subscription was not found");
-				subscription.close();
-				subscriptions.delete(control.subscriptionId);
-				return undefined;
-			}
-			return provider.invoke(call, context);
+		invokeService(call, publish, context) {
+			if (released) return Promise.reject(new Error("Server service attachment is released"));
+			return endpoint.invoke(call, publish, context);
 		},
 		release() {
 			if (released) return;
 			released = true;
-			for (const subscription of subscriptions.values()) subscription.close();
-			subscriptions.clear();
+			endpoint.dispose();
 			provider.dispose();
 			onRelease();
 		},
 	};
-}
-
-function toProtocolJson(value: unknown): JsonValue {
-	if (!Check(JsonValueSchema, value)) throw new Error("Service control value is not strict JSON");
-	return value;
-}
-
-function toProtocolServiceUpdate(update: CoreServiceProviderUpdate): ProtocolServiceProviderUpdate {
-	const candidate: unknown = update;
-	if (!Check(ServiceProviderUpdateSchema, candidate)) throw new Error("Service produced an invalid update");
-	return candidate;
 }

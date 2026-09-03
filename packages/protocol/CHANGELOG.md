@@ -2,9 +2,7 @@
 
 ## [Unreleased]
 
-### Removed
-
-- Removed the unused manual-action run-result and lane-snapshot wire fields. `PROTOCOL_VERSION` remains unchanged because no shipped producer emitted them.
+## [0.84.4] - 2026-08-28
 
 ## [0.84.3] - 2026-08-24
 

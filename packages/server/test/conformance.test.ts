@@ -1,14 +1,23 @@
+import type { ServiceCall } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT, type SessionMetadata } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, test } from "vitest";
 import type { ByteConnection, ByteConnectionHandler } from "../src/connection.ts";
+import { SessionAmbiguousError } from "../src/errors.ts";
 import { Server } from "../src/server.ts";
-import { Deferred, ProtocolTestClient, TestServerHost, type WireChannel } from "../src/testing/index.ts";
+import {
+	createTestServerServices,
+	Deferred,
+	ProtocolTestClient,
+	TestServerHost,
+	type WireChannel,
+} from "../src/testing/index.ts";
 import type { ServerHost } from "../src/types.ts";
 
+const serverId = "00000000-0000-4000-8000-000000000001";
 const servers = new Set<Server>();
 
-function createServer(host: ServerHost, serverId = "00000000-0000-4000-8000-000000000001"): Server {
-	const server = new Server(host, { listeners: [], serverId });
+function createServer(host: ServerHost, id = serverId): Server {
+	const server = new Server(host, { listeners: [], serverId: id });
 	servers.add(server);
 	return server;
 }
@@ -50,6 +59,19 @@ function connect(server: Server): ProtocolTestClient {
 	return client;
 }
 
+function sessionCall(member: string, args: ServiceCall["args"] = []): ServiceCall {
+	return { serviceId: "test.session", member, args };
+}
+
+function latestAttachmentId(client: ProtocolTestClient, sessionId: string): string {
+	for (const message of [...client.messages].reverse()) {
+		if (message.type === "attachment" && message.attachment?.sessionId === sessionId) {
+			return message.attachment.attachmentId;
+		}
+	}
+	throw new Error(`Missing attachment for ${sessionId}`);
+}
+
 afterEach(async () => {
 	await Promise.all([...servers].map((server) => server.close()));
 	servers.clear();
@@ -61,55 +83,22 @@ describe("Session protocol", () => {
 		await host.seed();
 		const client = connect(createServer(host));
 
-		expect(await client.hello()).toMatchObject({ type: "hello", serverId: "00000000-0000-4000-8000-000000000001" });
+		expect(await client.hello()).toMatchObject({ type: "hello", serverId });
 		expect(host.harnesses.size).toBe(0);
 	});
 
-	test("list returns presentation-safe summaries without opening a Session", async () => {
-		const host = new TestServerHost();
-		const metadata = await host.seed("session-1", "parent-1");
-		const client = connect(createServer(host));
-		await client.hello();
-
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "list", args: [] }),
-		).resolves.toEqual({
-			type: "response",
-			id: "request-1",
-			ok: true,
-			result: [
-				{
-					serverId: "00000000-0000-4000-8000-000000000001",
-					sessionId: metadata.id,
-					createdAt: metadata.createdAt,
-				},
-			],
-		});
-		expect(host.harnesses.size).toBe(0);
-	});
-
-	test("create persists a Session without opening a Harness", async () => {
+	test("rejects a semantically invalid service call after envelope decoding", async () => {
 		const host = new TestServerHost();
 		const client = connect(createServer(host));
 		await client.hello();
-
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", {
-				method: "create",
-				args: [{ id: "session-1" }],
-			}),
-		).resolves.toMatchObject({
-			ok: true,
-			result: {
-				serverId: "00000000-0000-4000-8000-000000000001",
-				sessionId: "session-1",
-				createdAt: 1,
-			},
+		const response = client.next((message) => message.type === "response" && message.id === "invalid-call");
+		await client.sendMessage({
+			type: "request",
+			id: "invalid-call",
+			target: { serverId },
+			call: { arbitrary: true },
 		});
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "list", args: [] }),
-		).resolves.toMatchObject({ result: [{ sessionId: "session-1" }] });
-		expect(host.harnesses.size).toBe(0);
+		expect(await response).toMatchObject({ ok: false, error: { code: "invalid_request" } });
 	});
 
 	test("attach passes concrete repository metadata to the Harness host", async () => {
@@ -124,58 +113,21 @@ describe("Session protocol", () => {
 		};
 		let received: BackendMetadata | undefined;
 		const host: ServerHost<BackendMetadata> = {
-			sessions: { list: async () => [metadata], create: async () => metadata },
+			serverServices: createTestServerServices(),
+			resolveSession: async () => metadata,
 			openSession: async (candidate) => {
 				received = candidate;
 				return {
-					attachClient: async () => ({
-						prompt: async () => ({
-							ok: true,
-							value: {
-								operationId: "run-1",
-								kind: "run" as const,
-								status: "completed" as const,
-								fromTipId: null,
-								tipId: "leaf-1",
-								startedAt: 1,
-								endedAt: 2,
-							},
-						}),
-						release: () => {},
-					}),
+					attachClient: () => ({ invokeService: async () => undefined, release() {} }),
 					close: async () => {},
 				};
 			},
 		};
-		const server = new Server(host, {
-			listeners: [],
-			serverId: "00000000-0000-4000-8000-000000000001",
-		});
-		servers.add(server);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
 
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "list", args: [] }),
-		).resolves.toEqual({
-			type: "response",
-			id: "request-1",
-			ok: true,
-			result: [
-				{
-					serverId: "00000000-0000-4000-8000-000000000001",
-					sessionId: "session-1",
-					createdAt: 1,
-				},
-			],
-		});
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["session-1"] }),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(client.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		expect(received).toBe(metadata);
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "watch", args: ["session-1"] }),
-		).resolves.toMatchObject({ ok: false, error: { code: "not_supported" } });
 	});
 
 	test("routes opaque server services and publishes attachment changes out of band", async () => {
@@ -183,7 +135,7 @@ describe("Session protocol", () => {
 		await backing.seed("session-1");
 		let releaseCount = 0;
 		const host: ServerHost = {
-			sessions: backing.sessions,
+			resolveSession: (sessionId, context) => backing.resolveSession(sessionId, context),
 			openSession: (metadata, context) => backing.openSession(metadata, context),
 			serverServices: {
 				attachClient(presentation) {
@@ -192,11 +144,11 @@ describe("Session protocol", () => {
 							if (call.serviceId !== "pi.session-management") throw new Error("Unexpected service");
 							if (call.member === "attach" && typeof call.args[0] === "string") {
 								await presentation.attachSession(call.args[0], context);
-								return undefined;
+								return null;
 							}
 							if (call.member === "detach") {
 								await presentation.detachSession(context);
-								return undefined;
+								return null;
 							}
 							throw new Error("Unexpected service member");
 						},
@@ -207,128 +159,24 @@ describe("Session protocol", () => {
 				},
 			},
 		};
-		const server = createServer(host);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
 		const attached = client.next((message) => message.type === "attachment" && message.attachment !== null);
-		const attachResponse = client.next((message) => message.type === "response" && message.id === "service-attach");
-		await client.sendMessage({
-			type: "request",
-			id: "service-attach",
-			target: { serverId: "00000000-0000-4000-8000-000000000001" },
-			call: { serviceId: "pi.session-management", member: "attach", args: ["session-1"] },
-		});
+		await expect(client.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		await expect(attached).resolves.toMatchObject({
 			type: "attachment",
 			attachment: { sessionId: "session-1", attachmentId: expect.any(String) },
 		});
-		await expect(attachResponse).resolves.toEqual({
-			type: "response",
-			id: "service-attach",
-			ok: true,
-		});
 		expect(backing.latestHarness("session-1").attachedClients).toBe(1);
 
 		const detached = client.next((message) => message.type === "attachment" && message.attachment === null);
-		const detachResponse = client.next((message) => message.type === "response" && message.id === "service-detach");
-		await client.sendMessage({
-			type: "request",
-			id: "service-detach",
-			target: { serverId: "00000000-0000-4000-8000-000000000001" },
-			call: { serviceId: "pi.session-management", member: "detach", args: [] },
-		});
+		await expect(
+			client.requestService({ serverId }, { serviceId: "pi.session-management", member: "detach", args: [] }),
+		).resolves.toMatchObject({ ok: true });
 		await expect(detached).resolves.toMatchObject({ type: "attachment", attachment: null });
-		await expect(detachResponse).resolves.toEqual({
-			type: "response",
-			id: "service-detach",
-			ok: true,
-		});
 		expect(backing.latestHarness("session-1").attachedClients).toBe(0);
 		await client.close();
 		await expect.poll(() => releaseCount).toBe(1);
-	});
-
-	test("delivers a lane snapshot before buffered and live watch events", async () => {
-		const host = new TestServerHost();
-		await host.seed("session-1");
-		const client = connect(createServer(host));
-		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
-
-		const watched = await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "watch",
-			args: ["session-1"],
-		});
-		expect(watched).toMatchObject({
-			ok: true,
-			result: { snapshot: { lane: "main", transcript: [], operation: null } },
-		});
-		if (
-			!watched.ok ||
-			typeof watched.result !== "object" ||
-			watched.result === null ||
-			!("watchId" in watched.result)
-		) {
-			throw new Error("Missing watch result");
-		}
-		const watchId = watched.result.watchId;
-		if (typeof watchId !== "string") throw new Error("Invalid watch ID");
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", {
-				method: "watch",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "watch_in_use" } });
-		await host.latestHarness("session-1").emitEvent({
-			type: "run_start",
-			lane: "main",
-			runId: "run-1",
-			startedAt: 1,
-		});
-		expect(client.messages.some((message) => message.type === "event")).toBe(false);
-
-		const messageIndex = client.messages.length;
-		const starting = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "startWatch",
-			args: ["session-1", watchId],
-		});
-		await expect(client.nextFrom(messageIndex, (message) => message.type === "event")).resolves.toMatchObject({
-			type: "event",
-			watchId,
-			event: { type: "run_start", runId: "run-1" },
-		});
-		await expect(starting).resolves.toMatchObject({ ok: true, result: { watchId } });
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", {
-				method: "resnapshotWatch",
-				args: ["session-1", watchId],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { watchId, snapshot: { lane: "main" } } });
-
-		await host.latestHarness("session-1").emitEvent({
-			type: "message_start",
-			lane: "main",
-			runId: "run-1",
-			message: { role: "user", content: "hello", timestamp: 1 },
-		});
-		await expect(client.nextFrom(messageIndex + 1, (message) => message.type === "event")).resolves.toMatchObject({
-			event: { type: "message_start" },
-		});
-
-		await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "stopWatch",
-			args: ["session-1", watchId],
-		});
-		const stoppedAt = client.messages.length;
-		await host.latestHarness("session-1").emitEvent({
-			type: "run_resume",
-			lane: "main",
-			runId: "run-1",
-		});
-		expect(client.messages.slice(stoppedAt).some((message) => message.type === "event")).toBe(false);
 	});
 
 	test("permits multiple client attachments per Session", async () => {
@@ -339,55 +187,28 @@ describe("Session protocol", () => {
 		const second = connect(server);
 		await Promise.all([first.hello(), second.hello()]);
 
-		await expect(
-			first.request("00000000-0000-4000-8000-000000000001", {
-				method: "attach",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
-		await expect(
-			first.request("00000000-0000-4000-8000-000000000001", {
-				method: "attach",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(first.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
+		await expect(first.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		expect(host.latestHarness("session-1").attachedClients).toBe(1);
-		await expect(
-			second.request("00000000-0000-4000-8000-000000000001", {
-				method: "attach",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(second.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		expect(host.harnesses.get("session-1")).toHaveLength(1);
 		expect(host.latestHarness("session-1").attachedClients).toBe(2);
 
 		await first.close();
 		await expect.poll(() => host.latestHarness("session-1").attachedClients).toBe(1);
-		await expect(
-			second.request("00000000-0000-4000-8000-000000000001", {
-				method: "attach",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(second.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 	});
 
 	test("clears connection ownership when attachment release fails", async () => {
 		const host = new TestServerHost();
 		await host.seed("session-1");
 		const errors: Error[] = [];
-		const server = new Server(host, {
-			listeners: [],
-			serverId: "00000000-0000-4000-8000-000000000001",
-			onError: (error) => errors.push(error),
-		});
+		const server = new Server(host, { listeners: [], serverId, onError: (error) => errors.push(error) });
 		servers.add(server);
 		const first = connect(server);
 		const second = connect(server);
 		await Promise.all([first.hello(), second.hello()]);
-		await first.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		await first.attach(serverId, "session-1");
 		const harness = host.latestHarness("session-1");
 		const releaseError = new Error("release failed");
 		harness.failAttachmentRelease = releaseError;
@@ -396,12 +217,7 @@ describe("Session protocol", () => {
 		await expect.poll(() => harness.attachmentReleaseCount).toBe(1);
 		await expect.poll(() => errors).toContain(releaseError);
 		harness.failAttachmentRelease = undefined;
-		await expect(
-			second.request("00000000-0000-4000-8000-000000000001", {
-				method: "attach",
-				args: ["session-1"],
-			}),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(second.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 	});
 
 	test("requires the requesting client to hold the targeted Session attachment", async () => {
@@ -412,166 +228,94 @@ describe("Session protocol", () => {
 		const unattached = connect(server);
 		await Promise.all([attached.hello(), unattached.hello()]);
 
-		await expect(
-			unattached.request("00000000-0000-4000-8000-000000000001", {
-				method: "prompt",
-				args: ["session-1", ["Hello"]],
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "session_not_attached" } });
-		await attached.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
+		await expect(unattached.requestSessionService(serverId, "session-1", sessionCall("run"))).resolves.toMatchObject({
+			ok: false,
+			error: { code: "session_not_attached" },
+		});
+		await attached.attach(serverId, "session-1");
+		await expect(attached.requestSessionService(serverId, "session-2", sessionCall("run"))).resolves.toMatchObject({
+			ok: false,
+			error: { code: "session_not_attached" },
 		});
 		await expect(
-			attached.request("00000000-0000-4000-8000-000000000001", {
-				method: "prompt",
-				args: ["session-2", ["Hello"]],
-			}),
-		).resolves.toMatchObject({ ok: false, error: { code: "session_not_attached" } });
-
-		await expect(
-			attached.request("00000000-0000-4000-8000-000000000001", {
-				method: "prompt",
-				args: ["session-1", ["Hello"]],
-			}),
-		).resolves.toEqual({
-			type: "response",
-			id: "request-3",
-			ok: true,
-			result: {
-				ok: true,
-				value: {
-					operationId: "run-1",
-					kind: "run",
-					status: "completed",
-					fromTipId: null,
-					tipId: "leaf-1",
-					startedAt: 1,
-					endedAt: 2,
-				},
-			},
-		});
-		expect(host.latestHarness("session-1").promptCalls).toEqual([["Hello"]]);
+			attached.requestSessionService(serverId, "session-1", sessionCall("run", ["Hello"])),
+		).resolves.toMatchObject({ ok: true, result: { ok: true } });
+		expect(host.latestHarness("session-1").serviceCalls).toEqual([sessionCall("run", ["Hello"])]);
 	});
 
 	test("rejects a stale attachment route after switching Sessions", async () => {
 		const host = new TestServerHost();
 		await Promise.all([host.seed("session-1"), host.seed("session-2")]);
 		const client = connect(createServer(host));
-		const serverId = "00000000-0000-4000-8000-000000000001";
 		await client.hello();
-		const first = await client.request(serverId, { method: "attach", args: ["session-1"] });
-		if (
-			!first.ok ||
-			typeof first.result !== "object" ||
-			first.result === null ||
-			!("attachmentId" in first.result) ||
-			typeof first.result.attachmentId !== "string"
-		) {
-			throw new Error("Missing first attachment ID");
-		}
-		await client.request(serverId, { method: "attach", args: ["session-2"] });
+		await client.attach(serverId, "session-1");
+		const firstAttachmentId = latestAttachmentId(client, "session-1");
+		await client.attach(serverId, "session-2");
 
-		const response = client.next((message) => message.type === "response" && message.id === "stale-request");
-		await client.sendMessage({
-			type: "request",
-			id: "stale-request",
-			target: { serverId, sessionId: "session-1", attachmentId: first.result.attachmentId },
-			call: { serviceId: "pi.chat", member: "prompt", args: [["stale"]] },
-		});
-		await expect(response).resolves.toMatchObject({
-			type: "response",
-			ok: false,
-			error: { code: "session_not_attached" },
-		});
-		expect(host.latestHarness("session-1").promptCalls).toEqual([]);
+		await expect(
+			client.requestService(
+				{ serverId, sessionId: "session-1", attachmentId: firstAttachmentId },
+				sessionCall("run", ["stale"]),
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "session_not_attached" } });
+		expect(host.latestHarness("session-1").serviceCalls).toEqual([]);
 	});
 
-	test("preserves structural Harness failures and bounds adapter defects", async () => {
+	test("preserves opaque service results and bounds adapter defects", async () => {
 		const host = new TestServerHost();
 		await host.seed("session-1");
 		const client = connect(createServer(host));
 		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		await client.attach(serverId, "session-1");
 		const harness = host.latestHarness("session-1");
-		harness.nextPromptResult = { ok: false, error: { _tag: "Closed", message: "Harness closed" } };
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", {
-				method: "prompt",
-				args: ["session-1", ["Hello"]],
-			}),
-		).resolves.toMatchObject({
+		harness.nextServiceResult = { accepted: false, reason: "closed" };
+		await expect(client.requestSessionService(serverId, "session-1", sessionCall("run"))).resolves.toMatchObject({
 			ok: true,
-			result: { ok: false, error: { _tag: "Closed", message: "Harness closed" } },
+			result: { accepted: false, reason: "closed" },
 		});
 
-		harness.nextPromptError = new Error("private adapter detail");
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", {
-				method: "prompt",
-				args: ["session-1", ["Hello"]],
-			}),
-		).resolves.toMatchObject({
+		harness.nextServiceError = new Error("private adapter detail");
+		await expect(client.requestSessionService(serverId, "session-1", sessionCall("run"))).resolves.toMatchObject({
 			ok: false,
 			error: { code: "internal_error", message: "Internal server error" },
 		});
 	});
 
-	test("admits concurrent prompts so the Harness owns lane-busy semantics", async () => {
+	test("admits concurrent service calls to the attached Session", async () => {
 		const host = new TestServerHost();
 		await host.seed("session-1");
 		const client = connect(createServer(host));
 		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		await client.attach(serverId, "session-1");
 		const harness = host.latestHarness("session-1");
-		const gate = harness.gateNextPrompt();
-		const first = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "prompt",
-			args: ["session-1", ["first"]],
-		});
+		const gate = harness.gateNextServiceCall();
+		const first = client.requestSessionService(serverId, "session-1", sessionCall("run", ["first"]));
 		await gate.entered.promise;
-		const second = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "prompt",
-			args: ["session-1", ["second"]],
-		});
+		const second = client.requestSessionService(serverId, "session-1", sessionCall("run", ["second"]));
 
-		await expect(second).resolves.toMatchObject({ ok: true, result: { ok: true } });
-		expect(harness.promptCalls).toEqual([["first"], ["second"]]);
+		await expect(second).resolves.toMatchObject({ ok: true });
+		expect(harness.serviceCalls).toEqual([sessionCall("run", ["first"]), sessionCall("run", ["second"])]);
 		gate.release.resolve(undefined);
-		await expect(first).resolves.toMatchObject({ ok: true, result: { ok: true } });
+		await expect(first).resolves.toMatchObject({ ok: true });
 	});
 
-	test("keeps attachment demand until an accepted prompt settles after disconnect", async () => {
+	test("keeps attachment demand until an accepted service call settles after disconnect", async () => {
 		const host = new TestServerHost();
 		await host.seed("session-1");
-		const server = createServer(host);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		await client.attach(serverId, "session-1");
 		const harness = host.latestHarness("session-1");
-		const gate = harness.gateNextPrompt();
-		const prompting = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "prompt",
-			args: ["session-1", ["Hello"]],
-		});
-		const disconnectedPrompt = expect(prompting).rejects.toThrow(/closed/i);
+		const gate = harness.gateNextServiceCall();
+		const calling = client.requestSessionService(serverId, "session-1", sessionCall("run"));
+		const disconnectedCall = expect(calling).rejects.toThrow(/closed/i);
 		await gate.entered.promise;
 
 		await client.close();
 		expect(harness.attachedClients).toBe(1);
 		gate.release.resolve(undefined);
-		await disconnectedPrompt;
+		await disconnectedCall;
 		await expect.poll(() => harness.attachedClients).toBe(0);
-		expect(harness.promptCalls).toEqual([["Hello"]]);
 	});
 
 	test("rejects requests addressed to another server before repository access", async () => {
@@ -580,9 +324,7 @@ describe("Session protocol", () => {
 		const client = connect(createServer(host));
 		await client.hello();
 
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000002", { method: "attach", args: ["session-1"] }),
-		).resolves.toMatchObject({
+		await expect(client.attach("00000000-0000-4000-8000-000000000002", "session-1")).resolves.toMatchObject({
 			ok: false,
 			error: { code: "wrong_server" },
 		});
@@ -594,9 +336,7 @@ describe("Session protocol", () => {
 		const client = connect(createServer(host));
 		await client.hello();
 
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["missing"] }),
-		).resolves.toMatchObject({
+		await expect(client.attach(serverId, "missing")).resolves.toMatchObject({
 			ok: false,
 			error: { code: "session_not_found" },
 		});
@@ -606,39 +346,29 @@ describe("Session protocol", () => {
 	test("rejects an ambiguous session ID without creating a Harness", async () => {
 		type BackendMetadata = SessionMetadata & { path: string };
 		const host: ServerHost<BackendMetadata> = {
-			sessions: {
-				list: async () => [
-					{ id: "duplicate", createdAt: 1, storageVersion: 1, cwd: "/one", path: "/one/session.jsonl" },
-					{ id: "duplicate", createdAt: 2, storageVersion: 1, cwd: "/two", path: "/two/session.jsonl" },
-				],
-				create: async () => {
-					throw new Error("must not create a Session in this test");
-				},
+			serverServices: createTestServerServices(),
+			resolveSession: async () => {
+				throw new SessionAmbiguousError();
 			},
 			openSession: async () => {
 				throw new Error("must not create a Harness for an ambiguous session");
 			},
 		};
-		const server = new Server(host, {
-			listeners: [],
-			serverId: "00000000-0000-4000-8000-000000000001",
-		});
-		servers.add(server);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
 
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["duplicate"] }),
-		).resolves.toMatchObject({ ok: false, error: { code: "session_ambiguous" } });
+		await expect(client.attach(serverId, "duplicate")).resolves.toMatchObject({
+			ok: false,
+			error: { code: "session_ambiguous" },
+		});
 	});
 
 	test("invalidates a terminated Harness handle and allows a later attach", async () => {
 		const host = new TestServerHost();
 		await host.seed("session-1");
-		const server = createServer(host);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["session-1"] });
+		await client.attach(serverId, "session-1");
 		const firstHarness = host.latestHarness("session-1");
 
 		await firstHarness.terminate(new Error("worker crashed"));
@@ -646,9 +376,7 @@ describe("Session protocol", () => {
 		await expect.poll(() => firstHarness.attachedClients).toBe(0);
 		expect(firstHarness.attachmentReleaseCount).toBe(1);
 
-		await expect(
-			client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["session-1"] }),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(client.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		expect(host.harnesses.get("session-1")).toHaveLength(2);
 	});
 
@@ -658,7 +386,7 @@ describe("Session protocol", () => {
 		const server = createServer(host);
 		const client = connect(server);
 		await client.hello();
-		await client.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["session-1"] });
+		await client.attach(serverId, "session-1");
 		const harness = host.latestHarness("session-1");
 
 		await client.close();
@@ -677,25 +405,15 @@ describe("routed Session acquisition failures", () => {
 		const terminated = new Deferred<Error | undefined>();
 		let releaseCount = 0;
 		const host: ServerHost = {
-			sessions: { list: async () => [metadata], create: async () => metadata },
+			serverServices: createTestServerServices(),
+			resolveSession: async () => metadata,
 			openSession: async () => ({
 				terminated: terminated.promise,
 				attachClient: async () => {
 					acquiring.resolve(undefined);
 					await continueAcquiring.promise;
 					return {
-						prompt: async () => ({
-							ok: true,
-							value: {
-								operationId: "run-1",
-								kind: "run" as const,
-								status: "completed" as const,
-								fromTipId: null,
-								tipId: "leaf-1",
-								startedAt: 1,
-								endedAt: 2,
-							},
-						}),
+						invokeService: async () => undefined,
 						release: () => {
 							releaseCount += 1;
 						},
@@ -704,17 +422,9 @@ describe("routed Session acquisition failures", () => {
 				close: async () => {},
 			}),
 		};
-		const server = new Server(host, {
-			listeners: [],
-			serverId: "00000000-0000-4000-8000-000000000001",
-		});
-		servers.add(server);
-		const client = connect(server);
+		const client = connect(createServer(host));
 		await client.hello();
-		const attach = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		const attach = client.attach(serverId, "session-1");
 		await acquiring.promise;
 
 		terminated.resolve(new Error("worker crashed"));
@@ -733,15 +443,9 @@ describe("routed Session acquisition failures", () => {
 		await Promise.all([first.hello(), second.hello()]);
 		const gate = host.gateNextOpenSession();
 
-		const firstAttach = first.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		const firstAttach = first.attach(serverId, "session-1");
 		await gate.entered.promise;
-		const secondAttach = second.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		const secondAttach = second.attach(serverId, "session-1");
 		gate.release.resolve(undefined);
 
 		await expect(Promise.all([firstAttach, secondAttach])).resolves.toMatchObject([
@@ -750,9 +454,7 @@ describe("routed Session acquisition failures", () => {
 		]);
 		expect(host.openSessionCount).toBe(1);
 
-		await expect(
-			first.request("00000000-0000-4000-8000-000000000001", { method: "attach", args: ["session-1"] }),
-		).resolves.toMatchObject({ ok: true, result: { sessionId: "session-1" } });
+		await expect(first.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 		expect(host.openSessionCount).toBe(2);
 		expect(host.harnesses.get("session-1")).toHaveLength(1);
 	});
@@ -764,10 +466,7 @@ describe("routed Session acquisition failures", () => {
 		const client = connect(server);
 		await client.hello();
 		const gate = host.gateNextOpenSession();
-		const attach = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		const attach = client.attach(serverId, "session-1");
 		await gate.entered.promise;
 		const closing = server.close();
 		gate.release.resolve(undefined);
@@ -786,10 +485,7 @@ describe("routed Session acquisition failures", () => {
 		const client = connect(server);
 		await client.hello();
 		const gate = host.gateNextOpenSession();
-		const attach = client.request("00000000-0000-4000-8000-000000000001", {
-			method: "attach",
-			args: ["session-1"],
-		});
+		const attach = client.attach(serverId, "session-1");
 		await gate.entered.promise;
 
 		const closing = server.close();

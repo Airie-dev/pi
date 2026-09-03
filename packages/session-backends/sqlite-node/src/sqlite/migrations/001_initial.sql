@@ -119,10 +119,3 @@ CREATE TABLE IF NOT EXISTS branch_meta (
 ) WITHOUT ROWID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ix_bm_tip ON branch_meta(session_id, tip_entry_id);
-
-CREATE TABLE IF NOT EXISTS writer_lease (
-	session_id TEXT PRIMARY KEY,
-	owner_id TEXT NOT NULL,
-	fence INTEGER NOT NULL,
-	expires_at_ms INTEGER NOT NULL
-) WITHOUT ROWID;

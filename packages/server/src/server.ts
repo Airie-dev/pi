@@ -1,24 +1,25 @@
 import {
-	BACKGROUND_CONTEXT,
+	createServiceStateEncoder,
+	decodeServiceControlCall,
+	type JsonValue,
+	parseServiceCall,
+	parseServiceSubscriptionSnapshot,
 	RemoteServiceError,
-	ServiceSliceNotImplemented,
-	type SessionMetadata,
-	TODO_CONTEXT,
-	withAbortSignal,
-} from "@earendil-works/pi-agent-core";
+	type ServiceCall,
+	type ServiceProviderUpdate,
+} from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, type SessionMetadata, TODO_CONTEXT, withAbortSignal } from "@earendil-works/pi-agent-core";
 import {
 	type CancelEnvelope,
 	type ClientHello,
 	type ClientMessage,
 	ClientMessageDecoder,
 	DEFAULT_MAX_FRAME_LENGTH,
-	decodeServiceRpcCall,
 	encodeServerMessage,
 	isServerId,
 	isSupportedProtocolVersion,
 	PROTOCOL_VERSION,
 	type ProtocolError,
-	type ProtocolRpcResult,
 	ProtocolValidationError,
 	type RequestEnvelope,
 	type ResponseEnvelope,
@@ -153,6 +154,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		state = {
 			connection,
 			decoder: new ClientMessageDecoder({ maxFrameLength: this.maxFrameLength }),
+			serviceStateEncoders: new Map(),
 			stage: "awaitingHello",
 			disconnected: false,
 			handshakeTimeout,
@@ -267,24 +269,21 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		}
 
 		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) return;
-		const serviceHost = this.host.serverServices;
-		if (serviceHost !== undefined) {
-			const services = await serviceHost.attachClient(
-				{
-					attachSession: async (sessionId, context) => {
-						await this.sessions.attachClient(state, sessionId, context);
-					},
-					detachSession: (context) => this.sessions.detachClient(state, context),
-					prepareSessionRemoval: (sessionId, context) => this.sessions.removeSession(sessionId, context),
+		const services = await this.host.serverServices.attachClient(
+			{
+				attachSession: async (sessionId, context) => {
+					await this.sessions.attachClient(state, sessionId, context);
 				},
-				TODO_CONTEXT,
-			);
-			if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) {
-				await services.release(TODO_CONTEXT);
-				return;
-			}
-			state.serverServices = services;
+				detachSession: (context) => this.sessions.detachClient(state, context),
+				prepareSessionRemoval: (sessionId, context) => this.sessions.removeSession(sessionId, context),
+			},
+			TODO_CONTEXT,
+		);
+		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) {
+			await services.release(TODO_CONTEXT);
+			return;
 		}
+		state.serverServices = services;
 		const sent = await this.sendMessage(state, {
 			type: "hello",
 			version: PROTOCOL_VERSION,
@@ -314,46 +313,57 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			} satisfies ResponseEnvelope);
 			return;
 		}
+		let call: ServiceCall;
+		try {
+			call = parseServiceCall(envelope.call);
+		} catch {
+			await this.sendMessage(state, {
+				type: "response",
+				id: envelope.id,
+				ok: false,
+				error: { code: "invalid_request", message: "Invalid service call" },
+			} satisfies ResponseEnvelope);
+			return;
+		}
 		const controller = new AbortController();
 		const active = { controller, target: envelope.target };
 		state.activeRequests.set(envelope.id, active);
 		const context = withAbortSignal(controller.signal, TODO_CONTEXT);
+		const control = decodeServiceControlCall(call);
+		const subscribing = control?.type === "subscribe" ? control : undefined;
+		const pendingUpdates: { readonly update: ServiceProviderUpdate }[] = [];
+		let subscriptionReady = subscribing === undefined;
+		let installedSubscriptionEncoder = false;
+		let responded = false;
+		const publish = async (subscriptionId: string, update: ServiceProviderUpdate): Promise<void> => {
+			if (subscribing !== undefined && subscriptionId === subscribing.subscriptionId && !subscriptionReady) {
+				pendingUpdates.push({ update });
+				return;
+			}
+			await this.sendServiceUpdate(state, subscriptionId, update);
+		};
 		try {
 			if (envelope.target.serverId !== this.serverId) throw new WrongServerError();
-			let result: ProtocolRpcResult;
-			const call = decodeServiceRpcCall(envelope.call);
-			if (!("sessionId" in envelope.target) && state.serverServices !== undefined && call?.method !== "list") {
-				result = await state.serverServices.invokeService(
-					envelope.call,
-					async (subscriptionId, update) => {
-						await this.sendMessage(state, { type: "service_update", subscriptionId, update });
-					},
-					context,
-				);
-			} else if (call !== undefined) {
-				result = await this.sessions.executeCall(
-					call,
-					envelope.target,
-					state,
-					async (message, _context) => {
-						await this.sendMessage(state, message);
-					},
-					context,
-				);
-			} else if ("sessionId" in envelope.target) {
-				result = await this.sessions.executeServiceCall(
-					envelope.call,
-					envelope.target,
-					state,
-					async (message, _context) => {
-						await this.sendMessage(state, message);
-					},
-					context,
-				);
+			if (subscribing !== undefined && state.serviceStateEncoders.has(subscribing.subscriptionId)) {
+				throw new ProtocolValidationError(`Duplicate service subscription ${subscribing.subscriptionId}`);
+			}
+			let result: JsonValue | undefined;
+			if ("sessionId" in envelope.target) {
+				result = await this.sessions.executeServiceCall(call, envelope.target, state, publish, context);
+			} else if (state.serverServices !== undefined) {
+				result = await state.serverServices.invokeService(call, publish, context);
 			} else {
-				throw new ProtocolValidationError(
-					`Unknown service member ${envelope.call.serviceId}.${envelope.call.member}`,
-				);
+				throw new ProtocolValidationError(`Unknown service member ${call.serviceId}.${call.member}`);
+			}
+			if (subscribing !== undefined) {
+				if (result === undefined)
+					throw new ProtocolValidationError("Service subscription did not return a snapshot");
+				const stateEncoder = createServiceStateEncoder();
+				result = stateEncoder.encodeSnapshot(parseServiceSubscriptionSnapshot(result)) as unknown as JsonValue;
+				state.serviceStateEncoders.set(subscribing.subscriptionId, stateEncoder);
+				installedSubscriptionEncoder = true;
+			} else if (control?.type === "unsubscribe") {
+				state.serviceStateEncoders.delete(control.subscriptionId);
 			}
 			await this.sendMessage(
 				state,
@@ -361,15 +371,33 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 					? { type: "response", id: envelope.id, ok: true }
 					: { type: "response", id: envelope.id, ok: true, result },
 			);
+			responded = true;
+			if (subscribing !== undefined) {
+				while (pendingUpdates.length > 0) {
+					const pending = pendingUpdates.shift();
+					if (pending !== undefined)
+						await this.sendServiceUpdate(state, subscribing.subscriptionId, pending.update);
+				}
+				subscriptionReady = true;
+			}
 		} catch (error) {
-			await this.sendMessage(state, {
-				type: "response",
-				id: envelope.id,
-				ok: false,
-				error: controller.signal.aborted
-					? { code: "cancelled", message: "RPC request cancelled" }
-					: this.toProtocolError(error),
-			} satisfies ResponseEnvelope);
+			if (subscribing !== undefined && installedSubscriptionEncoder && !responded) {
+				state.serviceStateEncoders.delete(subscribing.subscriptionId);
+			}
+			if (responded) {
+				this.reportError(error);
+				await this.closeConnection(state.connection);
+				this.disconnect(state);
+			} else {
+				await this.sendMessage(state, {
+					type: "response",
+					id: envelope.id,
+					ok: false,
+					error: controller.signal.aborted
+						? { code: "cancelled", message: "RPC request cancelled" }
+						: this.toProtocolError(error),
+				} satisfies ResponseEnvelope);
+			}
 		} finally {
 			if (state.activeRequests.get(envelope.id) === active) state.activeRequests.delete(envelope.id);
 		}
@@ -395,6 +423,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			controller.abort(new Error("Client disconnected"));
 		}
 		connection.activeRequests.clear();
+		connection.serviceStateEncoders.clear();
 		if (this.connections.delete(connection)) this.notifyConnectionCountChanged();
 		const serverServices = connection.serverServices;
 		delete connection.serverServices;
@@ -403,6 +432,20 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 			serverServices?.release(TODO_CONTEXT),
 		]).then((results) => {
 			for (const result of results) if (result.status === "rejected") this.reportError(result.reason);
+		});
+	}
+
+	private async sendServiceUpdate(
+		connection: ConnectionState,
+		subscriptionId: string,
+		update: ServiceProviderUpdate,
+	): Promise<void> {
+		const stateEncoder = connection.serviceStateEncoders.get(subscriptionId);
+		if (stateEncoder === undefined) return;
+		await this.sendMessage(connection, {
+			type: "service_update",
+			subscriptionId,
+			update: stateEncoder.encodeUpdate(update) as unknown as JsonValue,
 		});
 	}
 
@@ -467,11 +510,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 	}
 
 	private toProtocolError(error: unknown): ProtocolError {
-		if (
-			error instanceof ServerError ||
-			error instanceof RemoteServiceError ||
-			error instanceof ServiceSliceNotImplemented
-		) {
+		if (error instanceof ServerError || error instanceof RemoteServiceError) {
 			return { code: error.code, message: error.message };
 		}
 		if (error instanceof ProtocolValidationError) {

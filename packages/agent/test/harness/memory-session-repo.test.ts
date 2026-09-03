@@ -98,11 +98,23 @@ describe("MemorySessionRepo metadata", () => {
 					customType: "child",
 				}),
 				storedValues.setValue(storedValues.branchTip("main"), childId),
+				storedValues.setValue(storedValues.laneConfig("main"), {
+					model: { provider: "test", modelId: "test" },
+					thinkingLevel: "off",
+					activeToolNames: [],
+				}),
+				storedValues.setValue(storedValues.laneState("main"), {
+					currentOperationId: null,
+					lastOperationId: null,
+					inbox: [],
+				}),
 			],
 			BACKGROUND_CONTEXT,
 		);
 		const options = {
 			id: "fork",
+			scope: "branch" as const,
+			branch: "main",
 			entryId: childId,
 			position: "before" as "before" | "at",
 		};

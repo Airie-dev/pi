@@ -1,14 +1,5 @@
+import type { JsonValue, ServiceCall, ServiceProviderUpdate } from "@earendil-works/chord";
 import type { Context, SessionMetadata } from "@earendil-works/pi-agent-core";
-import type {
-	LaneEvent,
-	LaneSnapshot,
-	PromptArguments,
-	ProtocolRpcCall,
-	ProtocolRpcResult,
-	RunResult,
-	ServiceProviderUpdate,
-	SessionCreateOptions,
-} from "@earendil-works/pi-protocol";
 import type { ServerListener } from "./listener.ts";
 
 export interface ServerOptions {
@@ -25,16 +16,12 @@ export type MaybePromise<T> = T | Promise<T>;
 
 /** One presentation connection's live capability for a hosted Session. */
 export interface RoutedSessionAttachment {
-	/** Execute one serializable prompt through this attachment. */
-	prompt(prompt: PromptArguments, context: Context): Promise<RunResult>;
 	/** Route one contract-agnostic service operation to the attached Session endpoint. */
-	invokeService?(
-		call: ProtocolRpcCall,
+	invokeService(
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult>;
-	/** Observe the attached main lane when supported by this host. */
-	watch?(context: Context): Promise<RoutedSessionWatch>;
+	): Promise<JsonValue | undefined>;
 	release(context: Context): MaybePromise<void>;
 }
 
@@ -49,23 +36,15 @@ export interface RoutedServerPresentation {
 /** One connection's server-scoped service endpoint. */
 export interface RoutedServerServiceAttachment {
 	invokeService(
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => MaybePromise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult>;
+	): Promise<JsonValue | undefined>;
 	release(context: Context): MaybePromise<void>;
 }
 
 export interface RoutedServerServiceHost {
 	attachClient(presentation: RoutedServerPresentation, context: Context): MaybePromise<RoutedServerServiceAttachment>;
-}
-
-/** Snapshot-first observation handle supplied by a routed Session attachment. */
-export interface RoutedSessionWatch {
-	readonly snapshot: LaneSnapshot;
-	start(listener: (event: LaneEvent, context: Context) => MaybePromise<void>, context: Context): MaybePromise<void>;
-	resnapshot(context: Context): Promise<LaneSnapshot>;
-	unsubscribe(context: Context): MaybePromise<void>;
 }
 
 /** A process-safe handle that acquires presentation-scoped Session capabilities. */
@@ -78,10 +57,8 @@ export interface RoutedSessionHandle {
 
 /** Application capabilities used by server-wide management and Session routing. */
 export interface ServerHost<TMetadata extends SessionMetadata = SessionMetadata> {
-	readonly serverServices?: RoutedServerServiceHost;
-	readonly sessions: {
-		list(context: Context): Promise<TMetadata[]>;
-		create(options: SessionCreateOptions, context: Context): Promise<TMetadata>;
-	};
+	readonly serverServices: RoutedServerServiceHost;
+	/** Resolve one durable Session ID or throw a bounded routing error. */
+	resolveSession(sessionId: string, context: Context): Promise<TMetadata>;
 	openSession(metadata: TMetadata, context: Context): Promise<RoutedSessionHandle>;
 }

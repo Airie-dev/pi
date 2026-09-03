@@ -1,40 +1,30 @@
-import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
+import {
+	isJsonValue,
+	type JsonValue,
+	parseServiceProviderUpdate,
+	REMOTE_SERVICE_ERROR_CODES,
+	RemoteServiceError,
+	type RemoteServiceErrorCode,
+	type ServiceCall,
+	type ServiceProviderUpdate,
+} from "@earendil-works/chord";
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
 	type AgentLane,
 	BACKGROUND_CONTEXT,
-	type Context,
 	createBashTool,
 	createReadTool,
 	createWriteTool,
 	type JsonlSessionMetadata,
 	JsonlSessionRepo,
-	RemoteServiceError,
-	ServiceSliceNotImplemented,
 	type Session,
 	TODO_CONTEXT,
 	withCancel,
 } from "@earendil-works/pi-agent-core";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import {
-	createRpcCallSchema,
-	createRpcDispatcher,
-	createRpcResultSchema,
-	defineRpc,
-	LaneEventSchema,
-	LaneSnapshotSchema,
-	PromptArgumentsSchema,
-	ProtocolRpcCallSchema,
-	type RpcCall,
-	type RpcResultUnion,
-	RunResultSchema,
-	type ServiceErrorCode,
-	ServiceErrorCodeSchema,
-	ServiceProviderUpdateSchema,
-} from "@earendil-works/pi-protocol";
 import lockfile from "proper-lockfile";
 import Type, { type Static } from "typebox";
 import { Check } from "typebox/value";
@@ -42,12 +32,7 @@ import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
-import {
-	toHarnessPromptArguments,
-	toWireLaneEvent,
-	toWireLaneSnapshot,
-	toWireRunResult,
-} from "./harness-wire-adapter.ts";
+import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
 	encodeControlLine,
@@ -56,15 +41,29 @@ import {
 } from "./process.ts";
 import {
 	createSessionWorkerServices,
-	ServiceOperationResultSchema,
 	type SessionWorkerRuntime,
 	type SessionWorkerServices,
+	type WorkerServiceScope,
 } from "./services/worker.ts";
 
 export type { SessionWorkerRuntime } from "./services/worker.ts";
 
 const StrictObject = <const T extends Parameters<typeof Type.Object>[0]>(properties: T) =>
 	Type.Object(properties, { additionalProperties: false });
+const OpaqueJsonValueSchema = Type.Unsafe<JsonValue>(Type.Unknown());
+const ServiceCallSchema = Type.Unsafe<ServiceCall>(
+	StrictObject({
+		serviceId: Type.String({ minLength: 1 }),
+		instance: Type.Optional(
+			StrictObject({ key: Type.String({ minLength: 1 }), generation: Type.Integer({ minimum: 1 }) }),
+		),
+		member: Type.String({ minLength: 1 }),
+		args: Type.Array(Type.Unknown()),
+	}),
+);
+const RemoteServiceErrorCodeSchema = Type.Unsafe<RemoteServiceErrorCode>(
+	Type.String({ pattern: `^(?:${REMOTE_SERVICE_ERROR_CODES.join("|")})$` }),
+);
 
 export const SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS";
 export const SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN";
@@ -79,7 +78,6 @@ export const SessionWorkerMetadataSchema = StrictObject({
 	path: Type.String(),
 	modifiedAt: Type.Number(),
 	parentSessionId: Type.Optional(Type.String()),
-	legacyParentSessionPath: Type.Optional(Type.String()),
 });
 
 export const SessionWorkerOptionsSchema = StrictObject({
@@ -87,56 +85,21 @@ export const SessionWorkerOptionsSchema = StrictObject({
 	metadata: SessionWorkerMetadataSchema,
 	provider: Type.Optional(Type.String({ minLength: 1 })),
 	model: Type.Optional(Type.String({ minLength: 1 })),
+	pluginManifestPaths: Type.Array(Type.String({ minLength: 1 })),
 });
 export type SessionWorkerOptions = Static<typeof SessionWorkerOptionsSchema>;
-
-export const SessionWorkerOperations = defineRpc({
-	prompt: {
-		args: Type.Tuple([PromptArgumentsSchema]),
-		result: RunResultSchema,
-	},
-	watch: {
-		args: Type.Tuple([]),
-		result: StrictObject({ watchId: Type.String({ minLength: 1 }), snapshot: LaneSnapshotSchema }),
-	},
-	startWatch: {
-		args: Type.Tuple([Type.String({ minLength: 1 })]),
-		result: StrictObject({ watchId: Type.String({ minLength: 1 }) }),
-	},
-	resnapshotWatch: {
-		args: Type.Tuple([Type.String({ minLength: 1 })]),
-		result: StrictObject({ watchId: Type.String({ minLength: 1 }), snapshot: LaneSnapshotSchema }),
-	},
-	stopWatch: {
-		args: Type.Tuple([Type.String({ minLength: 1 })]),
-		result: StrictObject({ watchId: Type.String({ minLength: 1 }) }),
-	},
-	service: {
-		args: Type.Tuple([ProtocolRpcCallSchema]),
-		result: ServiceOperationResultSchema,
-	},
-});
-export type SessionWorkerOperationCall = RpcCall<typeof SessionWorkerOperations>;
-type SessionWorkerOperationResult = RpcResultUnion<typeof SessionWorkerOperations>;
-
-const SessionWorkerOperationCallSchema = Type.Unsafe<SessionWorkerOperationCall>(
-	createRpcCallSchema(SessionWorkerOperations),
-);
-const SessionWorkerOperationResultSchema = Type.Unsafe<SessionWorkerOperationResult>(
-	createRpcResultSchema(SessionWorkerOperations),
-);
 
 export const WorkerOperationScopeSchema = StrictObject({
 	serverConnectionId: Type.String(),
 	attachmentId: Type.String(),
 });
-export type WorkerOperationScope = Static<typeof WorkerOperationScopeSchema>;
+export type WorkerOperationScope = WorkerServiceScope;
 
 export const WorkerOperationRequestSchema = StrictObject({
 	type: Type.Literal("operation"),
 	requestId: Type.String({ minLength: 1 }),
 	scope: WorkerOperationScopeSchema,
-	call: SessionWorkerOperationCallSchema,
+	call: ServiceCallSchema,
 });
 export type WorkerOperationRequest = Static<typeof WorkerOperationRequestSchema>;
 
@@ -145,13 +108,13 @@ export const WorkerOperationResponseSchema = Type.Union([
 		type: Type.Literal("operation_result"),
 		requestId: Type.String({ minLength: 1 }),
 		scope: WorkerOperationScopeSchema,
-		result: SessionWorkerOperationResultSchema,
+		result: Type.Optional(OpaqueJsonValueSchema),
 	}),
 	StrictObject({
 		type: Type.Literal("operation_error"),
 		requestId: Type.String({ minLength: 1 }),
 		scope: WorkerOperationScopeSchema,
-		code: Type.Optional(ServiceErrorCodeSchema),
+		code: Type.Optional(RemoteServiceErrorCodeSchema),
 		message: Type.String(),
 	}),
 ]);
@@ -184,6 +147,7 @@ export const SessionWorkerEventSchema = Type.Union([
 		sessionId: Type.String(),
 		pid: Type.Integer({ minimum: 1 }),
 		metadata: SessionWorkerMetadataSchema,
+		pluginManifestPaths: Type.Array(Type.String({ minLength: 1 })),
 	}),
 	Type.Object({
 		type: Type.Literal("worker_failed"),
@@ -213,20 +177,12 @@ export const SessionWorkerEventSchema = Type.Union([
 		response: WorkerOperationResponseSchema,
 	}),
 	Type.Object({
-		type: Type.Literal("lane_event"),
-		token: Type.String(),
-		sessionKey: Type.String(),
-		scope: WorkerOperationScopeSchema,
-		watchId: Type.String({ minLength: 1 }),
-		event: LaneEventSchema,
-	}),
-	Type.Object({
 		type: Type.Literal("service_update"),
 		token: Type.String(),
 		sessionKey: Type.String(),
 		scope: WorkerOperationScopeSchema,
 		subscriptionId: Type.String({ minLength: 1 }),
-		update: ServiceProviderUpdateSchema,
+		update: Type.Unknown(),
 	}),
 ]);
 export type SessionWorkerEvent = Static<typeof SessionWorkerEventSchema>;
@@ -500,6 +456,11 @@ function writeJsonLine(socket: Socket, message: unknown): Promise<void> {
 	});
 }
 
+function toWorkerServiceUpdate(update: ServiceProviderUpdate): ServiceProviderUpdate {
+	if (!isJsonValue(update)) throw new Error("Service produced a non-JSON update");
+	return parseServiceProviderUpdate(update);
+}
+
 function demandKey(serverConnectionId: string, attachmentId: string): string {
 	return `${serverConnectionId}\0${attachmentId}`;
 }
@@ -559,7 +520,7 @@ export type CreateSessionWorkerHarness = (
 	session: Session<JsonlSessionMetadata>,
 	options: SessionWorkerOptions,
 	executionEnv: NodeExecutionEnv,
-) => Promise<AgentHarnessInstance | SessionWorkerRuntime>;
+) => Promise<SessionWorkerRuntime>;
 
 async function run(options: SessionWorkerOptions, createHarness: CreateSessionWorkerHarness): Promise<void> {
 	const { sessionDir, metadata } = options;
@@ -568,6 +529,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	const token = process.env[SESSION_WORKER_CONTROL_TOKEN_ENV]!;
 	const sessionKey = Buffer.from(process.env[SESSION_WORKER_SESSION_KEY_ENV]!, "base64url").toString();
 	failureControl = control;
+	const pluginManifestPaths = options.pluginManifestPaths;
 	const releaseOwnership = await lockfile.lock(metadata.path, {
 		realpath: true,
 		stale: 2_000,
@@ -582,8 +544,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	let services: SessionWorkerServices | undefined;
 	try {
 		session = await repo.open(metadata, TODO_CONTEXT);
-		const created = await createHarness(session, options, executionEnv);
-		const runtime: SessionWorkerRuntime = "harness" in created ? created : { harness: created };
+		const runtime = await createHarness(session, options, executionEnv);
 		harness = runtime.harness;
 		lane = runtime.lane ?? (await harness.lane("main", TODO_CONTEXT));
 		services = await createSessionWorkerServices({
@@ -598,7 +559,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 					sessionKey,
 					scope,
 					subscriptionId,
-					update,
+					update: toWorkerServiceUpdate(update),
 				}),
 		});
 	} catch (error) {
@@ -610,28 +571,16 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		throw error;
 	}
 
-	const laneWatches = new Map<
-		string,
-		{ readonly scope: WorkerOperationScope; readonly handle: Awaited<ReturnType<AgentLane["watch"]>> }
-	>();
 	const activeRequests = new Map<
 		string,
 		{ readonly scope: WorkerOperationScope; readonly cancel: (reason?: unknown) => void }
 	>();
-	const removeLaneWatches = (matches: (scope: WorkerOperationScope) => boolean): void => {
-		for (const [watchId, watch] of laneWatches) {
-			if (!matches(watch.scope)) continue;
-			watch.handle.unsubscribe();
-			laneWatches.delete(watchId);
-		}
-	};
 	let lifecycle: WorkerLifecycle | undefined;
 	let removeLifecycleListeners: (() => void)[] = [];
 	let closing: Promise<void> | undefined;
 	const close = (): Promise<void> => {
 		if (closing) return closing;
 		lifecycle?.close();
-		removeLaneWatches(() => true);
 		services.removeSubscriptions(() => true);
 		for (const request of activeRequests.values()) request.cancel(new Error("Session worker is closing"));
 		activeRequests.clear();
@@ -676,71 +625,33 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		harness.events.on("fault", closeAndExit),
 	];
 
-	interface WorkerOperationContext {
-		readonly scope: WorkerOperationScope;
-		readonly context: Context;
-	}
-	const dispatchWorkerOperation = createRpcDispatcher(SessionWorkerOperations, {
-		prompt: async ({ context }: WorkerOperationContext, prompt) => {
-			const args = toHarnessPromptArguments(prompt);
-			const result =
-				typeof args[0] === "string"
-					? await lane.prompt(args[0], args[1], context)
-					: await lane.prompt(args[0], context);
-			return toWireRunResult(result);
-		},
-		watch: async ({ scope, context }: WorkerOperationContext, ..._args: never[]) => {
-			const handle = await lane.watch(context);
-			const watchId = randomUUID();
-			laneWatches.set(watchId, { scope, handle });
-			return { watchId, snapshot: toWireLaneSnapshot(handle.snapshot) };
-		},
-		startWatch: async ({ scope }: WorkerOperationContext, watchId) => {
-			const watch = laneWatches.get(watchId);
-			if (!watch || !sameScope(watch.scope, scope)) throw new Error("Session worker lane watch was not found");
-			watch.handle.start(async (event) => {
-				const wireEvent = toWireLaneEvent(event);
-				if (wireEvent === undefined) return;
-				await control.send({ type: "lane_event", token, sessionKey, scope, watchId, event: wireEvent });
-			});
-			return { watchId };
-		},
-		resnapshotWatch: async ({ scope, context }: WorkerOperationContext, watchId) => {
-			const watch = laneWatches.get(watchId);
-			if (!watch || !sameScope(watch.scope, scope)) throw new Error("Session worker lane watch was not found");
-			return { watchId, snapshot: toWireLaneSnapshot(await watch.handle.resnapshot(context)) };
-		},
-		stopWatch: async ({ scope }: WorkerOperationContext, watchId) => {
-			const watch = laneWatches.get(watchId);
-			if (!watch || !sameScope(watch.scope, scope)) throw new Error("Session worker lane watch was not found");
-			watch.handle.unsubscribe();
-			laneWatches.delete(watchId);
-			return { watchId };
-		},
-		service: async ({ scope, context }: WorkerOperationContext, call) => {
-			const result = await services.invoke(call, scope, context);
-			return result === undefined ? {} : { result };
-		},
-	});
 	const handleOperation = async (request: WorkerOperationRequest): Promise<void> => {
 		let releaseRequest = (): void => {};
 		const cancellable = withCancel(BACKGROUND_CONTEXT);
 		try {
 			releaseRequest = lifecycle!.beginRequest(request.scope.serverConnectionId, request.scope.attachmentId);
 			activeRequests.set(request.requestId, { scope: request.scope, cancel: cancellable.cancel });
-			const result = await dispatchWorkerOperation(request.call, {
-				scope: request.scope,
-				context: cancellable.context,
-			});
+			const result = await services.invoke(request.call, request.scope, cancellable.context);
+			if (result !== undefined && !isJsonValue(result)) throw new Error("Service produced a non-JSON result");
 			await control.send({
 				type: "operation_response",
 				token,
 				sessionKey,
-				response: { type: "operation_result", requestId: request.requestId, scope: request.scope, result },
+				response: {
+					type: "operation_result",
+					requestId: request.requestId,
+					scope: request.scope,
+					...(result === undefined ? {} : { result }),
+				},
 			});
 		} catch (error) {
-			const code: ServiceErrorCode | undefined =
-				error instanceof RemoteServiceError || error instanceof ServiceSliceNotImplemented ? error.code : undefined;
+			let code: RemoteServiceErrorCode | undefined;
+			if (error instanceof RemoteServiceError) {
+				code = error.code;
+			} else if (error instanceof Error && "code" in error) {
+				const candidate = error.code;
+				if (Check(RemoteServiceErrorCodeSchema, candidate)) code = candidate;
+			}
 			await control.send({
 				type: "operation_response",
 				token,
@@ -772,6 +683,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 				sessionId,
 				pid: process.pid,
 				metadata,
+				pluginManifestPaths: [...pluginManifestPaths],
 			})
 			.catch(() => closeAndExit());
 	};
@@ -786,7 +698,6 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 						const matches = (scope: WorkerOperationScope): boolean =>
 							scope.serverConnectionId === command.serverConnectionId &&
 							scope.attachmentId === command.attachmentId;
-						removeLaneWatches(matches);
 						services.removeSubscriptions(matches);
 					}
 					lifecycle?.setDemand(command.serverConnectionId, command.attachmentId, command.attached);
@@ -824,7 +735,6 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		onServerConnected: (serverConnectionId) => lifecycle?.serverConnected(serverConnectionId),
 		onServerDisconnected: (serverConnectionId) => {
 			const matches = (scope: WorkerOperationScope): boolean => scope.serverConnectionId === serverConnectionId;
-			removeLaneWatches(matches);
 			services.removeSubscriptions(matches);
 			for (const request of activeRequests.values()) {
 				if (matches(request.scope)) request.cancel(new Error("Server disconnected"));
@@ -839,7 +749,15 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 
 	try {
 		ready = true;
-		await control.send({ type: "worker_ready", token, sessionKey, sessionId, pid: process.pid, metadata });
+		await control.send({
+			type: "worker_ready",
+			token,
+			sessionKey,
+			sessionId,
+			pid: process.pid,
+			metadata,
+			pluginManifestPaths: [...pluginManifestPaths],
+		});
 	} catch (error) {
 		try {
 			await close();
@@ -936,7 +854,13 @@ async function createCodingAgentHarness(
 		) {
 			await lane.setActiveTools(activeToolNames, TODO_CONTEXT);
 		}
-		return { harness, lane, modelRuntime, settingsManager };
+		return {
+			harness,
+			lane,
+			modelRuntime,
+			settingsManager,
+			facetLoader: createSessionPluginFacetLoader(options.pluginManifestPaths),
+		};
 	} catch (error) {
 		try {
 			await harness.close(TODO_CONTEXT);

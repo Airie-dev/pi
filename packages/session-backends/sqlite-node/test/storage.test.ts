@@ -2,12 +2,44 @@ import * as storedValues from "@earendil-works/pi-agent-core";
 import * as sessionWrites from "@earendil-works/pi-agent-core";
 import { BACKGROUND_CONTEXT, prepareStorageCommit } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
-import { createNodeSqliteFactory, type SqliteDatabase, SqliteStorage, sql } from "../src/index.ts";
+import {
+	createNodeSqliteFactory,
+	type SqliteDatabase,
+	type SqliteStatement,
+	SqliteStorage,
+	sql,
+} from "../src/index.ts";
 import { applyInitialSchema } from "../src/sqlite/migrations.ts";
 import { advanceNextSeq, readNextSeq } from "../src/sqlite/session/session-sequences.ts";
 import { listValueReadQuery } from "../src/sqlite/session/values.ts";
 
 const SESSION_ID = "session";
+
+class TransactionCountingDatabase implements SqliteDatabase {
+	readonly source: SqliteDatabase;
+	transactionCount = 0;
+
+	constructor(source: SqliteDatabase) {
+		this.source = source;
+	}
+
+	exec(query: string): void {
+		this.source.exec(query);
+	}
+
+	prepare(query: string): SqliteStatement {
+		return this.source.prepare(query);
+	}
+
+	transaction<T>(callback: () => T): T {
+		this.transactionCount++;
+		return this.source.transaction(callback);
+	}
+
+	close(): void {
+		this.source.close();
+	}
+}
 
 const ZERO_USAGE = {
 	input: 0,
@@ -59,6 +91,22 @@ function insertCommitSessionRow(db: SqliteDatabase, nextSeq = 1): void {
 }
 
 describe("SqliteStorage", () => {
+	it("uses one write transaction for an ordinary commit", async () => {
+		const db = new TransactionCountingDatabase(await createNodeSqliteFactory().open(":memory:"));
+		try {
+			await applyInitialSchema(db);
+			insertCommitSessionRow(db);
+			const storage = new SqliteStorage(db, { sessionId: SESSION_ID, now: () => 1_700_000_000_000 });
+
+			await storage.commit([storedValues.setValue(storedValues.sessionName, "name")], BACKGROUND_CONTEXT);
+
+			expect(db.transactionCount).toBe(1);
+			await storage.close(BACKGROUND_CONTEXT);
+		} finally {
+			db.close();
+		}
+	});
+
 	it("commits root entries and append-to-tip entries into the branch index", async () => {
 		await withStorage(async (storage, db) => {
 			insertCommitSessionRow(db);

@@ -2,30 +2,23 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
+	createServiceUnsubscribeCall,
+	decodeServiceControlCall,
+	type JsonValue,
+	parseServiceProviderUpdate,
+	type ServiceCall,
+	type ServiceProviderUpdate,
+} from "@earendil-works/chord";
+import {
 	BACKGROUND_CONTEXT,
 	type Context,
 	type JsonlSessionMetadata,
 	TODO_CONTEXT,
 } from "@earendil-works/pi-agent-core";
-import {
-	createRpcClient,
-	createServiceUnsubscribeCall,
-	decodeServiceControlCall,
-	type LaneEvent,
-	type ProtocolRpcCall,
-	type ProtocolRpcResult,
-	type ServiceProviderUpdate,
-} from "@earendil-works/pi-protocol";
-import {
-	type RoutedSessionAttachment,
-	type RoutedSessionHandle,
-	type RoutedSessionWatch,
-	ServerError,
-} from "@earendil-works/pi-server";
+import { type RoutedSessionAttachment, type RoutedSessionHandle, ServerError } from "@earendil-works/pi-server";
 import { Check } from "typebox/value";
 import type { CoordinatorConnection, CoordinatorConnectionEvent } from "./coordinator.ts";
 import { spawnInternalProcess } from "./process.ts";
-import type { ServiceOperationResult } from "./services/worker.ts";
 import {
 	SESSION_WORKER_CONTROL_ADDRESS_ENV,
 	SESSION_WORKER_CONTROL_TOKEN_ENV,
@@ -33,8 +26,6 @@ import {
 	SESSION_WORKER_SESSION_KEY_ENV,
 	type SessionWorkerEvent,
 	SessionWorkerEventSchema,
-	type SessionWorkerOperationCall,
-	SessionWorkerOperations,
 	type SessionWorkerOptions,
 	type WorkerOperationResponse,
 	type WorkerOperationScope,
@@ -45,11 +36,19 @@ const WORKER_SHUTDOWN_TIMEOUT_MS = 10_000;
 const WORKER_DISCOVERY_TIMEOUT_MS = 5_000;
 const WORKER_DEMAND_TIMEOUT_MS = 5_000;
 
+export class SessionPluginSelectionConflictError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionPluginSelectionConflictError";
+	}
+}
+
 interface WorkerRecord {
 	readonly peerId: string;
 	readonly metadata: JsonlSessionMetadata;
 	readonly pid: number;
 	readonly token: string;
+	readonly pluginManifestPaths: readonly string[];
 	readonly terminated: Promise<Error | undefined>;
 	resolveTerminated(error: Error | undefined): void;
 	readonly attachmentIds: Set<string>;
@@ -68,18 +67,11 @@ interface PendingDemand {
 	reject(error: Error): void;
 }
 
-interface WorkerLaneWatch {
-	readonly worker: WorkerRecord;
-	readonly scope: WorkerOperationScope;
-	listener?: (event: LaneEvent, context: Context) => void | Promise<void>;
-	deliveryTail: Promise<void>;
-}
-
 interface PendingWorkerOperation {
 	readonly worker: WorkerRecord;
 	readonly scope: WorkerOperationScope;
 	cleanup(): void;
-	resolve(result: unknown): void;
+	resolve(result: JsonValue | undefined): void;
 	reject(error: Error): void;
 }
 
@@ -94,6 +86,7 @@ interface PendingLaunch {
 	readonly sessionKey: string;
 	readonly peerId: string;
 	readonly token: string;
+	readonly pluginManifestPaths: readonly string[];
 	readonly child: ChildProcess;
 	readonly timer: NodeJS.Timeout;
 	readonly promise: Promise<WorkerRecord>;
@@ -115,7 +108,6 @@ export class SessionWorkerManager {
 	readonly #pending = new Map<string, PendingLaunch>();
 	readonly #pendingDemand = new Map<string, PendingDemand>();
 	readonly #pendingOperations = new Map<string, PendingWorkerOperation>();
-	readonly #laneWatches = new Map<string, WorkerLaneWatch>();
 	readonly #serviceSubscriptions = new Map<string, WorkerServiceSubscription>();
 	readonly #removeListener: () => void;
 	readonly #onWorkerCountChanged: ((count: number) => void) | undefined;
@@ -144,6 +136,21 @@ export class SessionWorkerManager {
 		return [...this.#workersBySession.values()].map((worker) => worker.metadata);
 	}
 
+	assertSessionPluginManifestPaths(metadata: JsonlSessionMetadata, manifestPaths: readonly string[]): void {
+		const existing = this.#workersBySession.get(metadata.path);
+		if (existing !== undefined && !sameStrings(existing.pluginManifestPaths, manifestPaths)) {
+			throw new SessionPluginSelectionConflictError(
+				`Session ${metadata.id} is active with a different plugin selection`,
+			);
+		}
+		const pending = this.#pending.get(metadata.path);
+		if (pending !== undefined && !sameStrings(pending.pluginManifestPaths, manifestPaths)) {
+			throw new SessionPluginSelectionConflictError(
+				`Session ${metadata.id} is starting with a different plugin selection`,
+			);
+		}
+	}
+
 	async discover(peerIds: ReadonlySet<string>): Promise<void> {
 		if (this.#detached) return;
 		const undiscovered = new Set(
@@ -168,13 +175,18 @@ export class SessionWorkerManager {
 		this.#resolveDiscovery = undefined;
 	}
 
-	async openSession(metadata: JsonlSessionMetadata, context: Context): Promise<RoutedSessionHandle> {
+	async openSession(
+		metadata: JsonlSessionMetadata,
+		context: Context,
+		pluginManifestPaths: readonly string[],
+	): Promise<RoutedSessionHandle> {
 		if (this.#detached || this.#shuttingDown) throw new Error("Experimental server is shutting down");
+		this.assertSessionPluginManifestPaths(metadata, pluginManifestPaths);
 		const existing = this.#workersBySession.get(metadata.path);
 		if (existing) return this.#routedHandle(existing);
 		const pending = this.#pending.get(metadata.path);
 		if (pending) return this.#routedHandle(await pending.promise);
-		return this.#routedHandle(await this.#launch(metadata, context));
+		return this.#routedHandle(await this.#launch(metadata, context, pluginManifestPaths));
 	}
 
 	async closeSession(metadata: JsonlSessionMetadata, context: Context): Promise<void> {
@@ -188,14 +200,6 @@ export class SessionWorkerManager {
 			attachClient: (context) => this.#attachClient(worker, context),
 			close: (context) => this.#stopWorker(worker, context),
 		};
-	}
-
-	#operations(
-		worker: WorkerRecord,
-		scope: WorkerOperationScope,
-		context: Context,
-	): ReturnType<typeof createRpcClient<typeof SessionWorkerOperations>> {
-		return createRpcClient(SessionWorkerOperations, (call) => this.#invoke(worker, scope, call, context));
 	}
 
 	async #attachClient(worker: WorkerRecord, context: Context): Promise<RoutedSessionAttachment> {
@@ -216,10 +220,8 @@ export class SessionWorkerManager {
 		const scope = this.#operationScope(worker, attachmentId);
 		let released = false;
 		return {
-			prompt: (prompt, promptContext) => this.#operations(worker, scope, promptContext).prompt(prompt),
 			invokeService: (call, publish, serviceContext) =>
 				this.#invokeService(worker, scope, call, publish, serviceContext),
-			watch: (watchContext) => this.#createLaneWatch(worker, scope, watchContext),
 			release: async (releaseContext) => {
 				if (released) return;
 				released = true;
@@ -239,10 +241,10 @@ export class SessionWorkerManager {
 	async #invokeService(
 		worker: WorkerRecord,
 		scope: WorkerOperationScope,
-		call: ProtocolRpcCall,
+		call: ServiceCall,
 		publish: (subscriptionId: string, update: ServiceProviderUpdate, context: Context) => void | Promise<void>,
 		context: Context,
-	): Promise<ProtocolRpcResult> {
+	): Promise<JsonValue | undefined> {
 		const control = decodeServiceControlCall(call);
 		let addedSubscriptionKey: string | undefined;
 		if (control?.type === "subscribe") {
@@ -256,73 +258,25 @@ export class SessionWorkerManager {
 			});
 			addedSubscriptionKey = key;
 		}
-		let response: ServiceOperationResult;
+		let response: JsonValue | undefined;
 		try {
-			response = await this.#operations(worker, scope, context).service(call);
+			response = await this.#invoke(worker, scope, call, context);
 		} catch (error) {
 			if (addedSubscriptionKey !== undefined && control?.type === "subscribe") {
 				this.#serviceSubscriptions.delete(addedSubscriptionKey);
-				void this.#operations(worker, scope, BACKGROUND_CONTEXT)
-					.service(createServiceUnsubscribeCall(control.subscriptionId))
-					.catch(() => {});
+				void this.#invoke(
+					worker,
+					scope,
+					createServiceUnsubscribeCall(control.subscriptionId),
+					BACKGROUND_CONTEXT,
+				).catch(() => {});
 			}
 			throw error;
 		}
 		if (control?.type === "unsubscribe") {
 			this.#serviceSubscriptions.delete(scopedServiceSubscriptionKey(scope, control.subscriptionId));
 		}
-		return response.result;
-	}
-
-	async #createLaneWatch(
-		worker: WorkerRecord,
-		scope: WorkerOperationScope,
-		context: Context,
-	): Promise<RoutedSessionWatch> {
-		const { watchId, snapshot } = await this.#operations(worker, scope, context).watch();
-		if (this.#laneWatches.has(watchId)) {
-			await this.#operations(worker, scope, context)
-				.stopWatch(watchId)
-				.catch(() => {});
-			throw new Error("Session worker reused an active lane watch ID");
-		}
-		const watch: WorkerLaneWatch = { worker, scope, deliveryTail: Promise.resolve() };
-		this.#laneWatches.set(watchId, watch);
-		let state: "ready" | "started" | "unsubscribed" = "ready";
-		return {
-			snapshot,
-			start: async (listener, startContext) => {
-				if (state !== "ready" || this.#laneWatches.get(watchId) !== watch) {
-					throw new Error("Session worker lane watch may be started only once");
-				}
-				state = "started";
-				watch.listener = listener;
-				try {
-					await this.#operations(worker, scope, startContext).startWatch(watchId);
-				} catch (error) {
-					this.#laneWatches.delete(watchId);
-					delete watch.listener;
-					state = "unsubscribed";
-					await this.#operations(worker, scope, startContext)
-						.stopWatch(watchId)
-						.catch(() => {});
-					throw error;
-				}
-			},
-			resnapshot: async (resnapshotContext) => {
-				if (state === "unsubscribed" || this.#laneWatches.get(watchId) !== watch) {
-					throw new Error("Session worker lane watch is unsubscribed");
-				}
-				return (await this.#operations(worker, scope, resnapshotContext).resnapshotWatch(watchId)).snapshot;
-			},
-			unsubscribe: async (unsubscribeContext) => {
-				if (state === "unsubscribed") return;
-				state = "unsubscribed";
-				if (this.#laneWatches.get(watchId) === watch) this.#laneWatches.delete(watchId);
-				delete watch.listener;
-				await this.#operations(worker, scope, unsubscribeContext).stopWatch(watchId);
-			},
-		};
+		return response;
 	}
 
 	async #applyDemand(
@@ -367,9 +321,9 @@ export class SessionWorkerManager {
 	#invoke(
 		worker: WorkerRecord,
 		scope: WorkerOperationScope,
-		call: SessionWorkerOperationCall,
+		call: ServiceCall,
 		context: Context,
-	): Promise<unknown> {
+	): Promise<JsonValue | undefined> {
 		try {
 			this.#operationScope(worker, scope.attachmentId);
 		} catch (error) {
@@ -377,9 +331,9 @@ export class SessionWorkerManager {
 		}
 		if (context.abortSignal?.aborted) return Promise.reject(abortError(context.abortSignal));
 		const requestId = randomUUID();
-		let resolve!: (result: unknown) => void;
+		let resolve!: (result: JsonValue | undefined) => void;
 		let reject!: (error: Error) => void;
-		const result = new Promise<unknown>((resolvePromise, rejectPromise) => {
+		const result = new Promise<JsonValue | undefined>((resolvePromise, rejectPromise) => {
 			resolve = resolvePromise;
 			reject = rejectPromise;
 		});
@@ -495,7 +449,11 @@ export class SessionWorkerManager {
 		this.#detachState();
 	}
 
-	#launch(metadata: JsonlSessionMetadata, _context: Context): Promise<WorkerRecord> {
+	#launch(
+		metadata: JsonlSessionMetadata,
+		_context: Context,
+		pluginManifestPaths: readonly string[],
+	): Promise<WorkerRecord> {
 		const sessionKey = metadata.path;
 		const peerId = `worker-${randomUUID()}`;
 		const token = randomUUID();
@@ -503,7 +461,16 @@ export class SessionWorkerManager {
 		try {
 			const options: SessionWorkerOptions = {
 				sessionDir: this.#sessionDir,
-				metadata,
+				metadata: {
+					id: metadata.id,
+					createdAt: metadata.createdAt,
+					storageVersion: metadata.storageVersion,
+					cwd: metadata.cwd,
+					path: metadata.path,
+					modifiedAt: metadata.modifiedAt,
+					...(metadata.parentSessionId === undefined ? {} : { parentSessionId: metadata.parentSessionId }),
+				},
+				pluginManifestPaths: [...pluginManifestPaths],
 				...(this.#model ?? {}),
 			};
 			child = spawnInternalProcess("session-worker", [JSON.stringify(options)], {
@@ -528,7 +495,17 @@ export class SessionWorkerManager {
 			WORKER_STARTUP_TIMEOUT_MS,
 		);
 		timer.unref();
-		const pending = { sessionKey, peerId, token, child, timer, promise, resolve, reject };
+		const pending = {
+			sessionKey,
+			peerId,
+			token,
+			pluginManifestPaths: Object.freeze([...pluginManifestPaths]),
+			child,
+			timer,
+			promise,
+			resolve,
+			reject,
+		};
 		this.#pending.set(sessionKey, pending);
 		this.#notifyWorkerCountChanged();
 		child.once("error", (error) => this.#failPending(sessionKey, error));
@@ -597,17 +574,6 @@ export class SessionWorkerManager {
 			this.#handleOperationResponse(event.from, message.token, message.sessionKey, message.response);
 			return;
 		}
-		if (message.type === "lane_event") {
-			this.#handleLaneEvent(
-				event.from,
-				message.token,
-				message.sessionKey,
-				message.scope,
-				message.watchId,
-				message.event,
-			);
-			return;
-		}
 		if (message.type === "service_update") {
 			this.#handleServiceEvent(
 				event.from,
@@ -656,37 +622,13 @@ export class SessionWorkerManager {
 		}
 	}
 
-	#handleLaneEvent(
-		peerId: string,
-		token: string,
-		sessionKey: string,
-		scope: WorkerOperationScope,
-		watchId: string,
-		event: LaneEvent,
-	): void {
-		const watch = this.#laneWatches.get(watchId);
-		const listener = watch?.listener;
-		if (
-			watch === undefined ||
-			listener === undefined ||
-			watch.worker.peerId !== peerId ||
-			watch.worker.token !== token ||
-			watch.worker.metadata.path !== sessionKey ||
-			watch.scope.serverConnectionId !== scope.serverConnectionId ||
-			watch.scope.attachmentId !== scope.attachmentId
-		) {
-			return;
-		}
-		watch.deliveryTail = watch.deliveryTail.then(() => listener(event, TODO_CONTEXT)).catch(() => {});
-	}
-
 	#handleServiceEvent(
 		peerId: string,
 		token: string,
 		sessionKey: string,
 		scope: WorkerOperationScope,
 		subscriptionId: string,
-		update: ServiceProviderUpdate,
+		update: unknown,
 	): void {
 		const entry = this.#serviceSubscriptions.get(scopedServiceSubscriptionKey(scope, subscriptionId));
 		if (
@@ -698,7 +640,13 @@ export class SessionWorkerManager {
 		) {
 			return;
 		}
-		entry.deliveryTail = entry.deliveryTail.then(() => entry.listener(update, TODO_CONTEXT)).catch(() => {});
+		let parsed: ServiceProviderUpdate;
+		try {
+			parsed = parseServiceProviderUpdate(update);
+		} catch {
+			return;
+		}
+		entry.deliveryTail = entry.deliveryTail.then(() => entry.listener(parsed, TODO_CONTEXT)).catch(() => {});
 	}
 
 	#recordReadyWorker(peerId: string, message: Extract<SessionWorkerEvent, { type: "worker_ready" }>): void {
@@ -711,12 +659,16 @@ export class SessionWorkerManager {
 			return;
 		}
 		this.#markDiscovered(peerId);
+		const pending = this.#pending.get(message.sessionKey);
+		if (pending?.peerId === peerId && !sameStrings(message.pluginManifestPaths, pending.pluginManifestPaths)) {
+			this.#failPending(message.sessionKey, new Error("Session worker started with stale plugin packages"));
+			return;
+		}
 		const existing = this.#workersBySession.get(message.sessionKey);
 		if (existing && existing.peerId !== peerId) {
 			void this.#coordinator.send(peerId, { type: "shutdown" }).catch(() => {});
 			return;
 		}
-		const pending = this.#pending.get(message.sessionKey);
 		if (
 			pending &&
 			(pending.peerId !== peerId || pending.token !== message.token || pending.child.pid !== message.pid)
@@ -733,6 +685,7 @@ export class SessionWorkerManager {
 			metadata: message.metadata,
 			pid: message.pid,
 			token: message.token,
+			pluginManifestPaths: Object.freeze([...message.pluginManifestPaths]),
 			terminated,
 			resolveTerminated,
 			attachmentIds: new Set(),
@@ -835,9 +788,6 @@ export class SessionWorkerManager {
 	#removeWorker(worker: WorkerRecord, error: Error | undefined): void {
 		if (this.#workersByPeer.get(worker.peerId) !== worker) return;
 		this.#rejectWorkerOperations(worker, new Error("Session worker disconnected during an operation"));
-		for (const [watchId, watch] of this.#laneWatches) {
-			if (watch.worker === worker) this.#laneWatches.delete(watchId);
-		}
 		this.#removeServiceSubscriptions((entry) => entry.worker === worker);
 		for (const pending of [...this.#pendingDemand.values()]) {
 			if (pending.worker === worker) {
@@ -881,7 +831,6 @@ export class SessionWorkerManager {
 			pending.resolve();
 		}
 		this.#pending.clear();
-		this.#laneWatches.clear();
 		this.#serviceSubscriptions.clear();
 		this.#workersByPeer.clear();
 		this.#workersBySession.clear();
@@ -890,6 +839,10 @@ export class SessionWorkerManager {
 		this.#resolveDiscovery?.();
 		this.#resolveDiscovery = undefined;
 	}
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function sameScope(left: WorkerOperationScope, right: WorkerOperationScope): boolean {

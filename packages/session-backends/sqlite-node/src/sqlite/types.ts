@@ -22,5 +22,10 @@ export interface SqliteDatabase {
 }
 
 export interface SqliteDatabaseFactory {
+	/** Open a writable database, creating it when absent. */
 	open(path: string): Promise<SqliteDatabase>;
+	/** Open a writable database without creating it. */
+	openExisting(path: string): Promise<SqliteDatabase>;
+	/** Open an existing database read-only. */
+	openReadOnly(path: string): Promise<SqliteDatabase>;
 }

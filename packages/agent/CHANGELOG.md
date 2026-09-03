@@ -2,20 +2,11 @@
 
 ## [Unreleased]
 
+## [0.84.4] - 2026-08-28
+
 ### Breaking Changes
 
-- Replaced the unfinished harness runtime and record-log session model with the shared entry/register/usage, operation-state, session, search, and public harness contracts specified for the durable harness.
-- Added the required replay-stable invocation metadata argument to `AgentHarnessTool.execute()`.
-- Required storage backends to return exact post-commit `SessionStats` in `CommitResult.stats`.
-
-### Added
-
-- Added scheduler-facing harness execution primitives (`accept`, fenced `drive`, `requestAbort`, and `inspectExecution`) plus replay-stable tool invocation identities.
-- Added isolated harness execution primitives for assistant streaming and durable-boundary tool phases.
-- Added direct-drive foundation primitives for split effect admission, deterministic commit gating, invocation-fenced progress writes, and injectable session id generation.
-- Added durable `AgentHarness` prompt acceptance and minimal no-tool execution with recovery, lifecycle events, usage settlement, and terminal cleanup.
-- Added assistant request recovery, durable retry waits, deferred suspension, and missing-identity suspension to `AgentHarness`.
-- Added durable tool planning, context-bound sequential and parallel execution, ordered result settlement, and safe tool replay recovery to `AgentHarness`.
+- Changed `prepareNextTurn` and `prepareNextTurnWithContext` to run only after `shouldStopAfterTurn` and queued-message checks determine that the agent loop will start another assistant turn. They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
 ### Fixed
 

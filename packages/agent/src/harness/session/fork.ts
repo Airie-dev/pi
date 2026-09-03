@@ -1,15 +1,7 @@
 import type { CommittedWrite } from "./commit.ts";
+import { classifyForkAddress } from "./fork-policy.ts";
 import type { Entry, ForkOptions } from "./types.ts";
-import {
-	branchTip,
-	entryLabel,
-	laneConfig,
-	laneState,
-	type StoredValue,
-	sessionName,
-	type Value,
-	value,
-} from "./values.ts";
+import { branchTip, laneConfig, laneState, type StoredValue, type Value, value } from "./values.ts";
 
 export interface ForkSourceSnapshot {
 	entries: Entry[];
@@ -40,7 +32,7 @@ export function createForkSnapshot(source: ForkSourceSnapshot, options: ForkOpti
 	const sourceTips = storedValuesInNamespace(source.scalarValues, branchTip(""));
 	validateForkSourceSnapshot(source, sourceEntries, sourceTips, options);
 
-	const { entryIds, sourceToDestinationTip } = selectForkContents(sourceEntries, sourceTips, options);
+	const { entryIds, destinationTips } = selectForkContents(sourceEntries, sourceTips, options);
 	const entries = new Map<string, Entry>();
 	for (const id of entryIds) entries.set(id, sourceEntries.get(id)!);
 
@@ -53,19 +45,23 @@ export function createForkSnapshot(source: ForkSourceSnapshot, options: ForkOpti
 			seq: nextSeq++,
 		});
 	};
-	for (const [sourceName, destination] of sourceToDestinationTip) {
-		const configuration = findStoredValue(source.scalarValues, laneConfig(sourceName));
-		store(branchTip(destination.name), destination.tipId);
+	for (const [branch, tipId] of destinationTips) {
+		const configuration = findStoredValue(source.scalarValues, laneConfig(branch));
+		store(branchTip(branch), tipId);
 		if (configuration !== undefined) {
-			store(laneConfig(destination.name), configuration.value);
-			store(laneState(destination.name), { currentOperationId: null, lastOperationId: null, inbox: [] });
+			store(laneConfig(branch), configuration.value);
+			store(laneState(branch), { currentOperationId: null, lastOperationId: null, inbox: [] });
 		}
 	}
-	const name = findStoredValue(source.scalarValues, sessionName);
-	if (name !== undefined) store(sessionName, name.value);
-	for (const entryId of entryIds) {
-		const label = findStoredValue(source.scalarValues, entryLabel(entryId));
-		if (label !== undefined) store(entryLabel(entryId), label.value);
+	for (const stored of source.scalarValues) {
+		switch (classifyForkAddress(stored.address, options.scope, (entryId) => entryIds.has(entryId))) {
+			case "copy":
+				store(stored.address, stored.value);
+				break;
+			case "exclude":
+			case "reconstruct":
+				break;
+		}
 	}
 
 	return { entries, scalarValues, nextSeq };
@@ -93,39 +89,39 @@ function selectForkContents(
 	options: ForkOptions,
 ): {
 	entryIds: Set<string>;
-	sourceToDestinationTip: Map<string, { name: string; tipId: string | null }>;
+	destinationTips: Map<string, string | null>;
 } {
 	const entryIds = new Set<string>();
-	const sourceToDestinationTip = new Map<string, { name: string; tipId: string | null }>();
+	const destinationTips = new Map<string, string | null>();
 	if (options.scope === "tree") {
 		for (const id of sourceEntries.keys()) entryIds.add(id);
-		for (const stored of sourceTips) {
-			sourceToDestinationTip.set(stored.address.key, {
-				name: stored.address.key,
-				tipId: stored.value,
-			});
-		}
+		for (const stored of sourceTips) destinationTips.set(stored.address.key, stored.value);
 	} else {
-		const mainTip = sourceTips.find((stored) => stored.address.key === "main");
-		if (mainTip === undefined) throw new Error("Source session is missing main branch");
-		const requested = options.entryId ?? mainTip.value;
-		let tipId = requested;
-		if (requested !== null) {
-			const target = sourceEntries.get(requested);
-			if (target === undefined) throw new Error(`Unknown fork entry: ${requested}`);
-			if (options.position === "before") tipId = target.parentId;
-		}
+		const sourceTip = sourceTips.find((stored) => stored.address.key === options.branch);
+		if (sourceTip === undefined) throw new Error(`Unknown source branch: ${options.branch}`);
 
-		let entryId = tipId;
+		const requested = options.entryId ?? sourceTip.value;
+		let found = requested === null;
+		let tipId: string | null = null;
+		let entryId = sourceTip.value;
 		while (entryId !== null) {
 			const entry = sourceEntries.get(entryId);
 			if (entry === undefined) throw new Error(`Corrupt source branch: missing parent ${entryId}`);
-			entryIds.add(entryId);
+			if (entry.id === requested) {
+				found = true;
+				tipId = options.position === "before" ? entry.parentId : entry.id;
+				if (options.position !== "before") entryIds.add(entry.id);
+			} else if (found) {
+				entryIds.add(entry.id);
+			}
 			entryId = entry.parentId;
 		}
-		sourceToDestinationTip.set("main", { name: "main", tipId });
+		if (!found) {
+			throw new Error(`Fork entry ${requested} is not on source branch ${JSON.stringify(options.branch)}`);
+		}
+		destinationTips.set(options.branch, tipId);
 	}
-	return { entryIds, sourceToDestinationTip };
+	return { entryIds, destinationTips };
 }
 
 function validateForkSourceSnapshot(
@@ -136,9 +132,6 @@ function validateForkSourceSnapshot(
 ): void {
 	const sourceTipKeys = new Set(sourceTips.map((stored) => stored.address.key));
 
-	if (options.scope !== "tree" && !sourceTipKeys.has("main")) {
-		throw new Error("Source session is missing main branch");
-	}
 	for (const stored of source.scalarValues) {
 		if (
 			(stored.address.namespace === laneConfig("").namespace ||
@@ -153,6 +146,9 @@ function validateForkSourceSnapshot(
 		const state = findStoredValue(source.scalarValues, laneState(tip.address.key));
 		if ((configuration === undefined) !== (state === undefined)) {
 			throw new Error(`Source session branch ${JSON.stringify(tip.address.key)} has incomplete lane state`);
+		}
+		if (options.scope === "branch" && tip.address.key === options.branch && configuration === undefined) {
+			throw new Error(`Source branch ${JSON.stringify(options.branch)} is not a configured AgentLane`);
 		}
 		if (
 			(source.entriesComplete !== false || options.scope === "tree") &&

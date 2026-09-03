@@ -44,7 +44,7 @@ await agent.prompt("Hello!");
 
 ## Experimental facet services
 
-The package exports the transport-neutral facet-service primitives used by the experimental application hosts: `defineService()`, `replicatedState()`, `RemoteServiceProvider`, and `RemoteServiceNamespace`. Providers classify implementation methods and replicated-state members at runtime; consumers receive stable singleton facades through `use()` or lifecycle-scoped keyed instances through `observe()`. `ReplicatedState` values are borrowed immutable JSON: the runtime does not defensively clone them, so callers must not mutate or retain them. Wire framing and host routing remain outside this package.
+Transport-neutral facet-service primitives live in `@earendil-works/chord`. The agent core does not export the service runtime.
 
 ## Core Concepts
 

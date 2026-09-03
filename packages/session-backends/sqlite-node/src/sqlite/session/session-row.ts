@@ -96,7 +96,6 @@ export function deleteSessionRows(db: SqliteDatabase, sessionId: string): void {
 	sql`DELETE FROM usage_ledger WHERE session_id = ${sessionId}`.run(db);
 	sql`DELETE FROM branch_entries WHERE session_id = ${sessionId}`.run(db);
 	sql`DELETE FROM branch_meta WHERE session_id = ${sessionId}`.run(db);
-	sql`DELETE FROM writer_lease WHERE session_id = ${sessionId}`.run(db);
 	const result = sql`DELETE FROM sessions WHERE id = ${sessionId}`.run(db);
 	if (result.changes !== 1)
 		throw new Error(`Expected to delete one SQLite session ${sessionId}, deleted ${result.changes}`);

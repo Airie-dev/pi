@@ -584,7 +584,6 @@ async function waitForTermination(serverClosed: Promise<void>): Promise<void> {
 }
 
 async function runExperimentalServerCommand(command: ServerCommand): Promise<void> {
-	if (command.listen !== undefined) throw new Error("The local demo server uses its server-addressed Unix socket");
 	let previousRelayStatus = "";
 	let relayOutputReady = false;
 	let pendingRelayStatus: RadiusRelayHostStatus | undefined;
@@ -606,6 +605,7 @@ async function runExperimentalServerCommand(command: ServerCommand): Promise<voi
 		sessionDir: command.sessionDir,
 		provider: command.provider,
 		model: command.model,
+		pluginPackages: command.pluginPackages ?? [],
 		relayAuth: command.auth,
 		onRelayStatus(status) {
 			if (relayOutputReady) reportRelayStatus(status);
@@ -649,10 +649,9 @@ async function runClientCommand(command: ClientCommand): Promise<void> {
 }
 
 async function runExperimentalCommand(args: string[]): Promise<boolean> {
-	if (!areExperimentalFeaturesEnabled()) return false;
+	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client")) return false;
 	try {
 		const result = await experimentalCli.execute(args, {
-			runPi: () => {},
 			runServer: runExperimentalServerCommand,
 			runClient: runClientCommand,
 		});
@@ -661,7 +660,7 @@ async function runExperimentalCommand(args: string[]): Promise<boolean> {
 			process.exitCode = 1;
 			return true;
 		}
-		return result.command.command !== "pi";
+		return true;
 	} catch (error) {
 		console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
 		process.exitCode = 1;

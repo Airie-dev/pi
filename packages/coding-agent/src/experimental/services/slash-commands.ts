@@ -1,4 +1,5 @@
-import { type Context, defineService } from "@earendil-works/pi-agent-core";
+import { type Context, defineService } from "@earendil-works/chord";
+import type { AgentOperationResponse, AgentQueueResponse } from "./agent-controller.ts";
 
 export interface SlashCommandCompletion {
 	readonly value: string;
@@ -6,18 +7,7 @@ export interface SlashCommandCompletion {
 	readonly description?: string;
 }
 
-export interface SlashCommandSelectItem {
-	readonly value: string;
-	readonly label: string;
-	readonly description?: string;
-}
-
-export interface SlashCommandExecutionContext {
-	readonly operation: Context;
-	select(title: string, items: readonly SlashCommandSelectItem[], selectedValue?: string): Promise<string | undefined>;
-	submitPrompt(message: string): Promise<void>;
-	showStatus(message: string): void;
-}
+export type SlashCommandRunResult = AgentOperationResponse | AgentQueueResponse | undefined;
 
 export interface SlashCommandContribution {
 	readonly name: string;
@@ -26,11 +16,13 @@ export interface SlashCommandContribution {
 	getArgumentCompletions?(
 		argumentPrefix: string,
 	): readonly SlashCommandCompletion[] | null | Promise<readonly SlashCommandCompletion[] | null>;
-	run(args: string, context: SlashCommandExecutionContext): void | Promise<void>;
+	run(args: string, context: Context): SlashCommandRunResult | Promise<SlashCommandRunResult>;
 }
 
 export interface SlashCommands {
 	register(command: SlashCommandContribution): () => void;
+	/** Stage a same-name replacement while the previous facet generation retires. */
+	replace(command: SlashCommandContribution): () => void;
 	list(): readonly SlashCommandContribution[];
 	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void;
 }

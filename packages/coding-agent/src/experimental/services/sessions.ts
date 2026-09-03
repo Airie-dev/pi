@@ -1,5 +1,18 @@
-import { type Context, defineService, type ReplicatedState } from "@earendil-works/pi-agent-core";
-import type { SessionCreateOptions, SessionSummary } from "@earendil-works/pi-protocol";
+import { type Context, defineService, type ReplicatedState } from "@earendil-works/chord";
+import type { ServerId } from "@earendil-works/pi-protocol";
+
+export interface SessionAddress {
+	serverId: ServerId;
+	sessionId: string;
+}
+
+export interface SessionSummary extends SessionAddress {
+	createdAt: number;
+}
+
+export interface SessionCreateOptions {
+	id?: string;
+}
 
 export interface SessionDirectoryState {
 	revision: number;

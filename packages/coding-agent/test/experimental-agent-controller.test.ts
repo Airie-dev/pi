@@ -1,3 +1,4 @@
+import { createFacetHost, defineFacet } from "@earendil-works/chord";
 import {
 	type AgentLane,
 	BACKGROUND_CONTEXT,
@@ -9,7 +10,6 @@ import {
 	UnknownTemplate,
 } from "@earendil-works/pi-agent-core";
 import { describe, expect, test, vi } from "vitest";
-import { createFacetHost, defineFacet } from "../src/experimental/facets.ts";
 import { AgentController } from "../src/experimental/services/agent-controller.ts";
 import { createAgentController } from "../src/experimental/services/agent-controller-provider.ts";
 

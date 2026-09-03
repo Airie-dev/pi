@@ -5,18 +5,15 @@ import {
 	authTokenFileOption,
 	authTokenOption,
 	parseAuth,
-	parseLegacyOptions,
-	type TransportAddress,
-	transportOption,
-	unsupportedLegacyOptions,
+	unsupportedOptions,
 } from "../command-options.ts";
 
 export interface ServerCommand {
 	readonly command: "server";
 	readonly auth?: AuthInput;
-	readonly listen?: readonly TransportAddress[];
 	readonly provider?: string;
 	readonly model?: string;
+	readonly pluginPackages?: readonly string[];
 	readonly serverId?: ServerId;
 	readonly sessionDir?: string;
 }
@@ -25,7 +22,6 @@ export interface ServerCommandContext {
 	runServer(command: ServerCommand): void | Promise<void>;
 }
 
-const listenOption = transportOption("--listen");
 const serverIdOption = valueOption("--server-id", (value) =>
 	isServerId(value)
 		? { ok: true, value }
@@ -34,34 +30,34 @@ const serverIdOption = valueOption("--server-id", (value) =>
 const sessionDirOption = stringOption("--session-dir");
 const providerOption = stringOption("--provider");
 const modelOption = stringOption("--model");
+const pluginPackageOption = stringOption("-e", { repeatable: true });
 
 export const serverCommand = new Command<ServerCommand, ServerCommandContext>("server")
-	.option(listenOption)
 	.option(serverIdOption)
 	.option(sessionDirOption)
 	.option(providerOption)
 	.option(modelOption)
+	.option(pluginPackageOption)
 	.option(authTokenOption)
 	.option(authTokenFileOption)
 	.build((input) => {
 		const { auth, errors: authErrors } = parseAuth(input);
-		const listen = input.values(listenOption);
 		const serverId = input.value(serverIdOption);
 		const sessionDir = input.value(sessionDirOption);
 		const provider = input.value(providerOption);
 		const model = input.value(modelOption);
-		const { errors: optionErrors } = parseLegacyOptions(input);
+		const pluginPackages = input.values(pluginPackageOption);
 		const modelErrors = provider !== undefined && model === undefined ? ["--provider requires --model"] : [];
-		const errors = [...authErrors, ...optionErrors, ...modelErrors, ...unsupportedLegacyOptions("server", input)];
+		const errors = [...authErrors, ...modelErrors, ...unsupportedOptions("server", input)];
 		if (errors.length > 0) return { ok: false, errors };
 		return {
 			ok: true,
 			command: {
 				command: "server",
 				...(auth === undefined ? {} : { auth }),
-				...(listen.length === 0 ? {} : { listen }),
 				...(provider === undefined ? {} : { provider }),
 				...(model === undefined ? {} : { model }),
+				...(pluginPackages.length === 0 ? {} : { pluginPackages }),
 				...(serverId === undefined ? {} : { serverId }),
 				...(sessionDir === undefined ? {} : { sessionDir }),
 			},

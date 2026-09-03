@@ -1,7 +1,5 @@
 import type { AgentLane, OperationResultRecord, SuspendedRun } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { PromptArguments } from "@earendil-works/pi-protocol";
-import { toHarnessPromptArguments } from "../harness-wire-adapter.ts";
 import type {
 	AgentController as AgentControllerService,
 	AgentOperationError,
@@ -107,11 +105,5 @@ function toAgentError(error: { readonly _tag: string; readonly message: string }
 }
 
 function toTextPrompt(request: AgentPromptRequest): [message: string, images: ImageContent[] | undefined] {
-	const prompt = toHarnessPromptArguments(toPromptArguments(request));
-	if (typeof prompt[0] !== "string") throw new TypeError("AgentController prompt did not contain text");
-	return [prompt[0], prompt.length === 1 ? undefined : prompt[1]];
-}
-
-function toPromptArguments(request: AgentPromptRequest): PromptArguments {
-	return request.images === null ? [request.message] : [request.message, request.images];
+	return [request.message, request.images ?? undefined];
 }

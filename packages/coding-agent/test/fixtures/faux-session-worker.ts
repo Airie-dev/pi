@@ -1,9 +1,8 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
 import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
-import { createStaticFacetLoader } from "../../src/experimental/facet-loader.ts";
-import { defineFacet } from "../../src/experimental/facets.ts";
 import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";
@@ -38,7 +37,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				const spawn = (value: string): void => {
 					const state = env.replicatedState({ value });
 					let close = (): void => {};
-					close = probes.add("probe", {
+					close = probes.spawn("probe", {
 						state,
 						async replace(next) {
 							close();

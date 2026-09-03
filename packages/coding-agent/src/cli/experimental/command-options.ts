@@ -1,7 +1,6 @@
 import { posix } from "node:path";
 import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
-import { type Args, parseArgs } from "../args.ts";
-import { type CommandOption, type ParsedCommandInput, stringOption, valueOption } from "./command.ts";
+import { type ParsedCommandInput, stringOption, valueOption } from "./command.ts";
 
 export type AuthInput =
 	| { readonly type: "token"; readonly token: string }
@@ -38,18 +37,14 @@ function parseAuthInput(options: { readonly authToken?: string; readonly authTok
 	return { errors: [] };
 }
 
-function parseTransportAddress(
-	value: string,
-	option: "--listen" | "--connect",
-): { address?: TransportAddress; error?: string } {
+function parseTransportAddress(value: string): { address?: TransportAddress; error?: string } {
 	let url: URL;
 	try {
 		url = new URL(value);
 	} catch {
-		return { error: `Invalid ${option} address "${value}"` };
+		return { error: `Invalid --connect address "${value}"` };
 	}
 	if (url.protocol === "radius:") {
-		if (option !== "--connect") return { error: "Radius transport is only valid for --connect" };
 		if (
 			url.username ||
 			url.password ||
@@ -59,7 +54,7 @@ function parseTransportAddress(
 			url.hash ||
 			value !== `radius://${url.hostname}${url.pathname}`
 		) {
-			return { error: `Invalid ${option} address "${value}"` };
+			return { error: `Invalid --connect address "${value}"` };
 		}
 		const serverId = url.hostname;
 		if (!isServerId(serverId)) {
@@ -67,7 +62,7 @@ function parseTransportAddress(
 		}
 		return { address: { transport: "radius", serverId } };
 	}
-	if (url.protocol !== "unix:") return { error: `Unsupported ${option} transport "${url.protocol}"` };
+	if (url.protocol !== "unix:") return { error: `Unsupported --connect transport "${url.protocol}"` };
 	if (url.hostname || url.port || url.username || url.password) {
 		return { error: "Unix transport address must not include an authority" };
 	}
@@ -78,27 +73,25 @@ function parseTransportAddress(
 		value.includes("#") ||
 		url.href !== value
 	) {
-		return { error: `Invalid ${option} address "${value}"` };
+		return { error: `Invalid --connect address "${value}"` };
 	}
 	let path: string;
 	try {
 		path = decodeURIComponent(url.pathname);
 	} catch {
-		return { error: `Invalid ${option} address "${value}"` };
+		return { error: `Invalid --connect address "${value}"` };
 	}
-	if (path.includes("\0")) return { error: `Invalid ${option} address "${value}"` };
+	if (path.includes("\0")) return { error: `Invalid --connect address "${value}"` };
 	if (!posix.isAbsolute(path)) return { error: "Unix transport address requires an absolute path" };
 	return { address: { transport: "unix", path } };
 }
 
-export function transportOption(name: "--listen" | "--connect"): CommandOption<TransportAddress> {
-	return valueOption(name, (value) => {
-		const result = parseTransportAddress(value, name);
-		return result.address
-			? { ok: true, value: result.address }
-			: { ok: false, error: result.error ?? `Invalid ${name} address "${value}"` };
-	});
-}
+export const connectOption = valueOption("--connect", (value) => {
+	const result = parseTransportAddress(value);
+	return result.address
+		? { ok: true, value: result.address }
+		: { ok: false, error: result.error ?? `Invalid --connect address "${value}"` };
+});
 
 export function parseAuth(input: ParsedCommandInput): { auth?: AuthInput; errors: string[] } {
 	return parseAuthInput({
@@ -107,17 +100,7 @@ export function parseAuth(input: ParsedCommandInput): { auth?: AuthInput; errors
 	});
 }
 
-export function parseLegacyOptions(input: ParsedCommandInput): { options: Args; errors: string[] } {
-	const options = parseArgs([...input.remainingArgs]);
-	return {
-		options,
-		errors: options.diagnostics
-			.filter((diagnostic) => diagnostic.type === "error")
-			.map((diagnostic) => diagnostic.message),
-	};
-}
-
-export function unsupportedLegacyOptions(command: string, input: ParsedCommandInput): string[] {
+export function unsupportedOptions(command: string, input: ParsedCommandInput): string[] {
 	if (input.remainingArgs.length === 0) return [];
 	return [`The experimental ${command} command does not support existing CLI options yet`];
 }
